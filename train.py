@@ -4,18 +4,17 @@ import warnings
 
 from configs.args import parse
 from fl.server import Server
-from utils.utils import set_seed
+from utils.utils import get_experiment_stem, set_seed
 
 warnings.filterwarnings("ignore")
 
 
 def build_logger(args):
-    data, num_client, alpha = args.data_name, args.num_clients, args.alpha
     log_dir = os.path.join(args.save_result, "logs")
     os.makedirs(log_dir, exist_ok=True)
 
     # 日志文件名中加入关键实验配置，方便区分不同实验结果。
-    logger_name = f"data_{data} client_{num_client} alpha_{alpha}"
+    logger_name = get_experiment_stem(args)
 
     # Python 标准 logging 用法：
     # logger 负责统一接收日志，handler 决定日志输出到哪里。

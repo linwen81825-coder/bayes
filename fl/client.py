@@ -4,6 +4,7 @@ import torch.optim as optim
 from torch import nn
 
 from data.loader import build_client_train_loader
+from model import build_model_from_args
 from utils.utils import record_result
 
 class Client:
@@ -15,6 +16,7 @@ class Client:
         # 从 save/model/{client_id}.pth 加载这个客户端自己的模型。
         self.model = self.load_client_model()
         self.device = self.args.device
+        self.model.to(self.device)
         # c_T 表示当前是第几轮服务端通信轮次，主要用于记录日志。
         self.c_T =  c_T
         self.client_epochs = self.args.client_epochs
@@ -35,11 +37,14 @@ class Client:
     def load_client_model(self):
         # 客户端模型路径，例如 ./save/model/1.pth。
         self.model_path = self.args.model_save_path + f"/{self.client_id}.pth"
-        return torch.load(self.model_path, map_location="cpu", weights_only=False)
+        model = build_model_from_args(self.args)
+        state_dict = torch.load(self.model_path, map_location="cpu")
+        model.load_state_dict(state_dict)
+        return model
 
     def save_client_model(self):
         # 本地训练结束后，把客户端模型保存回原来的路径。
-        torch.save(self.model, self.model_path)
+        torch.save(self.model.state_dict(), self.model_path)
 
     def get_dataloader(self):
         # 客户端只拥有自己的训练数据；验证和测试都由服务端统一执行。
@@ -51,10 +56,12 @@ class Client:
 
 
     def renew_model(self):
-        # 每一轮本地训练前，客户端同步服务端完整模型参数。
-        self.model.to(self.device)
-        global_model = torch.load(self.args.model_save_path + f"/server.pth", map_location="cpu", weights_only=False).to(self.device)
-        self.model.load_state_dict(global_model.state_dict())
+        # 每一轮本地训练前，客户端同步服务端 state_dict。
+        server_state_dict = torch.load(
+            self.args.model_save_path + f"/server.pth",
+            map_location="cpu",
+        )
+        self.model.load_state_dict(server_state_dict)
 
     def get_auxiliary_losses(self, result):
         zero = torch.tensor(0.0, device=self.device)
@@ -109,7 +116,6 @@ class Client:
     def train(self):
         # 本地训练保持普通监督学习；不同模型通过 forward 返回的 aux loss / stats 接入路由约束和日志。
         self.renew_model()
-        self.model.to(self.device)
 
         last_avg_router_probs = torch.zeros(self.args.num_experts, device=self.device)
         local_usage_total = torch.zeros(self.args.num_experts, device=self.device)

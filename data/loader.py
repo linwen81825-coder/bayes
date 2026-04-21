@@ -65,7 +65,7 @@ def load_partition_meta(args):
 def validate_partition_meta(meta, args):
     """Fail fast when saved partition metadata does not match current args."""
 
-    validate_partition_structure(meta)
+    validate_partition_structure(meta, args)
 
     checks = [
         ("protocol", meta.get("protocol"), EXPECTED_PROTOCOL, "str"),
@@ -84,7 +84,7 @@ def validate_partition_meta(meta, args):
             raise_partition_mismatch(field, actual, expected)
 
 
-def validate_partition_structure(meta):
+def validate_partition_structure(meta, args):
     """Check only top-level split structure so bad metadata fails early."""
 
     splits = meta.get("splits")
@@ -112,6 +112,22 @@ def validate_partition_structure(meta):
             "`splits['client_train_indices']` must be a dict. "
             "Please regenerate partition_meta.pt and partition_stats.json."
         )
+
+    expected_client_keys = {str(i) for i in range(1, args.num_clients + 1)}
+    actual_client_keys = set(splits["client_train_indices"].keys())
+    if actual_client_keys != expected_client_keys:
+        raise ValueError(
+            "partition_meta has incomplete client_train_indices keys: "
+            f"expected {sorted(expected_client_keys)}, found {sorted(actual_client_keys)}. "
+            "Please regenerate partition_meta.pt and partition_stats.json."
+        )
+
+    for client_id, indices in splits["client_train_indices"].items():
+        if not isinstance(indices, (list, tuple)):
+            raise ValueError(
+                f"`splits['client_train_indices']['{client_id}']` must be a list or tuple. "
+                "Please regenerate partition_meta.pt and partition_stats.json."
+            )
 
     for key in ["global_val_indices", "federated_train_pool_indices", "global_test_indices"]:
         if not isinstance(splits[key], (list, tuple)):
@@ -150,13 +166,51 @@ def build_raw_cifar_dataset(args, train, transform):
             download=False,
             transform=transform,
         )
-    except (FileNotFoundError, RuntimeError) as e:
-        raise RuntimeError(
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
             f"Could not load raw CIFAR data from `{args.data_path}` with download=False. "
             "This project uses index-based partition metadata, so training still requires "
-            "the original CIFAR files. Please make sure the raw dataset exists under "
-            "data_path, or re-run: `python -m data.data --data_name ... --num_clients ...` "
+            "the original CIFAR files. Please make sure the raw dataset exists under data_path, "
+            "or re-run: `python -m data.data --data_name ... --num_clients ...` "
             "to download the dataset and regenerate partition files."
+        ) from e
+    except RuntimeError as e:
+        error_text = str(e).lower()
+        missing_keywords = ["not found", "dataset not found", "no such file", "download"]
+        corrupt_keywords = ["corrupt", "corrupted", "truncate", "truncated", "invalid", "pickle", "unpickling"]
+
+        if any(keyword in error_text for keyword in missing_keywords):
+            raise FileNotFoundError(
+                f"Could not load raw CIFAR data from `{args.data_path}` with download=False. "
+                "This project uses index-based partition metadata, so training still requires "
+                "the original CIFAR files. Please make sure the raw dataset exists under data_path, "
+                "or re-run: `python -m data.data --data_name ... --num_clients ...` "
+                "to download the dataset and regenerate partition files."
+            ) from e
+
+        if any(keyword in error_text for keyword in corrupt_keywords):
+            raise RuntimeError(
+                f"Raw CIFAR files were found under `{args.data_path}`, but loading failed and "
+                "the dataset may be corrupted or incomplete. This project uses index-based "
+                "partition metadata, so training still requires the original CIFAR files. "
+                "Please check the dataset files or re-run: "
+                "`python -m data.data --data_name ... --num_clients ...` "
+                "to re-download and regenerate partition files."
+            ) from e
+
+        raise RuntimeError(
+            f"Failed to load raw CIFAR data from `{args.data_path}` with download=False. "
+            "This project uses index-based partition metadata, so training still requires "
+            "the original CIFAR files. Please check data_path or re-run: "
+            "`python -m data.data --data_name ... --num_clients ...` "
+            "to regenerate partition files after ensuring the dataset can be read."
+        ) from e
+    except Exception as e:
+        raise RuntimeError(
+            f"Unexpected error while loading raw CIFAR data from `{args.data_path}` with download=False. "
+            "This project uses index-based partition metadata, so training still requires "
+            "the original CIFAR files. Please check data_path or re-run: "
+            "`python -m data.data --data_name ... --num_clients ...`."
         ) from e
 
 

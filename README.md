@@ -1,97 +1,123 @@
 # Federated Learning Experiment
 
-这是一个联邦学习实验项目，当前只保留 `Hybrid CNN Stem + Switch Transformer` 模型分支。默认聚合方法是专家级样本数加权 FedAvg。
+这是一个基于 CIFAR10/CIFAR100 的 FL + MoE 实验项目，当前模型分支为 `Hybrid CNN Stem + Switch Transformer`，默认聚合方法为 `expert_fedavg`。
 
 ## 环境准备
 
-推荐使用 Conda 根据 `environment.yml` 创建环境：
+推荐使用 Conda：
 
 ```bash
 conda env create -f environment.yml
 conda activate fedwolf
 ```
 
-当前推荐环境记录如下：
-
-- Python: `3.10`
-- PyTorch: `torch==2.11.0+cu128`
-- TorchVision: `torchvision==0.26.0+cu128`
-- NumPy: `numpy==2.2.6`
-- CUDA wheel 源：`https://download.pytorch.org/whl/cu128`
-
-如果环境已经存在，可以直接激活：
+如果环境已经存在，直接激活即可：
 
 ```bash
 conda activate fedwolf
 ```
 
-## 项目入口
+## 运行顺序
 
-项目有两个主要入口：
-
-- `python -m data.data`：下载/加载 CIFAR10/CIFAR100，并生成 index-based 联邦划分协议。
-- `train.py`：启动联邦学习训练流程。
-
-因此运行顺序是：先生成划分协议，再运行 `train.py` 开始训练。
-
-数据划分逻辑：
-
-- 官方 train set 先按类别分层切出 `global_val`，剩余部分作为 `federated_train_pool`。
-- `federated_train_pool` 再通过 Dirichlet non-IID 划分到各客户端，客户端只有 train split。
-- 不保存 transform 后的样本 list，只保存 `partition_meta.pt` 中的索引和元信息。
-- `partition_stats.json` 记录各 split 大小和类别分布。
-- `data/loader.py` 会基于 raw CIFAR dataset + indices + transform 动态构造 DataLoader。
-- 客户端使用 `train_transform`，服务端 `global_val` / `global_test` 使用 `eval_transform`。
-- 服务器每轮用 `global_val` 做模型选择，训练结束后只用 `global_test` 做最终测试。
-
-## 基本运行顺序
-
-先生成客户端数据：
+先生成数据划分：
 
 ```bash
 python -m data.data --data_name cifar10 --num_clients 2
 ```
 
-再启动一次最小训练：
+再启动训练：
 
 ```bash
 python train.py --data_name cifar10 --num_clients 2 --server_epochs 1 --client_epochs 1 --device cpu
 ```
 
-## 模型选择
+## 数据协议
 
-默认模型是 Hybrid CNN Stem + Switch Transformer：
+当前项目使用的是 index-based partition 协议：
+
+- official `train` 先做分层切分，得到 `global_val` 和 `federated_train_pool`
+- `federated_train_pool` 再通过 Dirichlet non-IID 划分得到各客户端的 `client_train_indices`
+- official `test` 直接作为 `global_test`
+- `partition_meta.pt` 只保存索引和元信息，不保存原始图像数据
+- `partition_stats.json` 保存各 split 的样本规模和类别统计
+
+这意味着训练阶段仍然需要 `data_path` 下存在原始 CIFAR 数据文件。`data/loader.py` 会基于：
+
+- raw CIFAR dataset
+- saved indices
+- split-specific transforms
+
+动态构造 `Dataset` / `DataLoader`。
+
+如果训练时报原始 CIFAR 缺失，请检查 `--data_path`，或者重新运行：
 
 ```bash
-python train.py --model_type hybrid_switch_transformer --agg_method expert_fedavg
+python -m data.data --data_name cifar10 --num_clients 2
 ```
 
-启动训练时可以显式写出，也可以省略这两个默认参数：
+## 训练与评估协议
 
-```bash
-python train.py --model_type hybrid_switch_transformer --data_name cifar10 --num_clients 2 --server_epochs 1 --client_epochs 1 --device cpu
-```
+- client 只训练自己的 `client_train`
+- server 每轮在 `global_val` 上评估当前全局模型
+- best model 选择规则：
+  - 先比较 `global_val_acc`
+  - 若相同，再比较 `global_val_loss`
+- `global_test` 不参与模型选择，只在训练结束后做最终评估
 
-这个分支的数据流是：浅层 CNN stem -> feature map tokenization -> Transformer blocks -> 部分 block 的 FFN 替换为 token-level top-1 Switch FFN -> token mean pooling -> classifier。默认 `expert_fedavg` 聚合会对普通层使用客户端训练样本数加权，对 `blocks.{layer}.ffn.experts.{id}` 专家参数使用该层该专家在对应客户端实际处理的 token 数加权；如果需要完整模型标准 FedAvg，可显式传入 `--agg_method fedavg`。
+## 输出文件
 
-可以通过 `--depth` / `--num_layers`、`--moe_layers`、`--embed_dim`、`--num_heads`、`--mlp_ratio`、`--router_aux_loss_coef`、`--router_z_loss_coef`、`--router_jitter_noise` 等参数控制结构和路由损失。
+### 数据划分
 
-Switch FFN 支持 expert capacity 控制，相关参数包括 `--capacity_factor`、`--min_capacity` 和 `--drop_tokens` / `--no-drop_tokens`。超出 capacity 的 token 默认不进入 expert，而是在 Transformer 残差路径中走 identity bypass。模型默认使用 token mean pooling，也可以用 `--use_cls_token` 启用 cls token 分类。
+- `save/data/partition_meta.pt`
+  - 索引划分协议和元信息
+- `save/data/partition_stats.json`
+  - 各 split 的样本数量和类别分布统计
 
-## 输出目录
+### 模型文件
 
-项目运行时会使用以下目录：
+- `save/model/server.pth`
+  - 当前轮 / 最后一轮服务端模型的纯 `state_dict`
+- `save/model/best_server.pth`
+  - 带元信息的 checkpoint dict，不是纯 `state_dict`
+- `save/model/{client_id}.pth`
+  - 每个客户端当前模型的纯 `state_dict`
 
-- `save/data`：`partition_meta.pt` 和 `partition_stats.json`。
-- `save/model`：服务端模型 `server.pth` 和客户端模型 `{client_id}.pth`。
-- `save/result/detail`：训练过程的 CSV 明细结果。
-- `save/result/logs`：训练日志文件。
+### 结果与日志
 
-这些目录会在数据生成和训练时自动创建。
+- `save/result/detail/*.csv`
+  - client 侧逐轮训练明细
+- `save/result/server/*.csv`
+  - server 侧逐轮 `global_val` 与最终 `global_test` 结果
+- `save/result/logs/*.log`
+  - 本次实验的完整日志
+
+CSV 和日志文件名都会包含：
+
+- `data_name`
+- `num_clients`
+- `alpha`
+- `seed`
+- `global_val_ratio`
+- `agg_method`
+
+## Checkpoint 约定
+
+项目里模型文件有两种格式：
+
+- `server.pth` / `save/model/{client_id}.pth`
+  - 纯模型参数，直接保存 `state_dict`
+- `best_server.pth`
+  - checkpoint dict，至少包含：
+    - `model_state_dict`
+    - `best_round`
+    - `best_val_acc`
+    - `best_val_loss`
+
+如果需要读取 `best_server.pth`，请使用 [utils/utils.py](/home/cjq/Project/FedWolf/utils/utils.py) 中的 `load_best_server_checkpoint(path)`，不要把它当成纯 `state_dict` 直接使用。
 
 ## 常用命令
 
-检查环境中的核心依赖版本：
+检查核心依赖版本：
 
 ```bash
 python -c "import torch, torchvision, numpy; print(torch.__version__, torchvision.__version__, numpy.__version__)"

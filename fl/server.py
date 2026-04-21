@@ -6,8 +6,8 @@ from torch import nn
 from data.loader import build_global_eval_loader, get_client_train_size, load_partition_meta
 from fl.aggregators import build_aggregator
 from fl.client import Client
-from model.HybridSwitchTransformer import HybridSwitchTransformer
-from utils.utils import init_result_csv
+from model import build_model_from_args
+from utils.utils import init_result_csv, init_server_result_csv, record_server_result
 
 class Server:
     # Server 表示联邦学习中的服务端。
@@ -48,70 +48,29 @@ class Server:
         self.best_state_dict = None
         # 初始化 CSV 结果文件，后续客户端训练会不断追加记录。
         init_result_csv(self.args)
-    def get_out_dim(self):
-        # 根据数据集名称返回分类类别数。
-        self.data_name = self.args.data_name
-        if self.data_name == "cifar10":
-            return 10
-        if self.data_name == "cifar100":
-            return 100
-        raise ValueError(f"Unsupported dataset: {self.data_name}")
+        init_server_result_csv(self.args)
 
 
     def init_global_model(self):
         # 根据 model_type 初始化全局模型。
-        self.model = self.build_model()
+        self.model = build_model_from_args(self.args)
         # 初始化完成后立即保存，客户端 renew_model 时会读取这个文件。
         self.save_server_model()
 
-    def build_model(self):
-        depth = self.args.num_layers if self.args.num_layers is not None else self.args.depth
-        return HybridSwitchTransformer(
-            num_classes=self.get_out_dim(),
-            embed_dim=self.args.embed_dim,
-            depth=depth,
-            num_heads=self.args.num_heads,
-            mlp_ratio=self.args.mlp_ratio,
-            num_experts=self.args.num_experts,
-            moe_layers=self.parse_moe_layers(self.args.moe_layers, depth),
-            dropout_rate=self.args.dropout,
-            router_jitter_noise=self.args.router_jitter_noise,
-            capacity_factor=self.args.capacity_factor,
-            min_capacity=self.args.min_capacity,
-            drop_tokens=self.args.drop_tokens,
-            top_k=self.args.top_k,
-            stem_channels=self.args.stem_channels,
-            token_grid_size=self.args.token_grid_size,
-            use_cls_token=self.args.use_cls_token,
-            router_aux_loss_coef=self.args.router_aux_loss_coef,
-            router_z_loss_coef=self.args.router_z_loss_coef,
-        )
-
-    def parse_moe_layers(self, moe_layers, depth):
-        if moe_layers is None or str(moe_layers).strip() == "":
-            return []
-
-        layer_ids = []
-        for item in str(moe_layers).split(","):
-            item = item.strip()
-            if item == "":
-                continue
-            layer_id = int(item)
-            if layer_id < 0 or layer_id >= depth:
-                raise ValueError(f"moe layer index {layer_id} is outside depth {depth}")
-            layer_ids.append(layer_id)
-        return layer_ids
-
     def save_server_model(self):
-        # 保存当前服务端模型到 server.pth。
-        torch.save(self.model, self.args.model_save_path + f"/server.pth")
+        # 保存当前服务端模型参数到 server.pth。
+        torch.save(self.model.state_dict(), self.args.model_save_path + f"/server.pth")
 
 
     def sync_clients_model(self):
+        server_state_dict = {
+            key: value.detach().cpu().clone()
+            for key, value in self.model.state_dict().items()
+        }
         for id in self.clientsID_list:
-            # 初始化时所有客户端文件都保存同一个服务端模型。
+            # 初始化时所有客户端文件都保存同一个服务端 state_dict。
             model_path = self.args.model_save_path + f"/{id}.pth"
-            torch.save(self.model, model_path)
+            torch.save(server_state_dict, model_path)
 
 
 
@@ -169,7 +128,20 @@ class Server:
             # global_val 用于模型选择；global_test 只在训练结束后评估一次。
             val_loss, val_acc = self.evaluate_global_model(self.global_val_loader)
             self.logger.info(f"--server_global_val_loss : {val_loss:.4f} --server_global_val_acc : {val_acc:.4f}\n")
-            self.update_best_model(val_acc=val_acc, val_loss=val_loss, round_id=c_T + 1)
+            is_best = self.update_best_model(val_acc=val_acc, val_loss=val_loss, round_id=c_T + 1)
+            record_server_result(
+                {
+                    "phase": "val",
+                    "round": c_T + 1,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "best_val_acc": self.best_val_acc,
+                    "best_val_loss": self.best_val_loss,
+                    "is_best": int(is_best),
+                    "selected_for_test": 0,
+                },
+                self.args,
+            )
 
             # 每轮结束保存当前服务端模型，供下一轮客户端同步。
             self.save_server_model()
@@ -206,7 +178,7 @@ class Server:
             or (val_acc == self.best_val_acc and val_loss < self.best_val_loss)
         )
         if not is_better:
-            return
+            return False
 
         self.best_val_acc = val_acc
         self.best_val_loss = val_loss
@@ -216,14 +188,28 @@ class Server:
             for key, value in self.model.state_dict().items()
         }
         best_model_path = os.path.join(self.args.model_save_path, "best_server.pth")
-        torch.save(self.model, best_model_path)
+        torch.save(
+            {
+                "model_state_dict": self.best_state_dict,
+                "best_round": self.best_round,
+                "best_val_acc": self.best_val_acc,
+                "best_val_loss": self.best_val_loss,
+            },
+            best_model_path,
+        )
         self.logger.info(
             f"--best_global_val_acc : {self.best_val_acc:.4f} "
             f"--best_global_val_loss : {self.best_val_loss:.4f} "
             f"--best_round : {self.best_round}\n"
         )
+        return True
 
     def evaluate_best_on_global_test(self):
+        last_server_state = {
+            key: value.detach().cpu().clone()
+            for key, value in self.model.state_dict().items()
+        }
+
         if self.best_state_dict is None:
             self.best_state_dict = {
                 key: value.detach().cpu().clone()
@@ -238,7 +224,22 @@ class Server:
             f"--final_global_test_acc : {test_acc:.4f} "
             f"--selected_round : {self.best_round}\n"
         )
-        self.save_server_model()
+        record_server_result(
+            {
+                "phase": "final_test",
+                "round": self.best_round,
+                "test_loss": test_loss,
+                "test_acc": test_acc,
+                "selected_round": self.best_round,
+                "best_val_acc": self.best_val_acc,
+                "best_val_loss": self.best_val_loss,
+                "selected_for_test": 1,
+            },
+            self.args,
+        )
+        # server.pth should keep the current/last-round server model semantics.
+        # Restore the last server state after testing the best checkpoint.
+        self.model.load_state_dict(last_server_state)
 
     def get_client_train_size(self,client_id):
         # FedAvg 使用客户端训练样本数作为聚合权重。
@@ -251,8 +252,11 @@ class Server:
         client_states = []
         client_sizes = []
         for id in self.clientsID_list:
-            client_model = torch.load(self.args.model_save_path + f"/{id}.pth", map_location="cpu", weights_only=False)
-            client_states.append(client_model.state_dict())
+            client_state_dict = torch.load(
+                self.args.model_save_path + f"/{id}.pth",
+                map_location="cpu",
+            )
+            client_states.append(client_state_dict)
             client_sizes.append(self.get_client_train_size(id))
 
         total_size = sum(client_sizes)
