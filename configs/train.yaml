@@ -1,0 +1,7 @@
+num_clients: 20
+server_epochs: 50
+client_epochs: 1
+device: cuda
+save_result: ./save/result
+agg_method: expert_fedavg
+model_save_path: ./save/model

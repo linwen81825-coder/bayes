@@ -2,11 +2,12 @@ import argparse
 import json
 import os
 from collections import Counter
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
-from configs.args import parse
+from configs import add_config_path_arguments, load_args
 from data.loader import get_cifar_stats
 from utils.utils import set_seed
 
@@ -21,7 +22,7 @@ class CIFARPartitionBuilder:
     4. Only indices and metadata are saved; transforms are applied dynamically in loader.py.
     """
 
-    def __init__(self,args:argparse.Namespace):
+    def __init__(self, args: SimpleNamespace):
         self.args = args
         self.data_save_path = self.args.data_save_path
         self.num_clients = self.args.num_clients
@@ -149,7 +150,7 @@ class CIFARPartitionBuilder:
 
         raise ValueError(
             "Unable to split data with the requested min_datasize. "
-            "Try increasing --alpha, reducing --num_clients, or lowering --min_datasize."
+            "Try increasing alpha, reducing num_clients, or lowering min_datasize in the YAML config files."
         )
 
     def build_stats(self, meta):
@@ -205,7 +206,15 @@ class CIFARPartitionBuilder:
         print(f"Saved partition stats to {stats_path}")
 
 if __name__ == '__main__':
-    # 直接运行 `python -m data.data` 时，会根据 --data_name 选择对应的数据处理类。
-    args = parse.parse_args()
+    cli_parser = argparse.ArgumentParser(description="Build CIFAR partitions from YAML configuration files.")
+    add_config_path_arguments(cli_parser)
+    cli_args = cli_parser.parse_args()
+
+    # Load partition settings from YAML config files under `configs/`.
+    args = load_args(
+        data_cfg_path=cli_args.data_cfg,
+        train_cfg_path=cli_args.train_cfg,
+        model_cfg_path=cli_args.model_cfg,
+    )
     set_seed(args.seed)
     CIFARPartitionBuilder(args=args).build()

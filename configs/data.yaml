@@ -1,0 +1,12 @@
+data_name: cifar100
+data_path: ./data
+global_val_ratio: 0.1
+data_save_path: ./save/data
+batch_size: 32
+min_datasize: 32
+alpha: 0.1
+seed: 1
+partition_meta_name: partition_meta.pt
+partition_stats_name: partition_stats.json
+num_workers: 0
+pin_memory: false

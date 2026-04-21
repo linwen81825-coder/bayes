@@ -54,7 +54,7 @@ def load_partition_meta(args):
     if not os.path.exists(meta_path):
         raise FileNotFoundError(
             f"Missing partition metadata: {meta_path}. "
-            "Run `python -m data.data --data_name ... --num_clients ...` before training."
+            "Update the YAML config files if needed, then run `python -m data.data` before training."
         )
 
     meta = torch.load(meta_path, weights_only=False)
@@ -152,8 +152,8 @@ def metadata_value_matches(actual, expected, value_type):
 def raise_partition_mismatch(field, actual, expected):
     raise ValueError(
         f"partition_meta mismatch for `{field}`: found {actual!r}, expected {expected!r}. "
-        "Please re-run `python -m data.data --data_name ... --num_clients ...` "
-        "with the current arguments to regenerate partition_meta.pt."
+        "Please update the YAML config files and re-run `python -m data.data` "
+        "to regenerate partition_meta.pt."
     )
 
 
@@ -171,7 +171,7 @@ def build_raw_cifar_dataset(args, train, transform):
             f"Could not load raw CIFAR data from `{args.data_path}` with download=False. "
             "This project uses index-based partition metadata, so training still requires "
             "the original CIFAR files. Please make sure the raw dataset exists under data_path, "
-            "or re-run: `python -m data.data --data_name ... --num_clients ...` "
+            "or re-run: `python -m data.data` "
             "to download the dataset and regenerate partition files."
         ) from e
     except RuntimeError as e:
@@ -184,7 +184,7 @@ def build_raw_cifar_dataset(args, train, transform):
                 f"Could not load raw CIFAR data from `{args.data_path}` with download=False. "
                 "This project uses index-based partition metadata, so training still requires "
                 "the original CIFAR files. Please make sure the raw dataset exists under data_path, "
-                "or re-run: `python -m data.data --data_name ... --num_clients ...` "
+                "or re-run: `python -m data.data` "
                 "to download the dataset and regenerate partition files."
             ) from e
 
@@ -194,7 +194,7 @@ def build_raw_cifar_dataset(args, train, transform):
                 "the dataset may be corrupted or incomplete. This project uses index-based "
                 "partition metadata, so training still requires the original CIFAR files. "
                 "Please check the dataset files or re-run: "
-                "`python -m data.data --data_name ... --num_clients ...` "
+                "`python -m data.data` "
                 "to re-download and regenerate partition files."
             ) from e
 
@@ -202,7 +202,7 @@ def build_raw_cifar_dataset(args, train, transform):
             f"Failed to load raw CIFAR data from `{args.data_path}` with download=False. "
             "This project uses index-based partition metadata, so training still requires "
             "the original CIFAR files. Please check data_path or re-run: "
-            "`python -m data.data --data_name ... --num_clients ...` "
+            "`python -m data.data` "
             "to regenerate partition files after ensuring the dataset can be read."
         ) from e
     except Exception as e:
@@ -210,7 +210,7 @@ def build_raw_cifar_dataset(args, train, transform):
             f"Unexpected error while loading raw CIFAR data from `{args.data_path}` with download=False. "
             "This project uses index-based partition metadata, so training still requires "
             "the original CIFAR files. Please check data_path or re-run: "
-            "`python -m data.data --data_name ... --num_clients ...`."
+            "`python -m data.data`."
         ) from e
 
 

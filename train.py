@@ -1,8 +1,9 @@
+import argparse
 import logging
 import os
 import warnings
 
-from configs.args import parse
+from configs import add_config_path_arguments, load_args
 from fl.server import Server
 from utils.utils import get_experiment_stem, set_seed
 
@@ -41,9 +42,16 @@ def build_logger(args):
 
 
 def main():
-    # 读取命令行参数。比如：
-    # python train.py --data_name cifar10 --num_clients 4 --device cuda
-    args = parse.parse_args()
+    cli_parser = argparse.ArgumentParser(description="Train with YAML configuration files.")
+    add_config_path_arguments(cli_parser)
+    cli_args = cli_parser.parse_args()
+
+    # Read experiment settings from YAML config files under `configs/`.
+    args = load_args(
+        data_cfg_path=cli_args.data_cfg,
+        train_cfg_path=cli_args.train_cfg,
+        model_cfg_path=cli_args.model_cfg,
+    )
     set_seed(args.seed)
     logger = build_logger(args)
 

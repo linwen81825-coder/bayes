@@ -1,6 +1,6 @@
 import torch
-import argparse
 import torch.optim as optim
+from types import SimpleNamespace
 from torch import nn
 
 from data.loader import build_client_train_loader
@@ -10,7 +10,7 @@ from utils.utils import record_result
 class Client:
     # Client 表示联邦学习里的一个客户端。
     # 每个客户端有自己的数据和模型，服务端每一轮会让多个客户端分别训练。
-    def __init__(self,args:argparse.Namespace,client_id:int,logger,c_T:int,partition_meta=None):
+    def __init__(self, args: SimpleNamespace, client_id: int, logger, c_T: int, partition_meta=None):
         self.args = args
         self.client_id = client_id
         # 从 save/model/{client_id}.pth 加载这个客户端自己的模型。

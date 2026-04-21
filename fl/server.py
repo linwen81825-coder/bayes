@@ -1,6 +1,6 @@
 import torch
-import argparse
 import os
+from types import SimpleNamespace
 from torch import nn
 
 from data.loader import build_global_eval_loader, get_client_train_size, load_partition_meta
@@ -12,7 +12,7 @@ from utils.utils import init_result_csv, init_server_result_csv, record_server_r
 class Server:
     # Server 表示联邦学习中的服务端。
     # 它不直接训练全部数据，而是负责初始化模型、调度客户端训练、聚合客户端模型。
-    def __init__(self, args: argparse.Namespace, logger):
+    def __init__(self, args: SimpleNamespace, logger):
         self.args = args
         self.aggregator = build_aggregator(self.args)
         # 基础联邦训练配置。
