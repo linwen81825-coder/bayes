@@ -1,6 +1,7 @@
 """Model package."""
 
 from model.HybridSwitchTransformer import HybridSwitchTransformer
+from model.SwitchTransformer import SwitchTransformer
 
 
 def get_num_classes(data_name):
@@ -31,7 +32,7 @@ def build_model_from_args(args):
     """Build the project model from a single shared args-based code path."""
 
     depth = args.num_layers if args.num_layers is not None else args.depth
-    return HybridSwitchTransformer(
+    common_kwargs = dict(
         num_classes=get_num_classes(args.data_name),
         embed_dim=args.embed_dim,
         depth=depth,
@@ -51,3 +52,11 @@ def build_model_from_args(args):
         router_aux_loss_coef=args.router_aux_loss_coef,
         router_z_loss_coef=args.router_z_loss_coef,
     )
+
+    if args.model_type == "hybrid_switch_transformer":
+        return HybridSwitchTransformer(**common_kwargs)
+    if args.model_type == "switch_transformer":
+        switch_kwargs = dict(common_kwargs)
+        switch_kwargs["patch_size"] = getattr(args, "patch_size", None)
+        return SwitchTransformer(**switch_kwargs)
+    raise ValueError(f"Unsupported model_type: {args.model_type}")

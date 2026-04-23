@@ -20,14 +20,20 @@ def set_seed(seed:int):
 
 
 def get_experiment_stem(args):
-    return (
+    stem = (
         f"data_{args.data_name}_"
         f"clients_{args.num_clients}_"
         f"alpha_{args.alpha}_"
         f"seed_{args.seed}_"
         f"gval_{args.global_val_ratio}_"
-        f"agg_{args.agg_method}"
+        f"agg_{args.agg_method}_"
+        f"model_{args.model_type}"
     )
+    if args.model_type == "switch_transformer":
+        patch_size = getattr(args, "patch_size", None)
+        patch_tag = "auto" if patch_size is None else str(patch_size)
+        stem += f"_patch_{patch_tag}"
+    return stem
 
 
 def get_csv_path(args):

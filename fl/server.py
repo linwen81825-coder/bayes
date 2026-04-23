@@ -1,6 +1,8 @@
-import torch
+import math
 import os
 from types import SimpleNamespace
+
+import torch
 from torch import nn
 
 from data.loader import build_global_eval_loader, get_client_train_size, load_partition_meta
@@ -23,6 +25,7 @@ class Server:
         self.device = self.args.device
         # 服务端模型保存路径，例如 ./save/model/server.pth。
         self.model_path = self.args.model_save_path + f"/server.pth"
+        self.bayes_state_path = os.path.join(self.args.model_save_path, "server_bayes_state.pth")
         self.logger = logger
         os.makedirs(self.args.model_save_path, exist_ok=True)
         self.partition_meta = load_partition_meta(self.args)
@@ -38,6 +41,8 @@ class Server:
         )
         # 初始化全局模型，并保存到 server.pth。
         self.init_global_model()
+        # 贝叶斯 expert 聚合会额外维护一份服务端先验状态。
+        self.init_bayes_state()
         # 客户端初始模型直接来自同一个服务端模型，避免额外随机初始化。
         self.sync_clients_model()
         self.num_experts = self.args.num_experts
@@ -46,6 +51,8 @@ class Server:
         self.best_val_loss = float("inf")
         self.best_round = 0
         self.best_state_dict = None
+        self.last_client_expert_usages = []
+        self.last_client_bayes_evidence = []
         # 初始化 CSV 结果文件，后续客户端训练会不断追加记录。
         init_result_csv(self.args)
         init_server_result_csv(self.args)
@@ -54,13 +61,124 @@ class Server:
     def init_global_model(self):
         # 根据 model_type 初始化全局模型。
         self.model = build_model_from_args(self.args)
+        if self.has_bayesian_resume_checkpoint():
+            server_state_dict = torch.load(self.model_path, map_location="cpu")
+            self.model.load_state_dict(server_state_dict)
+            self.logger.info(f"--resume_server_model : {self.model_path}")
+            return
+
         # 初始化完成后立即保存，客户端 renew_model 时会读取这个文件。
         self.save_server_model()
 
     def save_server_model(self):
         # 保存当前服务端模型参数到 server.pth。
-        torch.save(self.model.state_dict(), self.args.model_save_path + f"/server.pth")
+        cpu_state_dict = {
+            key: value.detach().cpu().clone()
+            for key, value in self.model.state_dict().items()
+        }
+        torch.save(cpu_state_dict, self.args.model_save_path + f"/server.pth")
 
+    def uses_bayesian_aggregation(self):
+        return self.args.agg_method == "expert_bayes_meta"
+
+    def has_bayesian_resume_checkpoint(self):
+        return (
+            self.uses_bayesian_aggregation()
+            and os.path.exists(self.model_path)
+            and os.path.exists(self.bayes_state_path)
+        )
+
+    def init_bayes_state(self):
+        if not self.uses_bayesian_aggregation():
+            self.bayes_state = None
+            return
+
+        if self.has_bayesian_resume_checkpoint():
+            self.bayes_state = torch.load(self.bayes_state_path, map_location="cpu")
+            self.logger.info(
+                f"--resume_bayes_state : {self.bayes_state_path} "
+                f"--resume_bayes_round : {int(self.bayes_state.get('round', 0))}"
+            )
+            return
+
+        self.bayes_state = self.build_initial_bayes_state()
+        self.save_bayes_state()
+
+    def build_initial_bayes_state(self):
+        gamma0_init = max(float(getattr(self.args, "bayes_gamma0_init", 1.0)), 1e-8)
+        n0_init = max(float(getattr(self.args, "bayes_n0_init", 1.0)), 1e-8)
+        log_gamma0 = math.log(gamma0_init)
+        log_n0 = math.log(n0_init)
+        bayes_state = {
+            "round": 0,
+            "gamma0_init": gamma0_init,
+            "n0_init": n0_init,
+            "experts": {},
+        }
+
+        for key, value in self.model.state_dict().items():
+            expert_ref = self.parse_expert_ref(key)
+            if expert_ref is None:
+                continue
+
+            layer_id, expert_id = expert_ref
+            layer_state = bayes_state["experts"].setdefault(layer_id, {})
+            expert_state = layer_state.setdefault(
+                expert_id,
+                {
+                    "log_precision_state": {},
+                    "log_n0": torch.tensor(log_n0, dtype=torch.float32),
+                },
+            )
+            if torch.is_floating_point(value):
+                expert_state["log_precision_state"][key] = torch.full_like(
+                    value.detach().cpu(),
+                    fill_value=log_gamma0,
+                )
+            else:
+                expert_state["log_precision_state"][key] = value.detach().cpu().clone()
+
+        return bayes_state
+
+    def save_bayes_state(self):
+        if self.bayes_state is None:
+            return
+        torch.save(self.bayes_state, self.bayes_state_path)
+
+    def parse_expert_ref(self, key):
+        parts = key.split(".")
+        if "blocks" not in parts or "experts" not in parts:
+            return None
+
+        blocks_idx = parts.index("blocks")
+        experts_idx = parts.index("experts")
+        if blocks_idx + 1 >= len(parts) or experts_idx + 1 >= len(parts):
+            return None
+        if not parts[blocks_idx + 1].isdigit() or not parts[experts_idx + 1].isdigit():
+            return None
+
+        return parts[blocks_idx + 1], parts[experts_idx + 1]
+
+    def count_bayes_evidence_entries(self, evidence_by_layer):
+        total = 0
+        for expert_map in evidence_by_layer.values():
+            total += len(expert_map)
+        return total
+
+    def unpack_aggregation_output(self, aggregation_output):
+        if hasattr(aggregation_output, "model_state"):
+            model_state = aggregation_output.model_state
+            bayes_state = getattr(aggregation_output, "bayes_state", None)
+            metrics = getattr(aggregation_output, "metrics", {}) or {}
+            return model_state, bayes_state, metrics
+
+        if isinstance(aggregation_output, dict) and "model_state" in aggregation_output:
+            model_state = aggregation_output["model_state"]
+            bayes_state = aggregation_output.get("bayes_state")
+            metrics = aggregation_output.get("metrics", {}) or {}
+            return model_state, bayes_state, metrics
+
+        return aggregation_output, None, {}
 
     def sync_clients_model(self):
         server_state_dict = {
@@ -82,6 +200,7 @@ class Server:
             round_expert_usage_summary = torch.zeros(self.args.num_experts)
             round_layer_stats = {}
             round_client_expert_usages = []
+            round_client_bayes_evidences = []
             for id in self.clientsID_list:
                 # 每个客户端执行本地训练，并返回本轮信息。
                 client_stats = Client(
@@ -93,6 +212,7 @@ class Server:
                 ).train()
                 client_expert_usage = client_stats["expert_activations"].float().cpu()
                 round_client_expert_usages.append(client_stats)
+                round_client_bayes_evidences.append(client_stats.get("bayes_evidence_by_layer", {}))
                 round_expert_usage_summary += client_expert_usage
                 for layer_id, stats in client_stats.get("expert_stats_by_layer", {}).items():
                     if layer_id not in round_layer_stats:
@@ -108,9 +228,14 @@ class Server:
             usage_list = [int(v) for v in round_expert_usage_summary.tolist()]
             self.logger.info(f"--round_expert_usage_summary : {usage_list}\n")
             self.last_client_expert_usages = round_client_expert_usages
+            self.last_client_bayes_evidence = round_client_bayes_evidences
             client_usage_list = [
                 [int(v) for v in stats["expert_activations"].tolist()]
                 for stats in round_client_expert_usages
+            ]
+            client_bayes_counts = [
+                self.count_bayes_evidence_entries(evidence)
+                for evidence in round_client_bayes_evidences
             ]
             layer_stats_log = {
                 layer_id: {
@@ -122,6 +247,7 @@ class Server:
             }
             self.logger.info(f"--client_expert_usage_summary : {client_usage_list}\n")
             self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
+            self.logger.info(f"--client_bayes_evidence_counts : {client_bayes_counts}\n")
             # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
             self.aggregation()
 
@@ -249,6 +375,7 @@ class Server:
         # 聚合器接口：
         # - fedavg：对完整 state_dict 按客户端训练样本数加权平均；
         # - expert_fedavg：普通层按客户端样本数聚合，专家层按每个 expert 实际处理样本数聚合。
+        # - expert_bayes_meta：在 expert 粒度额外接收客户端上传的局部贝叶斯证据和服务端先验状态。
         client_states = []
         client_sizes = []
         for id in self.clientsID_list:
@@ -263,15 +390,39 @@ class Server:
         if total_size <= 0:
             raise ValueError("FedAvg requires at least one training sample across clients")
 
-        fedavg_state = self.aggregator.aggregate(
+        aggregation_output = self.aggregator.aggregate(
             client_updates=client_states,
             client_weights=client_sizes,
             global_model=self.model,
             expert_weights=getattr(self, "last_client_expert_usages", None),
+            expert_evidence=getattr(self, "last_client_bayes_evidence", None),
+            bayes_state=self.bayes_state,
         )
-        self.model.load_state_dict(fedavg_state)
+        aggregated_state, updated_bayes_state, aggregation_metrics = self.unpack_aggregation_output(
+            aggregation_output
+        )
+        self.model.load_state_dict(aggregated_state)
+        if updated_bayes_state is not None:
+            self.bayes_state = updated_bayes_state
+        self.save_bayes_state()
         self.logger.info(f"--aggregation_method : {self.args.agg_method}\n")
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
+        if self.uses_bayesian_aggregation():
+            total_evidence = sum(
+                self.count_bayes_evidence_entries(evidence)
+                for evidence in getattr(self, "last_client_bayes_evidence", [])
+            )
+            self.logger.info(f"--round_bayes_evidence_total : {total_evidence}\n")
+        if aggregation_metrics:
+            expert_meta_stats = aggregation_metrics.get("expert_meta_stats")
+            summary_metrics = {
+                key: value
+                for key, value in aggregation_metrics.items()
+                if key != "expert_meta_stats"
+            }
+            self.logger.info(f"--aggregation_metrics : {summary_metrics}\n")
+            if expert_meta_stats:
+                self.logger.info(f"--expert_meta_stats : {expert_meta_stats}\n")
 
     def aggregation(self):
         self.aggregation_by_method()
