@@ -1,20 +1,68 @@
-model_type: hybrid_switch_transformer
+# 模型类型：
+# hybrid_switch_transformer = CNN stem + Transformer
+# switch_transformer = patch embedding + Transformer
+model_type: switch_transformer
+
+# 标准 switch_transformer 的显式 patch 大小；
+# 为 null 时会回退到兼容逻辑，根据 token_grid_size 推导
+# 该字段只对 switch_transformer 生效
+patch_size: null
+
+# 每个 Switch FFN 中的专家数量
 num_experts: 8
+
+# Transformer / MLP 中使用的 dropout 比例
 dropout: 0.2
+
+# 优化器学习率
 learning_rate: 0.0005
+
+# token / hidden 的嵌入维度
 embed_dim: 128
+
+# 多头注意力的头数
 num_heads: 4
+
+# FFN 隐藏层扩张倍数，hidden_dim = embed_dim * mlp_ratio
 mlp_ratio: 4.0
+
+# Transformer block 总层数
 depth: 4
+
+# depth 的别名；如果不是 null，会优先使用它覆盖 depth
 num_layers: null
+
+# 哪些层使用 MoE/Switch FFN，字符串形式，例如 "1,3"
 moe_layers: "1,3"
+
+# 每个 token 选择的专家数量，当前项目实际按 top-1 使用
 top_k: 1
+
+# router auxiliary loss 的权重系数
 router_aux_loss_coef: 0.01
+
+# router z-loss 的权重系数
 router_z_loss_coef: 0.001
+
+# 训练时 router 输入抖动噪声强度
 router_jitter_noise: 0.0
+
+# expert capacity 系数，用于控制每个 expert 一轮可接收多少 token
 capacity_factor: 1.25
+
+# 每个 expert 的最小 capacity
 min_capacity: 4
+
+# token 超过 expert capacity 时是否丢弃
 drop_tokens: true
+
+# Hybrid 模型 CNN stem 的通道数；标准 switch_transformer 不使用该字段
 stem_channels: 64
+
+# token 网格边长：
+# 对 Hybrid 表示 token pooling 后的网格边长；
+# 对标准 Switch 在 patch_size 为 null 时可用于推导 patch 大小
 token_grid_size: 8
+
+# 是否使用 cls token 做分类；false 时用 token mean pooling
 use_cls_token: false

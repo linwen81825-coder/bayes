@@ -1,7 +1,60 @@
-num_clients: 20
+# 联邦学习中的客户端数量
+num_clients: 10
+
+# 服务端通信轮数，也就是全局训练轮数
 server_epochs: 50
+
+# 每轮中每个客户端本地训练的 epoch 数
 client_epochs: 1
+
+# 训练设备，例如 cpu 或 cuda
 device: cuda
+
+# 日志、CSV 结果等输出目录
 save_result: ./save/result
-agg_method: expert_fedavg
+
+# 聚合方法：
+# - fedavg
+# - expert_fedavg
+# - expert_bayes_meta
+agg_method: fedavg
+
+# Bayesian expert aggregation:
+# 客户端局部证据提取阶段的 SGLD 迭代步数
+bayes_sgld_steps: 10
+
+# SGLD burn-in 步数；小于总步数
+bayes_sgld_burnin: 5
+
+# 客户端提取局部 expert 证据时的 SGLD 学习率
+bayes_sgld_lr: 0.00005
+
+# 对角精度上限，防止局部方差过小导致数值不稳定
+bayes_ai_max: 1000.0
+
+# 每个 expert 在客户端最多抽多少个 batch 来估计局部证据
+bayes_evidence_batches: 4
+
+# 只有当 expert 实际处理 token 数达到该阈值时，才为它生成贝叶斯证据
+bayes_min_expert_tokens: 128
+
+# 服务端每轮对一个 expert 的元更新步数
+bayes_meta_steps: 2
+
+# 服务端元更新学习率
+bayes_meta_lr: 0.0005
+
+# 全局先验精度 gamma0 的初始值
+bayes_gamma0_init: 1.0
+
+# 全局先验强度 n0 的初始值
+bayes_n0_init: 1.0
+
+# 是否更新全局先验精度
+bayes_update_precision: true
+
+# 是否更新全局先验强度
+bayes_update_strength: true
+
+# 模型 checkpoint 保存目录
 model_save_path: ./save/model

@@ -1,12 +1,35 @@
-data_name: cifar100
+# 数据集名称，当前支持 cifar10 / cifar100
+data_name: cifar10
+
+# 原始数据下载或读取目录
 data_path: ./data
+
+# 从官方训练集里划给服务端全局验证集的比例
 global_val_ratio: 0.1
+
+# 划分后的索引协议与统计信息保存目录
 data_save_path: ./save/data
+
+# DataLoader 的 batch size
 batch_size: 32
+
+# Dirichlet 划分后，每个客户端至少要有多少条训练样本
 min_datasize: 32
+
+# Dirichlet 分布参数，越小表示客户端间数据越不均匀
 alpha: 0.1
+
+# 全局随机种子，控制数据划分和训练可复现性
 seed: 1
+
+# 索引划分协议文件名
 partition_meta_name: partition_meta.pt
+
+# 划分统计信息文件名
 partition_stats_name: partition_stats.json
+
+# DataLoader 的子进程数量，0 表示主进程加载
 num_workers: 0
+
+# 是否为 DataLoader 开启 pinned memory，加速 CPU->GPU 拷贝
 pin_memory: false

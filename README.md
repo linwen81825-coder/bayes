@@ -1,6 +1,6 @@
 # Federated Learning Experiment
 
-这是一个基于 CIFAR10/CIFAR100 的 FL + MoE 实验项目，当前模型分支为 `Hybrid CNN Stem + Switch Transformer`，默认聚合方法为 `expert_fedavg`。
+这是一个基于 CIFAR10/CIFAR100 的 FL + MoE 实验项目，当前模型分支为 `Hybrid CNN Stem + Switch Transformer`，默认聚合方法为 `expert_bayes_meta`。
 
 ## 环境准备
 
@@ -8,13 +8,13 @@
 
 ```bash
 conda env create -f environment.yml
-conda activate fedwolf
+conda activate bayes_env
 ```
 
 如果环境已经存在，直接激活即可：
 
 ```bash
-conda activate fedwolf
+conda activate bayes_env
 ```
 
 ## 配置方式
@@ -42,6 +42,12 @@ conda activate fedwolf
 - 切 CIFAR10 / CIFAR100：修改 `configs/data.yaml` 中的 `data_name`
 - 改 `alpha`：修改 `configs/data.yaml` 中的 `alpha`
 - 切聚合方法：修改 `configs/train.yaml` 中的 `agg_method`
+- 切模型：修改 `configs/model.yaml` 中的 `model_type`
+  - `hybrid_switch_transformer`：CNN stem + Transformer
+  - `switch_transformer`：patch embedding + Transformer
+  - `switch_transformer` 现在支持显式 `patch_size`；该字段只对标准 Switch 生效
+  - `hybrid_switch_transformer` 仍然使用 `token_grid_size` 控制 token 网格
+  - 结果文件名现在会区分 `model_type`；对 `switch_transformer` 还会进一步区分 `patch_size`
 - 改完 YAML 后，如果变动涉及数据划分（例如 `data_name`、`alpha`、`num_clients`、`global_val_ratio`），先运行 `python -m data.data`，再运行 `python train.py`
 - 如果只改训练或模型配置，且不影响数据划分，可以直接重新训练；否则先重建 partition
 - 如果想切换另一套 YAML，也可以使用轻量命令行入口：
@@ -53,6 +59,8 @@ python train.py
 python -m data.data --data_cfg configs/exp/cifar10.yaml --train_cfg configs/exp/train_fedavg.yaml --model_cfg configs/model.yaml
 python train.py --data_cfg configs/exp/cifar10.yaml --train_cfg configs/exp/train_fedavg.yaml --model_cfg configs/model.yaml
 ```
+
+两种模型当前都提供一致的 MoE 辅助接口，包括 expert/router state dict 提取和 parameter groups。
 
 ## 运行顺序
 
