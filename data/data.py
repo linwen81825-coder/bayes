@@ -16,10 +16,9 @@ class CIFARPartitionBuilder:
     """Build index-based FL partitions for CIFAR10/CIFAR100.
 
     Protocol:
-    1. Official train set is split stratified into global_val and federated_train_pool.
-    2. federated_train_pool is split across clients with Dirichlet non-IID sampling.
-    3. Official test set is kept as global_test and is never used by clients.
-    4. Only indices and metadata are saved; transforms are applied dynamically in loader.py.
+    1. Official train set is split across clients with Dirichlet non-IID sampling.
+    2. Official test set is kept as global_test and is only evaluated by the server.
+    3. Only indices and metadata are saved; transforms are applied dynamically in loader.py.
     """
 
     def __init__(self, args: SimpleNamespace):
@@ -35,7 +34,6 @@ class CIFARPartitionBuilder:
 
         # 官方 train set 只划给客户端；官方 test set 保持统一，不参与客户端划分。
         self.min_datasize = self.args.min_datasize
-        self.global_val_ratio = self.args.global_val_ratio
         self.seed = self.args.seed
         self.rng = np.random.default_rng(self.seed)
         self.train_targets = np.array(self.train_dataset.targets)
@@ -55,27 +53,24 @@ class CIFARPartitionBuilder:
         """Create partition_meta.pt and partition_stats.json."""
 
         self.validate_args()
-        global_val_indices, federated_train_pool_indices = self.stratified_global_val_split()
+        federated_train_pool_indices = list(range(len(self.train_dataset)))
         client_train_indices = self.dirichlet_client_split(federated_train_pool_indices)
 
         meta = {
-            "protocol": "server_global_val_client_train_index_partition",
-            "version": 1,
+            "protocol": "server_test_client_train_index_partition",
+            "version": 2,
             "dataset": self.data_name,
             "data_path": self.data_path,
             "num_classes": self.num_classes,
             "num_clients": self.num_clients,
             "alpha": self.alpha,
             "seed": self.seed,
-            "global_val_ratio": self.global_val_ratio,
             "min_datasize": self.min_datasize,
             "index_space": {
                 "client_train": "official_train",
-                "global_val": "official_train",
                 "global_test": "official_test",
             },
             "splits": {
-                "global_val_indices": global_val_indices,
                 "federated_train_pool_indices": federated_train_pool_indices,
                 "client_train_indices": {
                     str(client_id): indices
@@ -93,29 +88,8 @@ class CIFARPartitionBuilder:
             raise ValueError("num_clients must be positive")
         if self.alpha <= 0:
             raise ValueError("alpha must be positive")
-        if not (0 < self.global_val_ratio < 1):
-            raise ValueError("global_val_ratio must be between 0 and 1")
         if self.min_datasize <= 0:
             raise ValueError("min_datasize must be positive")
-
-    def stratified_global_val_split(self):
-        """Split official train indices into global_val and federated_train_pool."""
-
-        global_val_indices = []
-        federated_train_pool_indices = []
-
-        for class_id in range(self.num_classes):
-            class_indices = np.where(self.train_targets == class_id)[0]
-            class_indices = self.rng.permutation(class_indices)
-            val_size = int(round(len(class_indices) * self.global_val_ratio))
-            val_size = min(max(val_size, 1), len(class_indices) - 1)
-
-            global_val_indices.extend(class_indices[:val_size].tolist())
-            federated_train_pool_indices.extend(class_indices[val_size:].tolist())
-
-        self.rng.shuffle(global_val_indices)
-        self.rng.shuffle(federated_train_pool_indices)
-        return global_val_indices, federated_train_pool_indices
 
     def dirichlet_client_split(self, pool_indices, max_attempts=100):
         """Split federated_train_pool into non-IID client train indices."""
@@ -167,11 +141,9 @@ class CIFARPartitionBuilder:
             "num_clients": self.num_clients,
             "alpha": self.alpha,
             "seed": self.seed,
-            "global_val_ratio": self.global_val_ratio,
             "sizes": {
                 "official_train": len(self.train_dataset),
                 "federated_train_pool": len(splits["federated_train_pool_indices"]),
-                "global_val": len(splits["global_val_indices"]),
                 "global_test": len(splits["global_test_indices"]),
                 "client_train": {
                     client_id: len(indices)
@@ -183,7 +155,6 @@ class CIFARPartitionBuilder:
                     splits["federated_train_pool_indices"],
                     self.train_targets,
                 ),
-                "global_val": self.class_counts(splits["global_val_indices"], self.train_targets),
                 "global_test": self.class_counts(splits["global_test_indices"], self.test_targets),
                 "client_train": client_class_counts,
             },
@@ -215,6 +186,7 @@ if __name__ == '__main__':
         data_cfg_path=cli_args.data_cfg,
         train_cfg_path=cli_args.train_cfg,
         model_cfg_path=cli_args.model_cfg,
+        output_phase="data",
     )
     set_seed(args.seed)
     CIFARPartitionBuilder(args=args).build()

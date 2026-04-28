@@ -10,14 +10,20 @@ client_epochs: 1
 # 训练设备，例如 cpu 或 cuda
 device: cuda
 
-# 日志、CSV 结果等输出目录
-save_result: ./save/result
+# 实验输出根目录；最终会自动派生 save/{run_name}/data|model|result
+save_root: save
+
+# 本次实验名；开新实验时优先只改这个字段
+run_name: exp1
+
+# false 时，如果本次实验的目标输出目录已经非空，会直接报错防止覆盖
+allow_overwrite: false
 
 # 聚合方法：
 # - fedavg
 # - expert_fedavg
 # - expert_bayes_meta
-agg_method: fedavg
+agg_method: expert_fedavg
 
 # Bayesian expert aggregation:
 # 客户端局部证据提取阶段的 SGLD 迭代步数
@@ -55,6 +61,3 @@ bayes_update_precision: true
 
 # 是否更新全局先验强度
 bayes_update_strength: true
-
-# 模型 checkpoint 保存目录
-model_save_path: ./save/model

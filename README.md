@@ -27,11 +27,20 @@ conda activate bayes_env
 - `configs/data.yaml`
   - 数据集、划分协议、随机种子等
 - `configs/train.yaml`
-  - 联邦训练轮数、设备、结果输出路径等
+  - 联邦训练轮数、设备、实验名和覆盖保护等
 - `configs/model.yaml`
   - 模型结构和优化器超参数等
 
 项目入口会调用 `configs/__init__.py` 中的 `load_args()`，将三份 YAML 合并成一个扁平的 `args` 对象，因此项目内部仍然继续使用 `args.xxx` 访问配置。
+
+输出目录现在由 `configs/train.yaml` 中的 `save_root` 和 `run_name` 自动派生：
+
+- `args.data_save_path = {save_root}/{run_name}/data`
+- `args.model_save_path = {save_root}/{run_name}/model`
+- `args.save_result = {save_root}/{run_name}/result`
+
+也就是说，开新实验时优先只改 `run_name`，不再手动维护三条输出路径。
+如果旧配置没有显式填写 `run_name`，加载器会临时使用 `train.yaml` 所在配置目录名作为实验名；仍然建议新实验显式填写 `run_name`。
 
 这三份 YAML 的顶层都必须是 key-value mapping；空文件会按空配置处理。
 三份 YAML 配置文件会在启动时读取并合并。为避免歧义，顶层 key 必须全局唯一；如果出现重复 key，`load_args()` 会直接报错，而不是静默覆盖。
@@ -42,13 +51,16 @@ conda activate bayes_env
 - 切 CIFAR10 / CIFAR100：修改 `configs/data.yaml` 中的 `data_name`
 - 改 `alpha`：修改 `configs/data.yaml` 中的 `alpha`
 - 切聚合方法：修改 `configs/train.yaml` 中的 `agg_method`
+- 开新实验：修改 `configs/train.yaml` 中的 `run_name`
+- 故意覆盖旧实验：保持同一个 `run_name`，并显式设置 `allow_overwrite: true`
+- 防止误覆盖：保持默认 `allow_overwrite: false`
 - 切模型：修改 `configs/model.yaml` 中的 `model_type`
   - `hybrid_switch_transformer`：CNN stem + Transformer
   - `switch_transformer`：patch embedding + Transformer
   - `switch_transformer` 现在支持显式 `patch_size`；该字段只对标准 Switch 生效
   - `hybrid_switch_transformer` 仍然使用 `token_grid_size` 控制 token 网格
   - 结果文件名现在会区分 `model_type`；对 `switch_transformer` 还会进一步区分 `patch_size`
-- 改完 YAML 后，如果变动涉及数据划分（例如 `data_name`、`alpha`、`num_clients`、`global_val_ratio`），先运行 `python -m data.data`，再运行 `python train.py`
+- 改完 YAML 后，如果变动涉及数据划分（例如 `data_name`、`alpha`、`num_clients`），先运行 `python -m data.data`，再运行 `python train.py`
 - 如果只改训练或模型配置，且不影响数据划分，可以直接重新训练；否则先重建 partition
 - 如果想切换另一套 YAML，也可以使用轻量命令行入口：
 
@@ -80,9 +92,8 @@ python train.py
 
 当前项目使用的是 index-based partition 协议：
 
-- official `train` 先做分层切分，得到 `global_val` 和 `federated_train_pool`
-- `federated_train_pool` 再通过 Dirichlet non-IID 划分得到各客户端的 `client_train_indices`
-- official `test` 直接作为 `global_test`
+- official `train` 通过 Dirichlet non-IID 划分得到各客户端的 `client_train_indices`
+- official `test` 保持为统一的 `global_test`，只由服务端评估
 - `partition_meta.pt` 只保存索引和元信息，不保存原始图像数据
 - `partition_stats.json` 保存各 split 的样本规模和类别统计
 
@@ -103,37 +114,43 @@ python -m data.data
 ## 训练与评估协议
 
 - client 只训练自己的 `client_train`
-- server 每轮在 `global_val` 上评估当前全局模型
-- best model 选择规则：
-  - 先比较 `global_val_acc`
-  - 若相同，再比较 `global_val_loss`
-- `global_test` 不参与模型选择，只在训练结束后做最终评估
+- server 每轮在官方 `global_test` 上评估当前全局模型
+- 当前流程不再单独划分 `global_val`
+- 当前 CSV 记录的是每轮 test loss / test acc，不做 best checkpoint 选择
 
 ## 输出文件
 
+如果 `save_root: save` 且 `run_name: exp7`，输出目录结构为：
+
+- `save/exp7/data`
+- `save/exp7/model`
+- `save/exp7/result`
+
+当 `allow_overwrite: false` 时，如果对应阶段的目标目录已经非空，程序会在真正写入前直接报错，提示更换 `run_name` 或显式设置 `allow_overwrite: true`。
+
 ### 数据划分
 
-- `save/data/partition_meta.pt`
+- `save/{run_name}/data/partition_meta.pt`
   - 索引划分协议和元信息
-- `save/data/partition_stats.json`
+- `save/{run_name}/data/partition_stats.json`
   - 各 split 的样本数量和类别分布统计
 
 ### 模型文件
 
-- `save/model/server.pth`
+- `save/{run_name}/model/server.pth`
   - 当前轮 / 最后一轮服务端模型的纯 `state_dict`
-- `save/model/best_server.pth`
-  - 带元信息的 checkpoint dict，不是纯 `state_dict`
-- `save/model/{client_id}.pth`
+- `save/{run_name}/model/server_bayes_state.pth`
+  - `expert_bayes_meta` 使用的服务端贝叶斯状态
+- `save/{run_name}/model/{client_id}.pth`
   - 每个客户端当前模型的纯 `state_dict`
 
 ### 结果与日志
 
-- `save/result/detail/*.csv`
+- `save/{run_name}/result/detail/*.csv`
   - client 侧逐轮训练明细
-- `save/result/server/*.csv`
-  - server 侧逐轮 `global_val` 与最终 `global_test` 结果
-- `save/result/logs/*.log`
+- `save/{run_name}/result/server/*.csv`
+  - server 侧逐轮 `global_test` 结果
+- `save/{run_name}/result/logs/*.log`
   - 本次实验的完整日志
 
 CSV 和日志文件名都会包含：
@@ -142,23 +159,17 @@ CSV 和日志文件名都会包含：
 - `num_clients`
 - `alpha`
 - `seed`
-- `global_val_ratio`
 - `agg_method`
+- `run_name`
 
 ## Checkpoint 约定
 
 项目里模型文件有两种格式：
 
-- `server.pth` / `save/model/{client_id}.pth`
+- `server.pth` / `save/{run_name}/model/{client_id}.pth`
   - 纯模型参数，直接保存 `state_dict`
-- `best_server.pth`
-  - checkpoint dict，至少包含：
-    - `model_state_dict`
-    - `best_round`
-    - `best_val_acc`
-    - `best_val_loss`
-
-如果需要读取 `best_server.pth`，请使用 `utils/utils.py` 中的 `load_best_server_checkpoint(path)`，不要把它当成纯 `state_dict` 直接使用。
+- `server_bayes_state.pth`
+  - `expert_bayes_meta` 的全局贝叶斯状态，不是模型 `state_dict`
 
 ## 常用命令
 

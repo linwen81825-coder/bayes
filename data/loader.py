@@ -6,8 +6,8 @@ from torchvision import transforms
 from torchvision.datasets import CIFAR10, CIFAR100
 
 
-EXPECTED_PROTOCOL = "server_global_val_client_train_index_partition"
-EXPECTED_VERSION = 1
+EXPECTED_PROTOCOL = "server_test_client_train_index_partition"
+EXPECTED_VERSION = 2
 
 
 def get_cifar_stats(data_name):
@@ -74,7 +74,6 @@ def validate_partition_meta(meta, args):
         ("num_clients", meta.get("num_clients"), args.num_clients, "int"),
         ("alpha", meta.get("alpha"), args.alpha, "float"),
         ("seed", meta.get("seed"), args.seed, "int"),
-        ("global_val_ratio", meta.get("global_val_ratio"), args.global_val_ratio, "float"),
         ("min_datasize", meta.get("min_datasize"), args.min_datasize, "int"),
         ("data_path", meta.get("data_path"), args.data_path, "path"),
     ]
@@ -95,7 +94,6 @@ def validate_partition_structure(meta, args):
         )
 
     required_split_keys = {
-        "global_val_indices",
         "federated_train_pool_indices",
         "client_train_indices",
         "global_test_indices",
@@ -129,7 +127,7 @@ def validate_partition_structure(meta, args):
                 "Please regenerate partition_meta.pt and partition_stats.json."
             )
 
-    for key in ["global_val_indices", "federated_train_pool_indices", "global_test_indices"]:
+    for key in ["federated_train_pool_indices", "global_test_indices"]:
         if not isinstance(splits[key], (list, tuple)):
             raise ValueError(
                 f"`splits['{key}']` must be a list or tuple. "
@@ -226,9 +224,6 @@ def build_index_dataset(args, split, client_id=None, meta=None):
             raise ValueError("client_id is required for client_train split")
         indices = splits["client_train_indices"][str(client_id)]
         dataset = build_raw_cifar_dataset(args, train=True, transform=train_transform)
-    elif split == "global_val":
-        indices = splits["global_val_indices"]
-        dataset = build_raw_cifar_dataset(args, train=True, transform=eval_transform)
     elif split == "global_test":
         indices = splits["global_test_indices"]
         dataset = build_raw_cifar_dataset(args, train=False, transform=eval_transform)
@@ -255,8 +250,8 @@ def build_client_train_loader(args, client_id, meta=None):
 
 
 def build_global_eval_loader(args, split, meta=None):
-    if split not in {"global_val", "global_test"}:
-        raise ValueError("split must be global_val or global_test")
+    if split != "global_test":
+        raise ValueError("split must be global_test")
 
     dataset = build_index_dataset(args=args, split=split, meta=meta)
     return DataLoader(

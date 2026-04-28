@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .resnet_cifar_backbone import ResNetCIFARBackbone
+
 
 def make_group_norm(num_channels, max_groups=8):
     # GroupNorm 不依赖 batch statistics，更适合客户端数据分布不同的 FL 场景。
@@ -260,6 +262,9 @@ class HybridSwitchTransformer(nn.Module):
         use_cls_token=False,
         router_aux_loss_coef=0.01,
         router_z_loss_coef=0.001,
+        backbone_type="conv_stem",
+        resnet_use_layer4=False,
+        resnet_base_channels=64,
     ):
         super(HybridSwitchTransformer, self).__init__()
         if embed_dim % num_heads != 0:
@@ -273,17 +278,29 @@ class HybridSwitchTransformer(nn.Module):
         self.use_cls_token = use_cls_token
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_z_loss_coef = router_z_loss_coef
+        self.backbone_type = backbone_type
 
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, stem_channels, kernel_size=3, stride=1, padding=1),
-            make_group_norm(stem_channels),
-            nn.GELU(),
-            nn.Conv2d(stem_channels, stem_channels, kernel_size=3, stride=2, padding=1),
-            make_group_norm(stem_channels),
-            nn.GELU(),
-        )
+        if backbone_type == "conv_stem":
+            self.stem = nn.Sequential(
+                nn.Conv2d(3, stem_channels, kernel_size=3, stride=1, padding=1),
+                make_group_norm(stem_channels),
+                nn.GELU(),
+                nn.Conv2d(stem_channels, stem_channels, kernel_size=3, stride=2, padding=1),
+                make_group_norm(stem_channels),
+                nn.GELU(),
+            )
+            backbone_out_channels = stem_channels
+        elif backbone_type == "resnet18_cifar":
+            self.stem = ResNetCIFARBackbone(
+                use_layer4=resnet_use_layer4,
+                base_channels=resnet_base_channels,
+            )
+            backbone_out_channels = self.stem.out_channels
+        else:
+            raise ValueError(f"Unsupported backbone_type: {backbone_type}")
+
         self.token_pool = nn.AdaptiveAvgPool2d((token_grid_size, token_grid_size))
-        self.token_projection = nn.Conv2d(stem_channels, embed_dim, kernel_size=1)
+        self.token_projection = nn.Conv2d(backbone_out_channels, embed_dim, kernel_size=1)
         num_position_tokens = token_grid_size * token_grid_size + (1 if use_cls_token else 0)
         self.position_embedding = nn.Parameter(
             torch.zeros(1, num_position_tokens, embed_dim)

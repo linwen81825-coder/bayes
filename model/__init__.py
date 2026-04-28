@@ -54,7 +54,13 @@ def build_model_from_args(args):
     )
 
     if args.model_type == "hybrid_switch_transformer":
-        return HybridSwitchTransformer(**common_kwargs)
+        hybrid_kwargs = dict(common_kwargs)
+        hybrid_kwargs.update({
+            "backbone_type": getattr(args, "backbone_type", "conv_stem"),
+            "resnet_use_layer4": getattr(args, "resnet_use_layer4", False),
+            "resnet_base_channels": getattr(args, "resnet_base_channels", 64),
+        })
+        return HybridSwitchTransformer(**hybrid_kwargs)
     if args.model_type == "switch_transformer":
         switch_kwargs = dict(common_kwargs)
         switch_kwargs["patch_size"] = getattr(args, "patch_size", None)

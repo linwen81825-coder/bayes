@@ -4,14 +4,8 @@ data_name: cifar10
 # 原始数据下载或读取目录
 data_path: ./data
 
-# 从官方训练集里划给服务端全局验证集的比例
-global_val_ratio: 0.1
-
-# 划分后的索引协议与统计信息保存目录
-data_save_path: ./save/data
-
 # DataLoader 的 batch size
-batch_size: 32
+batch_size: 128
 
 # Dirichlet 划分后，每个客户端至少要有多少条训练样本
 min_datasize: 32

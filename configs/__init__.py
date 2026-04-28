@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,8 +17,6 @@ DEFAULT_MODEL_CFG_PATH = "configs/model.yaml"
 _REQUIRED_CONFIG_KEYS = (
     "data_name",
     "data_path",
-    "global_val_ratio",
-    "data_save_path",
     "batch_size",
     "min_datasize",
     "alpha",
@@ -30,7 +29,6 @@ _REQUIRED_CONFIG_KEYS = (
     "server_epochs",
     "client_epochs",
     "device",
-    "save_result",
     "agg_method",
     "bayes_sgld_steps",
     "bayes_sgld_burnin",
@@ -44,7 +42,6 @@ _REQUIRED_CONFIG_KEYS = (
     "bayes_n0_init",
     "bayes_update_precision",
     "bayes_update_strength",
-    "model_save_path",
     "model_type",
     "num_experts",
     "dropout",
@@ -66,6 +63,11 @@ _REQUIRED_CONFIG_KEYS = (
     "token_grid_size",
     "use_cls_token",
 )
+_DEFAULT_CONFIG_VALUES = {
+    "save_root": "save",
+    "allow_overwrite": False,
+}
+_RUN_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def _resolve_config_path(path_str: str) -> Path:
@@ -126,6 +128,94 @@ def _raise_if_missing_required_keys(merged_config: dict) -> None:
         )
 
 
+def _sanitize_run_name(run_name: object) -> str:
+    cleaned = _RUN_NAME_PATTERN.sub("_", str(run_name).strip())
+    cleaned = cleaned.strip("._-")
+    if cleaned == "":
+        raise ValueError(
+            "`run_name` is empty after sanitization. "
+            "Please set a non-empty run_name, for example `run_name: exp7`."
+        )
+    return cleaned
+
+
+def _default_run_name_from_config_path(config_path: Path) -> str:
+    if config_path.parent.name == "configs":
+        return "default"
+    return config_path.parent.name
+
+
+def _as_bool(value: object, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    raise ValueError(f"`{key}` must be a boolean value, got {value!r}.")
+
+
+def _derive_output_paths(merged_config: dict, train_cfg_path: Path) -> None:
+    for key, value in _DEFAULT_CONFIG_VALUES.items():
+        merged_config.setdefault(key, value)
+
+    run_name = merged_config.get("run_name")
+    if run_name is None or str(run_name).strip() == "":
+        run_name = _default_run_name_from_config_path(train_cfg_path)
+
+    sanitized_run_name = _sanitize_run_name(run_name)
+    save_root = Path(str(merged_config["save_root"]))
+    run_dir = save_root / sanitized_run_name
+
+    merged_config["run_name"] = sanitized_run_name
+    merged_config["allow_overwrite"] = _as_bool(
+        merged_config["allow_overwrite"],
+        "allow_overwrite",
+    )
+    merged_config["run_dir"] = str(run_dir)
+    merged_config["data_save_path"] = str(run_dir / "data")
+    merged_config["model_save_path"] = str(run_dir / "model")
+    merged_config["save_result"] = str(run_dir / "result")
+
+
+def _is_non_empty_dir(path: Path) -> bool:
+    return path.exists() and path.is_dir() and any(path.iterdir())
+
+
+def _check_output_overwrite(args: SimpleNamespace, output_phase: str | None) -> None:
+    if output_phase is None or args.allow_overwrite:
+        return
+
+    phase_targets = {
+        "data": [args.data_save_path],
+        "train": [args.model_save_path, args.save_result],
+        "all": [args.data_save_path, args.model_save_path, args.save_result],
+    }
+    if output_phase not in phase_targets:
+        raise ValueError(
+            f"Unsupported output_phase: {output_phase!r}. "
+            "Expected one of: data, train, all."
+        )
+
+    blocked_paths = [
+        path
+        for path in phase_targets[output_phase]
+        if _is_non_empty_dir(_resolve_config_path(path))
+    ]
+    if not blocked_paths:
+        return
+
+    formatted_paths = ", ".join(str(path) for path in blocked_paths)
+    raise FileExistsError(
+        "Output directory already exists and is not empty: "
+        f"{formatted_paths}. To protect existing experiment outputs, "
+        "please choose a new `run_name`, or explicitly set "
+        "`allow_overwrite: true` if you really want to reuse this run."
+    )
+
+
 def add_config_path_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add the lightweight YAML-path CLI overrides used by the entrypoints."""
 
@@ -139,10 +229,12 @@ def load_args(
     data_cfg_path: str = DEFAULT_DATA_CFG_PATH,
     train_cfg_path: str = DEFAULT_TRAIN_CFG_PATH,
     model_cfg_path: str = DEFAULT_MODEL_CFG_PATH,
+    output_phase: str | None = None,
 ):
     """Load flat YAML config files and return an args-like namespace."""
 
     config_items = []
+    resolved_train_cfg_path = _resolve_config_path(train_cfg_path)
     for config_path_str in [data_cfg_path, train_cfg_path, model_cfg_path]:
         try:
             resolved_path = _resolve_config_path(config_path_str)
@@ -161,9 +253,12 @@ def load_args(
     for _, config in config_items:
         merged_config.update(config)
 
+    _derive_output_paths(merged_config, resolved_train_cfg_path)
     _raise_if_missing_required_keys(merged_config)
 
-    return SimpleNamespace(**merged_config)
+    args = SimpleNamespace(**merged_config)
+    _check_output_overwrite(args, output_phase)
+    return args
 
 
 __all__ = [

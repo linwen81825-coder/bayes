@@ -29,11 +29,6 @@ class Server:
         self.logger = logger
         os.makedirs(self.args.model_save_path, exist_ok=True)
         self.partition_meta = load_partition_meta(self.args)
-        self.global_val_loader = build_global_eval_loader(
-            args=self.args,
-            split="global_val",
-            meta=self.partition_meta,
-        )
         self.global_test_loader = build_global_eval_loader(
             args=self.args,
             split="global_test",
@@ -47,10 +42,6 @@ class Server:
         self.sync_clients_model()
         self.num_experts = self.args.num_experts
         self.criterion = nn.CrossEntropyLoss()
-        self.best_val_acc = -1.0
-        self.best_val_loss = float("inf")
-        self.best_round = 0
-        self.best_state_dict = None
         self.last_client_expert_usages = []
         self.last_client_bayes_evidence = []
         # 初始化 CSV 结果文件，后续客户端训练会不断追加记录。
@@ -251,20 +242,15 @@ class Server:
             # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
             self.aggregation()
 
-            # global_val 用于模型选择；global_test 只在训练结束后评估一次。
-            val_loss, val_acc = self.evaluate_global_model(self.global_val_loader)
-            self.logger.info(f"--server_global_val_loss : {val_loss:.4f} --server_global_val_acc : {val_acc:.4f}\n")
-            is_best = self.update_best_model(val_acc=val_acc, val_loss=val_loss, round_id=c_T + 1)
+            # 不再单独划分验证集；服务端每轮直接在官方 test set 上测试当前全局模型。
+            test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
+            self.logger.info(f"--server_global_test_loss : {test_loss:.4f} --server_global_test_acc : {test_acc:.4f}\n")
             record_server_result(
                 {
-                    "phase": "val",
+                    "phase": "test",
                     "round": c_T + 1,
-                    "val_loss": val_loss,
-                    "val_acc": val_acc,
-                    "best_val_acc": self.best_val_acc,
-                    "best_val_loss": self.best_val_loss,
-                    "is_best": int(is_best),
-                    "selected_for_test": 0,
+                    "test_loss": test_loss,
+                    "test_acc": test_acc,
                 },
                 self.args,
             )
@@ -272,8 +258,6 @@ class Server:
             # 每轮结束保存当前服务端模型，供下一轮客户端同步。
             self.save_server_model()
             torch.cuda.empty_cache()
-
-        self.evaluate_best_on_global_test()
 
     def evaluate_global_model(self, data_loader):
         self.model.to(self.device)
@@ -296,76 +280,6 @@ class Server:
         eval_acc = running_corrects.double() / len(data_loader.dataset)
         self.model.to("cpu")
         return eval_loss, eval_acc.item()
-
-    def update_best_model(self, val_acc, val_loss, round_id):
-        # 模型选择规则：先比较 global_val_acc；acc 相同再比较 global_val_loss。
-        is_better = (
-            val_acc > self.best_val_acc
-            or (val_acc == self.best_val_acc and val_loss < self.best_val_loss)
-        )
-        if not is_better:
-            return False
-
-        self.best_val_acc = val_acc
-        self.best_val_loss = val_loss
-        self.best_round = round_id
-        self.best_state_dict = {
-            key: value.detach().cpu().clone()
-            for key, value in self.model.state_dict().items()
-        }
-        best_model_path = os.path.join(self.args.model_save_path, "best_server.pth")
-        torch.save(
-            {
-                "model_state_dict": self.best_state_dict,
-                "best_round": self.best_round,
-                "best_val_acc": self.best_val_acc,
-                "best_val_loss": self.best_val_loss,
-            },
-            best_model_path,
-        )
-        self.logger.info(
-            f"--best_global_val_acc : {self.best_val_acc:.4f} "
-            f"--best_global_val_loss : {self.best_val_loss:.4f} "
-            f"--best_round : {self.best_round}\n"
-        )
-        return True
-
-    def evaluate_best_on_global_test(self):
-        last_server_state = {
-            key: value.detach().cpu().clone()
-            for key, value in self.model.state_dict().items()
-        }
-
-        if self.best_state_dict is None:
-            self.best_state_dict = {
-                key: value.detach().cpu().clone()
-                for key, value in self.model.state_dict().items()
-            }
-            self.best_round = self.server_epochs
-
-        self.model.load_state_dict(self.best_state_dict)
-        test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
-        self.logger.info(
-            f"--final_global_test_loss : {test_loss:.4f} "
-            f"--final_global_test_acc : {test_acc:.4f} "
-            f"--selected_round : {self.best_round}\n"
-        )
-        record_server_result(
-            {
-                "phase": "final_test",
-                "round": self.best_round,
-                "test_loss": test_loss,
-                "test_acc": test_acc,
-                "selected_round": self.best_round,
-                "best_val_acc": self.best_val_acc,
-                "best_val_loss": self.best_val_loss,
-                "selected_for_test": 1,
-            },
-            self.args,
-        )
-        # server.pth should keep the current/last-round server model semantics.
-        # Restore the last server state after testing the best checkpoint.
-        self.model.load_state_dict(last_server_state)
 
     def get_client_train_size(self,client_id):
         # FedAvg 使用客户端训练样本数作为聚合权重。

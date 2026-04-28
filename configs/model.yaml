@@ -1,7 +1,7 @@
 # 模型类型：
 # hybrid_switch_transformer = CNN stem + Transformer
 # switch_transformer = patch embedding + Transformer
-model_type: switch_transformer
+model_type: hybrid_switch_transformer
 
 # 标准 switch_transformer 的显式 patch 大小；
 # 为 null 时会回退到兼容逻辑，根据 token_grid_size 推导
@@ -9,7 +9,7 @@ model_type: switch_transformer
 patch_size: null
 
 # 每个 Switch FFN 中的专家数量
-num_experts: 8
+num_experts: 8 
 
 # Transformer / MLP 中使用的 dropout 比例
 dropout: 0.2
@@ -58,6 +58,15 @@ drop_tokens: true
 
 # Hybrid 模型 CNN stem 的通道数；标准 switch_transformer 不使用该字段
 stem_channels: 64
+
+# Hybrid 模型前端 backbone：conv_stem 保持旧行为，resnet18_cifar 使用 CIFAR ResNet-18 风格 backbone
+backbone_type: resnet18_cifar
+
+# resnet18_cifar 是否使用 layer4；false 时输出约 8x8 feature map
+resnet_use_layer4: true
+
+# resnet18_cifar 的基础通道数
+resnet_base_channels: 64
 
 # token 网格边长：
 # 对 Hybrid 表示 token pooling 后的网格边长；

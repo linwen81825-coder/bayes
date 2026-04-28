@@ -31,8 +31,8 @@ def build_logger(args):
     console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 
-    # 文件日志：同时把训练过程保存到 save/result/logs/*.log。
-    file_handler = logging.FileHandler(os.path.join(log_dir, f"{logger_name}.log"))
+    # 文件日志：同时把训练过程保存到 save/{run_name}/result/logs/*.log。
+    file_handler = logging.FileHandler(os.path.join(log_dir, f"{logger_name}.log"), mode="w")
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 
@@ -51,6 +51,7 @@ def main():
         data_cfg_path=cli_args.data_cfg,
         train_cfg_path=cli_args.train_cfg,
         model_cfg_path=cli_args.model_cfg,
+        output_phase="train",
     )
     set_seed(args.seed)
     logger = build_logger(args)

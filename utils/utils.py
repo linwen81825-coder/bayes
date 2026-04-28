@@ -1,9 +1,12 @@
 import csv
 import os
 import random
+import re
 
 import numpy as np
 import torch
+
+_STEM_SAFE_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def set_seed(seed:int):
@@ -25,7 +28,6 @@ def get_experiment_stem(args):
         f"clients_{args.num_clients}_"
         f"alpha_{args.alpha}_"
         f"seed_{args.seed}_"
-        f"gval_{args.global_val_ratio}_"
         f"agg_{args.agg_method}_"
         f"model_{args.model_type}"
     )
@@ -33,6 +35,11 @@ def get_experiment_stem(args):
         patch_size = getattr(args, "patch_size", None)
         patch_tag = "auto" if patch_size is None else str(patch_size)
         stem += f"_patch_{patch_tag}"
+    run_name = getattr(args, "run_name", None)
+    if run_name:
+        safe_run_name = _STEM_SAFE_PATTERN.sub("_", str(run_name).strip()).strip("._-")
+        if safe_run_name:
+            stem += f"_run_{safe_run_name}"
     return stem
 
 
@@ -49,36 +56,6 @@ def get_server_csv_path(args):
     filename = f"{get_experiment_stem(args)}.csv"
     return os.path.join(server_dir, filename)
 
-
-def load_best_server_checkpoint(path):
-    """Load `best_server.pth`, which is a checkpoint dict, not a pure state_dict.
-
-    By convention:
-    - `server.pth` and client `{id}.pth` store pure model state_dict objects.
-    - `best_server.pth` stores a checkpoint dict with model_state_dict plus best metrics.
-    """
-
-    checkpoint = torch.load(path, map_location="cpu")
-    required_keys = {
-        "model_state_dict",
-        "best_round",
-        "best_val_acc",
-        "best_val_loss",
-    }
-
-    if not isinstance(checkpoint, dict):
-        raise ValueError(
-            f"`{path}` must be a checkpoint dict for best_server.pth, got {type(checkpoint).__name__}."
-        )
-
-    missing_keys = required_keys - set(checkpoint.keys())
-    if missing_keys:
-        raise ValueError(
-            f"`{path}` is missing checkpoint keys {sorted(missing_keys)}. "
-            "best_server.pth must contain model_state_dict, best_round, best_val_acc, and best_val_loss."
-        )
-
-    return checkpoint
 
 def init_result_csv(args):
     """初始化结果 CSV，写入表头。
@@ -101,15 +78,8 @@ def init_server_result_csv(args):
         fieldnames = [
             'phase',
             'round',
-            'val_loss',
-            'val_acc',
-            'best_val_acc',
-            'best_val_loss',
-            'is_best',
-            'selected_for_test',
             'test_loss',
             'test_acc',
-            'selected_round',
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
@@ -130,15 +100,8 @@ def record_server_result(record_dic:dict, args):
         fieldnames = [
             'phase',
             'round',
-            'val_loss',
-            'val_acc',
-            'best_val_acc',
-            'best_val_loss',
-            'is_best',
-            'selected_for_test',
             'test_loss',
             'test_acc',
-            'selected_round',
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writerow(record_dic)
