@@ -42,6 +42,7 @@ class Client:
         )
         self.bayes_sgld_lr = float(getattr(self.args, "bayes_sgld_lr", 0.00005))
         self.bayes_ai_max = float(getattr(self.args, "bayes_ai_max", 1e3))
+        self.bayes_sgld_var_floor = max(float(getattr(self.args, "bayes_sgld_var_floor", 0.0)), 0.0)
         self.bayes_evidence_batches = max(int(getattr(self.args, "bayes_evidence_batches", 8)), 1)
 
     def load_client_model(self):
@@ -209,10 +210,45 @@ class Client:
         evidence_model.load_state_dict(cpu_state_dict)
         return evidence_model
 
+    def summarize_named_tensor_state(self, state, high_clip=None):
+        values = []
+        for value in state.values():
+            if torch.is_tensor(value) and torch.is_floating_point(value):
+                values.append(value.detach().cpu().float().reshape(-1))
+
+        if not values:
+            return {
+                "numel": 0,
+                "mean": None,
+                "min": None,
+                "max": None,
+                "low_pct": None,
+                "high_pct": None,
+            }
+
+        vector = torch.cat(values)
+        low_threshold = 1.0001e-4
+        summary = {
+            "numel": int(vector.numel()),
+            "mean": round(float(vector.mean().item()), 6),
+            "min": round(float(vector.min().item()), 6),
+            "max": round(float(vector.max().item()), 6),
+            "low_pct": round(float((vector <= low_threshold).float().mean().item()), 6),
+        }
+        if high_clip is None or high_clip <= 0:
+            summary["high_pct"] = None
+        else:
+            high_threshold = 0.9999 * float(high_clip)
+            summary["high_pct"] = round(float((vector >= high_threshold).float().mean().item()), 6)
+        return summary
+
+    def count_cached_samples(self, batch_cache):
+        return int(sum(labels.size(0) for _, labels in batch_cache))
+
     def fit_local_expert_evidence(self, layer_id, expert_id, usage, batch_cache):
         evidence_model = self.build_evidence_model()
         try:
-            mean_state, precision_state = run_expert_sgld_fit(
+            mean_state, precision_state, sgld_diag = run_expert_sgld_fit(
                 model=evidence_model,
                 batch_cache=batch_cache,
                 criterion=self.criterion,
@@ -223,6 +259,7 @@ class Client:
                 burnin=self.bayes_sgld_burnin,
                 alp=self.bayes_sgld_lr,
                 ai_max=self.bayes_ai_max,
+                var_floor=self.bayes_sgld_var_floor,
             )
         finally:
             del evidence_model
@@ -234,6 +271,7 @@ class Client:
             "num_batches": len(batch_cache),
             "mean_state": mean_state,
             "precision_state": precision_state,
+            "sgld_diag": sgld_diag,
         }
 
     def extract_bayesian_evidence(self, layer_stats, batch_cache_by_expert):
@@ -261,11 +299,41 @@ class Client:
             if len(batch_cache) == 0:
                 continue
             layer_evidence = evidence_by_layer.setdefault(layer_id, {})
-            layer_evidence[expert_id] = self.fit_local_expert_evidence(
+            expert_evidence = self.fit_local_expert_evidence(
                 layer_id=layer_id,
                 expert_id=expert_id,
                 usage=usage,
                 batch_cache=batch_cache,
+            )
+            layer_evidence[expert_id] = expert_evidence
+
+            precision_summary = self.summarize_named_tensor_state(
+                expert_evidence["precision_state"],
+                high_clip=self.bayes_ai_max,
+            )
+            mean_summary = self.summarize_named_tensor_state(expert_evidence["mean_state"])
+            sgld_diag = expert_evidence.get("sgld_diag", {})
+            self.logger.info(
+                f"--client: {self.client_id} --bayes_evidence_diag "
+                f"--layer:{layer_id} --expert:{expert_id} --usage:{int(usage)} "
+                f"--batches:{len(batch_cache)} --cached_samples:{self.count_cached_samples(batch_cache)} "
+                f"--mean_numel:{mean_summary['numel']} "
+                f"--precision_mean:{precision_summary['mean']} "
+                f"--precision_min:{precision_summary['min']} "
+                f"--precision_max:{precision_summary['max']} "
+                f"--precision_low_pct:{precision_summary['low_pct']} "
+                f"--precision_high_pct:{precision_summary['high_pct']} "
+                f"--sgld_samples:{sgld_diag.get('sample_count')} "
+                f"--sgld_lr:{sgld_diag.get('sgld_lr')} "
+                f"--sgld_var_floor:{sgld_diag.get('sgld_var_floor')} "
+                f"--raw_var_mean:{sgld_diag.get('raw_var_mean')} "
+                f"--raw_var_min:{sgld_diag.get('raw_var_min')} "
+                f"--raw_var_max:{sgld_diag.get('raw_var_max')} "
+                f"--raw_var_under_floor_pct:{sgld_diag.get('raw_var_under_floor_pct')} "
+                f"--unclipped_precision_mean:{sgld_diag.get('unclipped_precision_mean')} "
+                f"--unclipped_precision_max:{sgld_diag.get('unclipped_precision_max')} "
+                f"--unclipped_precision_over_ai_max_pct:"
+                f"{sgld_diag.get('unclipped_precision_over_ai_max_pct')}"
             )
 
         return evidence_by_layer

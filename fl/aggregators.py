@@ -242,6 +242,8 @@ class ExpertBayesMetaAggregator(Aggregator):
                 contributing_clients=0,
                 local_posterior_count=0,
                 status="skipped",
+                expert_keys=expert_keys,
+                client_payloads=client_payloads,
             )
             return {
                 key: global_state[key].detach().cpu().clone()
@@ -280,6 +282,10 @@ class ExpertBayesMetaAggregator(Aggregator):
             status="updated",
             optimized_log_precision_state=optimized_log_precision_state,
             optimized_log_n0=optimized_log_n0,
+            expert_keys=expert_keys,
+            client_payloads=client_payloads,
+            global_state=global_state,
+            optimized_mean_state=optimized_mean_state,
         )
         return aggregated_params, len(client_payloads), local_posterior_count, expert_metric
 
@@ -360,6 +366,93 @@ class ExpertBayesMetaAggregator(Aggregator):
             final_local_posterior_count,
             float(final_meta_loss.detach().cpu().item()),
         )
+
+    def _summarize_client_payloads(self, client_payloads, expert_keys):
+        if not client_payloads:
+            return {
+                "usage_total": 0.0,
+                "usage_max": 0.0,
+                "num_batches_total": 0,
+                "num_batches_mean": 0.0,
+                "local_precision_mean": None,
+                "local_precision_min": None,
+                "local_precision_max": None,
+                "local_precision_low_pct": None,
+                "local_precision_high_pct": None,
+            }
+
+        usage_values = [float(payload.get("usage", 0.0)) for payload in client_payloads]
+        batch_values = [int(payload.get("num_batches", 0)) for payload in client_payloads]
+        precision_values = []
+        for payload in client_payloads:
+            precision_state = payload.get("precision_state", {})
+            for key in expert_keys:
+                value = precision_state.get(key)
+                if torch.is_tensor(value) and torch.is_floating_point(value):
+                    precision_values.append(value.detach().cpu().float().reshape(-1))
+
+        summary = {
+            "usage_total": round(float(sum(usage_values)), 6),
+            "usage_max": round(float(max(usage_values)), 6),
+            "num_batches_total": int(sum(batch_values)),
+            "num_batches_mean": round(float(sum(batch_values) / max(len(batch_values), 1)), 6),
+        }
+        if not precision_values:
+            summary.update(
+                {
+                    "local_precision_mean": None,
+                    "local_precision_min": None,
+                    "local_precision_max": None,
+                    "local_precision_low_pct": None,
+                    "local_precision_high_pct": None,
+                }
+            )
+            return summary
+
+        precision_vector = torch.cat(precision_values)
+        low_threshold = 1.0001e-4
+        high_threshold = 0.9999 * self.max_precision
+        summary.update(
+            {
+                "local_precision_mean": round(float(precision_vector.mean().item()), 6),
+                "local_precision_min": round(float(precision_vector.min().item()), 6),
+                "local_precision_max": round(float(precision_vector.max().item()), 6),
+                "local_precision_low_pct": round(
+                    float((precision_vector <= low_threshold).float().mean().item()),
+                    6,
+                ),
+                "local_precision_high_pct": round(
+                    float((precision_vector >= high_threshold).float().mean().item()),
+                    6,
+                ),
+            }
+        )
+        return summary
+
+    def _summarize_mean_update(self, global_state, optimized_mean_state, expert_keys):
+        if global_state is None or optimized_mean_state is None:
+            return {
+                "param_delta_norm": None,
+                "param_prior_norm": None,
+                "param_delta_rel": None,
+            }
+
+        delta_sq = 0.0
+        prior_sq = 0.0
+        for key in expert_keys:
+            prior_value = global_state[key].detach().cpu().float()
+            updated_value = optimized_mean_state[key].detach().cpu().float()
+            delta_sq += float((updated_value - prior_value).square().sum().item())
+            prior_sq += float(prior_value.square().sum().item())
+
+        delta_norm = math.sqrt(max(delta_sq, 0.0))
+        prior_norm = math.sqrt(max(prior_sq, 0.0))
+        delta_rel = delta_norm / max(prior_norm, 1e-12)
+        return {
+            "param_delta_norm": round(delta_norm, 6),
+            "param_prior_norm": round(prior_norm, 6),
+            "param_delta_rel": round(delta_rel, 6),
+        }
 
     def _compute_expert_meta_loss(
         self,
@@ -442,6 +535,10 @@ class ExpertBayesMetaAggregator(Aggregator):
         status,
         optimized_log_precision_state=None,
         optimized_log_n0=None,
+        expert_keys=None,
+        client_payloads=None,
+        global_state=None,
+        optimized_mean_state=None,
     ):
         if optimized_log_precision_state is None:
             log_precision_state = prior_state.get("log_precision_state", {})
@@ -455,9 +552,14 @@ class ExpertBayesMetaAggregator(Aggregator):
             gamma_values.append(torch.exp(value.detach().cpu().float()).reshape(-1))
 
         if gamma_values:
-            avg_gamma0 = float(torch.cat(gamma_values).mean().item())
+            gamma_vector = torch.cat(gamma_values)
+            avg_gamma0 = float(gamma_vector.mean().item())
+            min_gamma0 = float(gamma_vector.min().item())
+            max_gamma0 = float(gamma_vector.max().item())
         else:
             avg_gamma0 = float(self.gamma0_init)
+            min_gamma0 = float(self.gamma0_init)
+            max_gamma0 = float(self.gamma0_init)
 
         if optimized_log_n0 is None:
             log_n0 = prior_state.get("log_n0")
@@ -468,7 +570,12 @@ class ExpertBayesMetaAggregator(Aggregator):
         else:
             n0 = float(torch.exp(optimized_log_n0.detach().cpu().float()).item())
 
-        return {
+        expert_keys = expert_keys or []
+        client_payloads = client_payloads or []
+        payload_summary = self._summarize_client_payloads(client_payloads, expert_keys)
+        update_summary = self._summarize_mean_update(global_state, optimized_mean_state, expert_keys)
+
+        metric = {
             "status": status,
             "layer_id": str(layer_id),
             "expert_id": str(expert_id),
@@ -477,7 +584,12 @@ class ExpertBayesMetaAggregator(Aggregator):
             "meta_loss": None if meta_loss is None else round(float(meta_loss), 6),
             "n0": round(n0, 6),
             "avg_gamma0": round(avg_gamma0, 6),
+            "min_gamma0": round(min_gamma0, 6),
+            "max_gamma0": round(max_gamma0, 6),
         }
+        metric.update(payload_summary)
+        metric.update(update_summary)
+        return metric
 
     def _collect_client_payloads(self, expert_evidence, layer_id, expert_id):
         payloads = []
@@ -497,6 +609,7 @@ class ExpertBayesMetaAggregator(Aggregator):
             payloads.append(
                 {
                     "usage": usage,
+                    "num_batches": int(evidence.get("num_batches", 0)),
                     "mean_state": evidence.get("mean_state", {}),
                     "precision_state": evidence.get("precision_state", {}),
                 }

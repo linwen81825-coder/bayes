@@ -170,6 +170,7 @@ def run_expert_sgld_fit(
     burnin,
     alp,
     ai_max,
+    var_floor=0.0,
 ):
     # 参考 fewshot_vit/niwmeta.py 中的 run_sgld_gaussian_fit：
     # 对 burn-in 后的参数样本做均值 / 方差统计，再把方差倒数当作 precision。
@@ -189,21 +190,26 @@ def run_expert_sgld_fit(
 
     total_samples = sum(int(labels.size(0)) for _, labels in batch_cache)
     total_samples = max(total_samples, 1)
+    # Match fewshot_vit/niwmeta.py as closely as the MoE setting allows:
+    # Adam uses alp / N, while Langevin noise is injected into gradients.
     sgld_lr = float(alp) / float(total_samples)
     sgld_lr = max(sgld_lr, 1e-12)
+    var_floor = max(float(var_floor), 0.0)
+    effective_var_floor = max(var_floor, 1e-12)
     optim = torch.optim.Adam(params=target_params, lr=sgld_lr)
+    noise_scale = math.sqrt(1.0 / sgld_lr)
 
     moment1 = None
     moment2 = None
     sample_count = 0
-    noise_scale = math.sqrt(1.0 / sgld_lr)
 
     fallback_precision = 1e-4
+    last_seen_samples = 0
 
     for step_idx in range(steps):
         weighted_loss = None
         seen_samples = 0
-        optim.zero_grad()
+        optim.zero_grad(set_to_none=True)
 
         for cached_inputs, cached_labels in batch_cache:
             inputs = cached_inputs.to(device, non_blocking=True)
@@ -223,14 +229,16 @@ def run_expert_sgld_fit(
         if weighted_loss is None or seen_samples <= 0:
             break
 
+        last_seen_samples = int(seen_samples)
         loss = weighted_loss / float(seen_samples)
         loss.backward()
 
         with torch.no_grad():
+            grad_scale = float(seen_samples) / 2.0
             for param in target_params:
                 if param.grad is None:
                     continue
-                param.grad.mul_(float(seen_samples) / 2.0)
+                param.grad.mul_(grad_scale)
                 param.grad.add_(noise_scale * torch.randn_like(param))
 
         optim.step()
@@ -251,6 +259,21 @@ def run_expert_sgld_fit(
 
     with torch.no_grad():
         reference_state = model.state_dict()
+        sgld_diag = {
+            "sample_count": int(sample_count),
+            "total_cached_samples": int(total_samples),
+            "last_seen_samples": int(last_seen_samples),
+            "sgld_lr": float(sgld_lr),
+            "sgld_var_floor": float(var_floor),
+            "raw_var_mean": None,
+            "raw_var_min": None,
+            "raw_var_max": None,
+            "raw_var_under_floor_pct": None,
+            "unclipped_precision_mean": None,
+            "unclipped_precision_min": None,
+            "unclipped_precision_max": None,
+            "unclipped_precision_over_ai_max_pct": None,
+        }
         if moment1 is None:
             mean_vector = torch.nn.utils.parameters_to_vector(
                 [param.detach() for param in target_params]
@@ -261,9 +284,32 @@ def run_expert_sgld_fit(
             precision_vector = torch.full_like(mean_vector, fill_value=fallback_precision)
         else:
             unbiased_var = (sample_count / (sample_count - 1.0)) * (moment2 - moment1.square())
-            precision_vector = (1.0 / unbiased_var.clamp(min=1e-12)).clamp(min=1e-4, max=ai_max)
+            raw_var = unbiased_var.clamp(min=0.0)
+            # Optional numerical floor for degenerate finite-sample SGLD variance.
+            # With var_floor=0.0, this reduces to the previous 1e-12 numerical guard.
+            effective_var = raw_var.clamp(min=effective_var_floor)
+            precision_before_clip = 1.0 / effective_var
+            sgld_diag.update(
+                {
+                    "raw_var_mean": round(float(raw_var.mean().item()), 12),
+                    "raw_var_min": round(float(raw_var.min().item()), 12),
+                    "raw_var_max": round(float(raw_var.max().item()), 12),
+                    "raw_var_under_floor_pct": round(
+                        float((raw_var <= effective_var_floor).float().mean().item()),
+                        6,
+                    ),
+                    "unclipped_precision_mean": round(float(precision_before_clip.mean().item()), 6),
+                    "unclipped_precision_min": round(float(precision_before_clip.min().item()), 6),
+                    "unclipped_precision_max": round(float(precision_before_clip.max().item()), 6),
+                    "unclipped_precision_over_ai_max_pct": round(
+                        float((precision_before_clip >= float(ai_max)).float().mean().item()),
+                        6,
+                    ),
+                }
+            )
+            precision_vector = precision_before_clip.clamp(min=1e-4, max=ai_max)
             mean_vector = moment1
 
     mean_state = vector_to_named_state(reference_state, target_names, mean_vector)
     precision_state = vector_to_named_state(reference_state, target_names, precision_vector)
-    return mean_state, precision_state
+    return mean_state, precision_state, sgld_diag
