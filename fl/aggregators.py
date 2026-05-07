@@ -1,6 +1,7 @@
 import collections
 import copy
 import math
+import time
 from abc import ABC, abstractmethod
 
 import torch
@@ -150,6 +151,10 @@ class ExpertBayesMetaAggregator(Aggregator):
         self.meta_lr = float(getattr(args, "bayes_meta_lr", 0.001))
         self.update_precision = bool(getattr(args, "bayes_update_precision", True))
         self.update_strength = bool(getattr(args, "bayes_update_strength", True))
+        self.meta_device = self._resolve_meta_device(args)
+        self.empty_cache_after_aggregation = bool(
+            getattr(args, "bayes_empty_cache_after_aggregation", False)
+        )
         self.client_weight_mode = str(
             getattr(args, "bayes_client_weight_mode", "uniform")
         ).lower()
@@ -158,8 +163,38 @@ class ExpertBayesMetaAggregator(Aggregator):
                 "bayes_client_weight_mode must be one of: "
                 "uniform, sqrt_usage, usage"
             )
+        print(
+            "[ExpertBayesMetaAggregator] "
+            f"bayes_meta_device={self.meta_device} "
+            f"args.device={getattr(args, 'device', 'cpu')} "
+            f"cuda_available={torch.cuda.is_available()}"
+        )
+
+    def _resolve_meta_device(self, args):
+        requested = str(getattr(args, "bayes_meta_device", "auto")).lower()
+        base_device = str(getattr(args, "device", "cpu"))
+
+        if requested == "auto":
+            if base_device.startswith("cuda") and torch.cuda.is_available():
+                return torch.device(base_device)
+            return torch.device("cpu")
+
+        if requested.startswith("cuda"):
+            if not torch.cuda.is_available():
+                print(
+                    "[ExpertBayesMetaAggregator] CUDA requested for "
+                    "bayes_meta_device but not available; fallback to CPU"
+                )
+                return torch.device("cpu")
+            return torch.device(requested)
+
+        if requested == "cpu":
+            return torch.device("cpu")
+
+        raise ValueError(f"Unsupported bayes_meta_device: {requested}")
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
+        aggregate_start_time = time.perf_counter()
         if len(client_updates) == 0:
             raise ValueError("ExpertBayesMeta requires at least one client update")
         if len(client_updates) != len(client_weights):
@@ -189,6 +224,8 @@ class ExpertBayesMetaAggregator(Aggregator):
             "evidence_clients": 0,
             "expert_param_groups": len(expert_groups),
             "local_posteriors": 0,
+            "bayes_meta_device": str(self.meta_device),
+            "bayes_cuda_available": bool(torch.cuda.is_available()),
             "expert_meta_stats": {},
         }
 
@@ -213,6 +250,12 @@ class ExpertBayesMetaAggregator(Aggregator):
                 aggregated_state[key] = value
 
         updated_bayes_state["round"] = int(updated_bayes_state.get("round", 0)) + 1
+        metrics["bayes_aggregation_time_sec"] = round(
+            time.perf_counter() - aggregate_start_time,
+            4,
+        )
+        if self.meta_device.type == "cuda" and self.empty_cache_after_aggregation:
+            torch.cuda.empty_cache()
 
         return {
             "model_state": aggregated_state,
@@ -229,6 +272,7 @@ class ExpertBayesMetaAggregator(Aggregator):
         updated_bayes_state,
         expert_evidence,
     ):
+        expert_start_time = time.perf_counter()
         prior_state = self._get_or_init_prior_state(
             updated_bayes_state=updated_bayes_state,
             layer_id=layer_id,
@@ -252,6 +296,10 @@ class ExpertBayesMetaAggregator(Aggregator):
                 status="skipped",
                 expert_keys=expert_keys,
                 client_payloads=client_payloads,
+            )
+            expert_metric["expert_meta_time_sec"] = round(
+                time.perf_counter() - expert_start_time,
+                4,
             )
             return {
                 key: global_state[key].detach().cpu().clone()
@@ -295,6 +343,10 @@ class ExpertBayesMetaAggregator(Aggregator):
             global_state=global_state,
             optimized_mean_state=optimized_mean_state,
         )
+        expert_metric["expert_meta_time_sec"] = round(
+            time.perf_counter() - expert_start_time,
+            4,
+        )
         return aggregated_params, len(client_payloads), local_posterior_count, expert_metric
 
     def _optimize_expert_prior(
@@ -311,17 +363,34 @@ class ExpertBayesMetaAggregator(Aggregator):
 
         for key in expert_keys:
             mean_param = torch.nn.Parameter(
-                global_state[key].detach().cpu().clone().to(dtype=torch.float32)
+                global_state[key]
+                .detach()
+                .to(device=self.meta_device, dtype=torch.float32)
+                .clone()
             )
             prior_mean_params[key] = mean_param
             optim_params.append(mean_param)
 
-            reference_tensor = global_state[key].detach().cpu().clone().to(dtype=torch.float32)
+            reference_tensor = (
+                global_state[key]
+                .detach()
+                .to(device=self.meta_device, dtype=torch.float32)
+                .clone()
+            )
             log_precision = prior_state.get("log_precision_state", {}).get(key)
             if log_precision is None or not torch.is_floating_point(log_precision):
-                log_precision = torch.full_like(reference_tensor, fill_value=math.log(self.gamma0_init))
+                log_precision = torch.full_like(
+                    reference_tensor,
+                    fill_value=math.log(self.gamma0_init),
+                    device=self.meta_device,
+                )
             else:
-                log_precision = log_precision.detach().cpu().clone().to(dtype=torch.float32)
+                log_precision = (
+                    log_precision
+                    .detach()
+                    .to(device=self.meta_device, dtype=torch.float32)
+                    .clone()
+                )
 
             log_precision_param = torch.nn.Parameter(
                 log_precision,
@@ -333,9 +402,18 @@ class ExpertBayesMetaAggregator(Aggregator):
 
         log_n0_value = prior_state.get("log_n0")
         if log_n0_value is None:
-            log_n0_value = torch.tensor(math.log(max(float(prior_n0.item()), self.min_precision)), dtype=torch.float32)
+            log_n0_value = torch.tensor(
+                math.log(max(float(prior_n0.item()), self.min_precision)),
+                dtype=torch.float32,
+                device=self.meta_device,
+            )
         else:
-            log_n0_value = log_n0_value.detach().cpu().clone().to(dtype=torch.float32)
+            log_n0_value = (
+                log_n0_value
+                .detach()
+                .to(device=self.meta_device, dtype=torch.float32)
+                .clone()
+            )
         log_n0_param = torch.nn.Parameter(
             log_n0_value,
             requires_grad=self.update_strength,
@@ -519,6 +597,16 @@ class ExpertBayesMetaAggregator(Aggregator):
                     continue
 
                 prior_mean = prior_mean_params[key]
+                target_device = prior_mean.device
+                target_dtype = prior_mean.dtype
+                local_mean = local_mean.detach().to(
+                    device=target_device,
+                    dtype=target_dtype,
+                )
+                local_precision = local_precision.detach().to(
+                    device=target_device,
+                    dtype=target_dtype,
+                )
                 prior_precision = torch.exp(log_precision_params[key]).clamp(
                     min=self.min_precision,
                     max=self.max_precision,
@@ -625,6 +713,7 @@ class ExpertBayesMetaAggregator(Aggregator):
             "status": status,
             "layer_id": str(layer_id),
             "expert_id": str(expert_id),
+            "bayes_meta_device": str(self.meta_device),
             "clients": int(contributing_clients),
             "local_posteriors": int(local_posterior_count),
             "meta_loss": None if meta_loss is None else round(float(meta_loss), 6),
@@ -633,6 +722,16 @@ class ExpertBayesMetaAggregator(Aggregator):
             "min_gamma0": round(min_gamma0, 6),
             "max_gamma0": round(max_gamma0, 6),
         }
+        if optimized_mean_state:
+            metric["optimized_mean_device"] = str(
+                next(iter(optimized_mean_state.values())).device
+            )
+        if optimized_log_precision_state:
+            metric["log_precision_device"] = str(
+                next(iter(optimized_log_precision_state.values())).device
+            )
+        if optimized_log_n0 is not None:
+            metric["log_n0_device"] = str(optimized_log_n0.device)
         metric.update(payload_summary)
         metric.update(update_summary)
         return metric

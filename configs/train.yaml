@@ -10,6 +10,13 @@ client_epochs: 1
 # 训练设备，例如 cpu 或 cuda
 device: cuda
 
+# expert_bayes_meta 服务端 Bayes meta update 使用的设备：
+# auto 表示跟随 device 使用 GPU；没有 CUDA 时自动回退 CPU
+bayes_meta_device: auto
+
+# true 时每轮 Bayes 聚合后清理 CUDA cache；通常保持 false 更快
+bayes_empty_cache_after_aggregation: false
+
 # 实验输出根目录；最终会自动派生 save/{run_name}/data|model|result
 save_root: save
 
