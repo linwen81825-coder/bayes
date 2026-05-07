@@ -43,6 +43,12 @@ class Client:
         self.bayes_sgld_lr = float(getattr(self.args, "bayes_sgld_lr", 0.00005))
         self.bayes_ai_max = float(getattr(self.args, "bayes_ai_max", 1e3))
         self.bayes_sgld_var_floor = max(float(getattr(self.args, "bayes_sgld_var_floor", 0.0)), 0.0)
+        self.bayes_precision_mode = getattr(self.args, "bayes_precision_mode", "floor_inverse")
+        self.bayes_precision_temperature = float(getattr(self.args, "bayes_precision_temperature", 0.25))
+        self.bayes_precision_target = float(getattr(self.args, "bayes_precision_target", 100.0))
+        self.bayes_precision_min = float(getattr(self.args, "bayes_precision_min", 20.0))
+        self.bayes_precision_max = float(getattr(self.args, "bayes_precision_max", 300.0))
+        self.bayes_precision_eps = float(getattr(self.args, "bayes_precision_eps", 1.0e-12))
         self.bayes_evidence_batches = max(int(getattr(self.args, "bayes_evidence_batches", 8)), 1)
 
     def load_client_model(self):
@@ -222,6 +228,7 @@ class Client:
                 "mean": None,
                 "min": None,
                 "max": None,
+                "std": None,
                 "low_pct": None,
                 "high_pct": None,
             }
@@ -233,6 +240,7 @@ class Client:
             "mean": round(float(vector.mean().item()), 6),
             "min": round(float(vector.min().item()), 6),
             "max": round(float(vector.max().item()), 6),
+            "std": round(float(vector.std(unbiased=False).item()), 6),
             "low_pct": round(float((vector <= low_threshold).float().mean().item()), 6),
         }
         if high_clip is None or high_clip <= 0:
@@ -260,6 +268,12 @@ class Client:
                 alp=self.bayes_sgld_lr,
                 ai_max=self.bayes_ai_max,
                 var_floor=self.bayes_sgld_var_floor,
+                precision_mode=self.bayes_precision_mode,
+                precision_temperature=self.bayes_precision_temperature,
+                precision_target=self.bayes_precision_target,
+                precision_min=self.bayes_precision_min,
+                precision_max=self.bayes_precision_max,
+                precision_eps=self.bayes_precision_eps,
             )
         finally:
             del evidence_model
@@ -321,11 +335,19 @@ class Client:
                 f"--precision_mean:{precision_summary['mean']} "
                 f"--precision_min:{precision_summary['min']} "
                 f"--precision_max:{precision_summary['max']} "
+                f"--precision_std:{precision_summary['std']} "
                 f"--precision_low_pct:{precision_summary['low_pct']} "
                 f"--precision_high_pct:{precision_summary['high_pct']} "
+                f"--local_precision_mean:{precision_summary['mean']} "
+                f"--local_precision_min:{precision_summary['min']} "
+                f"--local_precision_max:{precision_summary['max']} "
+                f"--local_precision_std:{precision_summary['std']} "
                 f"--sgld_samples:{sgld_diag.get('sample_count')} "
                 f"--sgld_lr:{sgld_diag.get('sgld_lr')} "
                 f"--sgld_var_floor:{sgld_diag.get('sgld_var_floor')} "
+                f"--precision_mode:{sgld_diag.get('precision_mode')} "
+                f"--precision_temperature:{sgld_diag.get('precision_temperature')} "
+                f"--precision_target:{sgld_diag.get('precision_target')} "
                 f"--raw_var_mean:{sgld_diag.get('raw_var_mean')} "
                 f"--raw_var_min:{sgld_diag.get('raw_var_min')} "
                 f"--raw_var_max:{sgld_diag.get('raw_var_max')} "

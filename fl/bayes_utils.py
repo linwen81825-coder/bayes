@@ -81,6 +81,75 @@ def vector_to_named_state(reference_state, keys, vector):
     return named_state
 
 
+def _vector_segments(reference_state, keys):
+    offset = 0
+    segments = []
+    for key in keys:
+        numel = reference_state[key].numel()
+        segments.append((key, offset, offset + numel))
+        offset += numel
+    return segments
+
+
+def _calibrate_precision_vector(
+    raw_var,
+    reference_state,
+    target_names,
+    mode,
+    var_floor,
+    ai_max,
+    temperature,
+    target,
+    min_value,
+    max_value,
+    eps,
+):
+    mode = str(mode or "floor_inverse").lower()
+    eps = max(float(eps), 1e-12)
+    if mode == "floor_inverse":
+        effective_var_floor = max(float(var_floor), eps)
+        precision = 1.0 / raw_var.clamp(min=effective_var_floor)
+        return precision.clamp(min=1e-4, max=float(ai_max)), effective_var_floor
+
+    temperature = max(float(temperature), 1e-8)
+    target = max(float(target), eps)
+    min_value = max(float(min_value), eps)
+    max_value = max(float(max_value), min_value)
+
+    if mode == "normalized_power":
+        raw_precision = 1.0 / raw_var.clamp(min=eps)
+        tempered = raw_precision.clamp(min=eps).pow(temperature)
+        normalizer = tempered.mean().clamp(min=eps)
+        precision = tempered / normalizer * target
+        return precision.clamp(min=min_value, max=max_value), eps
+
+    if mode == "scalar_normalized_power":
+        segments = _vector_segments(reference_state, target_names)
+        scalar_precisions = []
+        scalar_weights = []
+        for _, start, end in segments:
+            raw_var_mean = raw_var[start:end].mean().clamp(min=eps)
+            scalar_precisions.append(1.0 / raw_var_mean)
+            scalar_weights.append(float(end - start))
+
+        scalar_vector = torch.stack(scalar_precisions)
+        tempered = scalar_vector.clamp(min=eps).pow(temperature)
+        weight_vector = torch.tensor(scalar_weights, dtype=tempered.dtype, device=tempered.device)
+        normalizer = (tempered * weight_vector).sum() / weight_vector.sum().clamp(min=eps)
+        normalizer = normalizer.clamp(min=eps)
+        calibrated_scalars = (tempered / normalizer * target).clamp(min=min_value, max=max_value)
+
+        precision = torch.empty_like(raw_var)
+        for scalar, (_, start, end) in zip(calibrated_scalars, segments):
+            precision[start:end] = scalar
+        return precision, eps
+
+    raise ValueError(
+        "Unknown bayes_precision_mode: "
+        f"{mode}. Expected one of: floor_inverse, normalized_power, scalar_normalized_power"
+    )
+
+
 def compute_optimal_local_posterior(
     local_mean,
     local_precision,
@@ -171,6 +240,12 @@ def run_expert_sgld_fit(
     alp,
     ai_max,
     var_floor=0.0,
+    precision_mode="floor_inverse",
+    precision_temperature=0.25,
+    precision_target=100.0,
+    precision_min=20.0,
+    precision_max=300.0,
+    precision_eps=1.0e-12,
 ):
     # 参考 fewshot_vit/niwmeta.py 中的 run_sgld_gaussian_fit：
     # 对 burn-in 后的参数样本做均值 / 方差统计，再把方差倒数当作 precision。
@@ -195,7 +270,6 @@ def run_expert_sgld_fit(
     sgld_lr = float(alp) / float(total_samples)
     sgld_lr = max(sgld_lr, 1e-12)
     var_floor = max(float(var_floor), 0.0)
-    effective_var_floor = max(var_floor, 1e-12)
     optim = torch.optim.Adam(params=target_params, lr=sgld_lr)
     noise_scale = math.sqrt(1.0 / sgld_lr)
 
@@ -265,6 +339,9 @@ def run_expert_sgld_fit(
             "last_seen_samples": int(last_seen_samples),
             "sgld_lr": float(sgld_lr),
             "sgld_var_floor": float(var_floor),
+            "precision_mode": str(precision_mode),
+            "precision_temperature": float(precision_temperature),
+            "precision_target": float(precision_target),
             "raw_var_mean": None,
             "raw_var_min": None,
             "raw_var_max": None,
@@ -285,10 +362,20 @@ def run_expert_sgld_fit(
         else:
             unbiased_var = (sample_count / (sample_count - 1.0)) * (moment2 - moment1.square())
             raw_var = unbiased_var.clamp(min=0.0)
-            # Optional numerical floor for degenerate finite-sample SGLD variance.
-            # With var_floor=0.0, this reduces to the previous 1e-12 numerical guard.
-            effective_var = raw_var.clamp(min=effective_var_floor)
-            precision_before_clip = 1.0 / effective_var
+            precision_vector, effective_var_floor = _calibrate_precision_vector(
+                raw_var=raw_var,
+                reference_state=reference_state,
+                target_names=target_names,
+                mode=precision_mode,
+                var_floor=var_floor,
+                ai_max=ai_max,
+                temperature=precision_temperature,
+                target=precision_target,
+                min_value=precision_min,
+                max_value=precision_max,
+                eps=precision_eps,
+            )
+            precision_before_clip = 1.0 / raw_var.clamp(min=max(float(precision_eps), 1e-12))
             sgld_diag.update(
                 {
                     "raw_var_mean": round(float(raw_var.mean().item()), 12),
@@ -307,7 +394,6 @@ def run_expert_sgld_fit(
                     ),
                 }
             )
-            precision_vector = precision_before_clip.clamp(min=1e-4, max=ai_max)
             mean_vector = moment1
 
     mean_state = vector_to_named_state(reference_state, target_names, mean_vector)
