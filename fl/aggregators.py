@@ -150,6 +150,14 @@ class ExpertBayesMetaAggregator(Aggregator):
         self.meta_lr = float(getattr(args, "bayes_meta_lr", 0.001))
         self.update_precision = bool(getattr(args, "bayes_update_precision", True))
         self.update_strength = bool(getattr(args, "bayes_update_strength", True))
+        self.client_weight_mode = str(
+            getattr(args, "bayes_client_weight_mode", "uniform")
+        ).lower()
+        if self.client_weight_mode not in {"uniform", "sqrt_usage", "usage"}:
+            raise ValueError(
+                "bayes_client_weight_mode must be one of: "
+                "uniform, sqrt_usage, usage"
+            )
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
         if len(client_updates) == 0:
@@ -370,8 +378,14 @@ class ExpertBayesMetaAggregator(Aggregator):
     def _summarize_client_payloads(self, client_payloads, expert_keys):
         if not client_payloads:
             return {
+                "bayes_client_weight_mode": self.client_weight_mode,
                 "usage_total": 0.0,
                 "usage_max": 0.0,
+                "usage_weight_sum": 0.0,
+                "usage_weight_min": 0.0,
+                "usage_weight_max": 0.0,
+                "usage_weight_mean": 0.0,
+                "usage_weight_max_ratio": 0.0,
                 "num_batches_total": 0,
                 "num_batches_mean": 0.0,
                 "local_precision_mean": None,
@@ -382,6 +396,11 @@ class ExpertBayesMetaAggregator(Aggregator):
             }
 
         usage_values = [float(payload.get("usage", 0.0)) for payload in client_payloads]
+        usage_weight_values = [
+            self._get_client_meta_weight(payload)
+            for payload in client_payloads
+        ]
+        usage_weight_sum = float(sum(usage_weight_values))
         batch_values = [int(payload.get("num_batches", 0)) for payload in client_payloads]
         precision_values = []
         for payload in client_payloads:
@@ -392,8 +411,20 @@ class ExpertBayesMetaAggregator(Aggregator):
                     precision_values.append(value.detach().cpu().float().reshape(-1))
 
         summary = {
+            "bayes_client_weight_mode": self.client_weight_mode,
             "usage_total": round(float(sum(usage_values)), 6),
             "usage_max": round(float(max(usage_values)), 6),
+            "usage_weight_sum": round(usage_weight_sum, 6),
+            "usage_weight_min": round(float(min(usage_weight_values)), 6),
+            "usage_weight_max": round(float(max(usage_weight_values)), 6),
+            "usage_weight_mean": round(
+                usage_weight_sum / max(len(usage_weight_values), 1),
+                6,
+            ),
+            "usage_weight_max_ratio": round(
+                float(max(usage_weight_values) / max(usage_weight_sum, 1e-12)),
+                6,
+            ),
             "num_batches_total": int(sum(batch_values)),
             "num_batches_mean": round(float(sum(batch_values) / max(len(batch_values), 1)), 6),
         }
@@ -454,6 +485,16 @@ class ExpertBayesMetaAggregator(Aggregator):
             "param_delta_rel": round(delta_rel, 6),
         }
 
+    def _get_client_meta_weight(self, payload):
+        usage = max(float(payload.get("usage", 0.0)), 1.0)
+        if self.client_weight_mode == "uniform":
+            return 1.0
+        if self.client_weight_mode == "sqrt_usage":
+            return math.sqrt(usage)
+        if self.client_weight_mode == "usage":
+            return usage
+        raise ValueError(f"Unknown bayes_client_weight_mode: {self.client_weight_mode}")
+
     def _compute_expert_meta_loss(
         self,
         expert_keys,
@@ -463,7 +504,8 @@ class ExpertBayesMetaAggregator(Aggregator):
         client_payloads,
     ):
         zero = next(iter(prior_mean_params.values())).new_tensor(0.0)
-        client_losses = []
+        weighted_losses = []
+        weight_values = []
         local_posterior_count = 0
         prior_n0 = torch.exp(log_n0_param).clamp(min=self.min_precision, max=self.max_n0)
 
@@ -503,17 +545,21 @@ class ExpertBayesMetaAggregator(Aggregator):
                 has_local_terms = True
                 local_posterior_count += 1
 
-            # 按算法文档 Step 5：
-            #   |S_k|^{-1} * sum_i [ f_{i,k}(L_{0,k}) + 1/2 g_{i,k}(L_{0,k}) ]
-            # 这里应当直接对“每个客户端的总项”做平均，
-            # 不再额外按参数维度做归一化。
+            # uniform 对应算法文档里的 |S_k|^{-1} sum_i；
+            # sqrt_usage / usage 只替换 client evidence 的聚合权重，
+            # 不改变每个客户端局部 posterior 与二次项的计算公式。
             if has_local_terms:
-                client_losses.append(client_loss)
+                weight = self._get_client_meta_weight(payload)
+                weight_tensor = client_loss.new_tensor(weight)
+                weighted_losses.append(client_loss * weight_tensor)
+                weight_values.append(weight_tensor)
 
-        if len(client_losses) == 0:
+        if len(weighted_losses) == 0:
             return zero, 0
 
-        return torch.stack(client_losses).mean(), local_posterior_count
+        total_weight = torch.stack(weight_values).sum().clamp_min(1e-12)
+        meta_loss = torch.stack(weighted_losses).sum() / total_weight
+        return meta_loss, local_posterior_count
 
     def _project_meta_params(self, log_precision_params, log_n0_param):
         log_min_precision = math.log(self.min_precision)
