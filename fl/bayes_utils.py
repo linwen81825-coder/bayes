@@ -279,6 +279,7 @@ def run_expert_sgld_fit(
 
     fallback_precision = 1e-4
     last_seen_samples = 0
+    target_device = torch.device(device)
 
     for step_idx in range(steps):
         weighted_loss = None
@@ -286,8 +287,14 @@ def run_expert_sgld_fit(
         optim.zero_grad(set_to_none=True)
 
         for cached_inputs, cached_labels in batch_cache:
-            inputs = cached_inputs.to(device, non_blocking=True)
-            labels = cached_labels.to(device, non_blocking=True)
+            if cached_inputs.device == target_device:
+                inputs = cached_inputs
+            else:
+                inputs = cached_inputs.to(device, non_blocking=True)
+            if cached_labels.device == target_device:
+                labels = cached_labels
+            else:
+                labels = cached_labels.to(device, non_blocking=True)
             result = model(inputs)
             logits = result["logits"]
             batch_loss = criterion(logits, labels)

@@ -1,5 +1,6 @@
 import torch
 import torch.optim as optim
+import time
 from types import SimpleNamespace
 from torch import nn
 
@@ -50,6 +51,12 @@ class Client:
         self.bayes_precision_max = float(getattr(self.args, "bayes_precision_max", 300.0))
         self.bayes_precision_eps = float(getattr(self.args, "bayes_precision_eps", 1.0e-12))
         self.bayes_evidence_batches = max(int(getattr(self.args, "bayes_evidence_batches", 8)), 1)
+        self.bayes_empty_cache_after_client_evidence = bool(
+            getattr(self.args, "bayes_empty_cache_after_client_evidence", False)
+        )
+        self.bayes_cache_device = str(getattr(self.args, "bayes_cache_device", "cpu")).lower()
+        if self.bayes_cache_device not in {"cpu", "cuda", "auto"}:
+            raise ValueError("bayes_cache_device must be one of: cpu, cuda, auto")
 
     def load_client_model(self):
         # 客户端模型路径，例如 ./save/model/1.pth。
@@ -151,12 +158,61 @@ class Client:
                 active_experts.append((str(layer_id), str(expert_id), expert_usage))
         return active_experts
 
+    def resolve_bayes_cache_device(self):
+        if self.bayes_cache_device == "cpu":
+            return torch.device("cpu")
+        if self.bayes_cache_device == "cuda":
+            if str(self.device).startswith("cuda") and torch.cuda.is_available():
+                return torch.device(self.device)
+            return torch.device("cpu")
+        if (
+            str(self.device).startswith("cuda")
+            and torch.cuda.is_available()
+            and self.bayes_evidence_batches <= 4
+        ):
+            return torch.device(self.device)
+        return torch.device("cpu")
+
+    def move_bayes_cache_tensor(self, tensor, cache_device):
+        if cache_device.type == "cuda":
+            return tensor.detach().to(device=cache_device).clone()
+        return tensor.detach().cpu().clone()
+
+    def estimate_bayes_cache_memory_mb(self, batch_cache_by_expert):
+        seen_tensors = {}
+        for layer_cache in batch_cache_by_expert.values():
+            for expert_cache in layer_cache.values():
+                for cache_entry in expert_cache:
+                    if len(cache_entry) == 4:
+                        _, _, cached_inputs, cached_labels = cache_entry
+                    else:
+                        _, cached_inputs, cached_labels = cache_entry
+                    for tensor in [cached_inputs, cached_labels]:
+                        if torch.is_tensor(tensor):
+                            seen_tensors[id(tensor)] = tensor
+
+        total_bytes = 0
+        for tensor in seen_tensors.values():
+            total_bytes += tensor.numel() * tensor.element_size()
+        return total_bytes / (1024.0 * 1024.0)
+
+    def get_cached_batch_device(self, batch_cache_by_expert):
+        for layer_cache in batch_cache_by_expert.values():
+            for expert_cache in layer_cache.values():
+                for cache_entry in expert_cache:
+                    if len(cache_entry) == 4:
+                        return str(cache_entry[2].device)
+                    if len(cache_entry) >= 3:
+                        return str(cache_entry[1].device)
+        return str(self.resolve_bayes_cache_device())
+
     def update_bayes_batch_cache(self, batch_cache_by_expert, inputs, labels, layer_stats):
         if not self.should_collect_bayes_evidence():
             return
 
-        cpu_inputs = inputs.detach().cpu()
-        cpu_labels = labels.detach().cpu()
+        cache_device = self.resolve_bayes_cache_device()
+        cached_inputs = self.move_bayes_cache_tensor(inputs, cache_device)
+        cached_labels = self.move_bayes_cache_tensor(labels, cache_device)
 
         for layer_id, stats in layer_stats.items():
             sample_hits_by_expert = stats.get("sample_hits_by_expert")
@@ -168,8 +224,9 @@ class Client:
                         continue
 
                     expert_score = int(sample_hits[sample_indices].sum().item())
-                    expert_inputs = cpu_inputs.index_select(0, sample_indices).clone()
-                    expert_labels = cpu_labels.index_select(0, sample_indices).clone()
+                    sample_indices = sample_indices.to(device=cache_device)
+                    expert_inputs = cached_inputs.index_select(0, sample_indices).clone()
+                    expert_labels = cached_labels.index_select(0, sample_indices).clone()
                     expert_cache = batch_cache_by_expert.setdefault(str(layer_id), {}).setdefault(str(expert_id), [])
                     expert_cache.append((
                         expert_score,
@@ -190,7 +247,7 @@ class Client:
                 if expert_usage <= 0:
                     continue
                 expert_cache = batch_cache_by_expert.setdefault(str(layer_id), {}).setdefault(str(expert_id), [])
-                expert_cache.append((expert_usage, cpu_inputs.clone(), cpu_labels.clone()))
+                expert_cache.append((expert_usage, cached_inputs.clone(), cached_labels.clone()))
                 expert_cache.sort(key=lambda item: item[0], reverse=True)
                 if len(expert_cache) > self.bayes_evidence_batches:
                     del expert_cache[self.bayes_evidence_batches:]
@@ -215,6 +272,25 @@ class Client:
         }
         evidence_model.load_state_dict(cpu_state_dict)
         return evidence_model
+
+    def get_expert_param_prefix(self, layer_id, expert_id):
+        return f"blocks.{layer_id}.ffn.experts.{expert_id}."
+
+    def backup_expert_params(self, model, layer_id, expert_id):
+        prefix = self.get_expert_param_prefix(layer_id, expert_id)
+        backup = {}
+        for name, param in model.named_parameters():
+            if name.startswith(prefix):
+                backup[name] = param.detach().clone()
+        return backup
+
+    def restore_expert_params(self, model, backup):
+        if not backup:
+            return
+        param_dict = dict(model.named_parameters())
+        with torch.no_grad():
+            for name, value in backup.items():
+                param_dict[name].copy_(value)
 
     def summarize_named_tensor_state(self, state, high_clip=None):
         values = []
@@ -253,8 +329,8 @@ class Client:
     def count_cached_samples(self, batch_cache):
         return int(sum(labels.size(0) for _, labels in batch_cache))
 
-    def fit_local_expert_evidence(self, layer_id, expert_id, usage, batch_cache):
-        evidence_model = self.build_evidence_model()
+    def fit_local_expert_evidence(self, evidence_model, layer_id, expert_id, usage, batch_cache):
+        expert_backup = self.backup_expert_params(evidence_model, layer_id, expert_id)
         try:
             mean_state, precision_state, sgld_diag = run_expert_sgld_fit(
                 model=evidence_model,
@@ -276,9 +352,8 @@ class Client:
                 precision_eps=self.bayes_precision_eps,
             )
         finally:
-            del evidence_model
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            self.restore_expert_params(evidence_model, expert_backup)
+            del expert_backup
 
         return {
             "usage": usage,
@@ -303,60 +378,102 @@ class Client:
             f"--client: {self.client_id} --bayes_active_experts : {len(active_experts)} "
             f"--bayes_cached_experts : {cached_expert_count}"
         )
+        self.logger.info(
+            f"--client: {self.client_id} --bayes_cache_diag "
+            f"--bayes_cache_device:{self.bayes_cache_device} "
+            f"--resolved_cache_device:{self.resolve_bayes_cache_device()} "
+            f"--cached_batch_device:{self.get_cached_batch_device(batch_cache_by_expert)} "
+            f"--cached_experts:{cached_expert_count} "
+            f"--estimated_cache_memory_mb:{self.estimate_bayes_cache_memory_mb(batch_cache_by_expert):.4f}"
+        )
         evidence_by_layer = {}
-        for layer_id, expert_id, usage in active_experts:
-            batch_cache = self.get_expert_batch_cache(
-                batch_cache_by_expert=batch_cache_by_expert,
-                layer_id=layer_id,
-                expert_id=expert_id,
-            )
-            if len(batch_cache) == 0:
-                continue
-            layer_evidence = evidence_by_layer.setdefault(layer_id, {})
-            expert_evidence = self.fit_local_expert_evidence(
-                layer_id=layer_id,
-                expert_id=expert_id,
-                usage=usage,
-                batch_cache=batch_cache,
-            )
-            layer_evidence[expert_id] = expert_evidence
+        build_model_sec = 0.0
+        sgld_times = []
+        total_start_time = time.perf_counter()
+        evidence_model = None
+        try:
+            if active_experts:
+                build_start_time = time.perf_counter()
+                evidence_model = self.build_evidence_model()
+                evidence_model.to(self.device)
+                build_model_sec = time.perf_counter() - build_start_time
 
-            precision_summary = self.summarize_named_tensor_state(
-                expert_evidence["precision_state"],
-                high_clip=self.bayes_ai_max,
-            )
-            mean_summary = self.summarize_named_tensor_state(expert_evidence["mean_state"])
-            sgld_diag = expert_evidence.get("sgld_diag", {})
-            self.logger.info(
-                f"--client: {self.client_id} --bayes_evidence_diag "
-                f"--layer:{layer_id} --expert:{expert_id} --usage:{int(usage)} "
-                f"--batches:{len(batch_cache)} --cached_samples:{self.count_cached_samples(batch_cache)} "
-                f"--mean_numel:{mean_summary['numel']} "
-                f"--precision_mean:{precision_summary['mean']} "
-                f"--precision_min:{precision_summary['min']} "
-                f"--precision_max:{precision_summary['max']} "
-                f"--precision_std:{precision_summary['std']} "
-                f"--precision_low_pct:{precision_summary['low_pct']} "
-                f"--precision_high_pct:{precision_summary['high_pct']} "
-                f"--local_precision_mean:{precision_summary['mean']} "
-                f"--local_precision_min:{precision_summary['min']} "
-                f"--local_precision_max:{precision_summary['max']} "
-                f"--local_precision_std:{precision_summary['std']} "
-                f"--sgld_samples:{sgld_diag.get('sample_count')} "
-                f"--sgld_lr:{sgld_diag.get('sgld_lr')} "
-                f"--sgld_var_floor:{sgld_diag.get('sgld_var_floor')} "
-                f"--precision_mode:{sgld_diag.get('precision_mode')} "
-                f"--precision_temperature:{sgld_diag.get('precision_temperature')} "
-                f"--precision_target:{sgld_diag.get('precision_target')} "
-                f"--raw_var_mean:{sgld_diag.get('raw_var_mean')} "
-                f"--raw_var_min:{sgld_diag.get('raw_var_min')} "
-                f"--raw_var_max:{sgld_diag.get('raw_var_max')} "
-                f"--raw_var_under_floor_pct:{sgld_diag.get('raw_var_under_floor_pct')} "
-                f"--unclipped_precision_mean:{sgld_diag.get('unclipped_precision_mean')} "
-                f"--unclipped_precision_max:{sgld_diag.get('unclipped_precision_max')} "
-                f"--unclipped_precision_over_ai_max_pct:"
-                f"{sgld_diag.get('unclipped_precision_over_ai_max_pct')}"
-            )
+            for layer_id, expert_id, usage in active_experts:
+                batch_cache = self.get_expert_batch_cache(
+                    batch_cache_by_expert=batch_cache_by_expert,
+                    layer_id=layer_id,
+                    expert_id=expert_id,
+                )
+                if len(batch_cache) == 0:
+                    continue
+                layer_evidence = evidence_by_layer.setdefault(layer_id, {})
+                sgld_start_time = time.perf_counter()
+                expert_evidence = self.fit_local_expert_evidence(
+                    evidence_model=evidence_model,
+                    layer_id=layer_id,
+                    expert_id=expert_id,
+                    usage=usage,
+                    batch_cache=batch_cache,
+                )
+                sgld_times.append(time.perf_counter() - sgld_start_time)
+                layer_evidence[expert_id] = expert_evidence
+
+                precision_summary = self.summarize_named_tensor_state(
+                    expert_evidence["precision_state"],
+                    high_clip=self.bayes_ai_max,
+                )
+                mean_summary = self.summarize_named_tensor_state(expert_evidence["mean_state"])
+                sgld_diag = expert_evidence.get("sgld_diag", {})
+                self.logger.info(
+                    f"--client: {self.client_id} --bayes_evidence_diag "
+                    f"--layer:{layer_id} --expert:{expert_id} --usage:{int(usage)} "
+                    f"--batches:{len(batch_cache)} --cached_samples:{self.count_cached_samples(batch_cache)} "
+                    f"--mean_numel:{mean_summary['numel']} "
+                    f"--precision_mean:{precision_summary['mean']} "
+                    f"--precision_min:{precision_summary['min']} "
+                    f"--precision_max:{precision_summary['max']} "
+                    f"--precision_std:{precision_summary['std']} "
+                    f"--precision_low_pct:{precision_summary['low_pct']} "
+                    f"--precision_high_pct:{precision_summary['high_pct']} "
+                    f"--local_precision_mean:{precision_summary['mean']} "
+                    f"--local_precision_min:{precision_summary['min']} "
+                    f"--local_precision_max:{precision_summary['max']} "
+                    f"--local_precision_std:{precision_summary['std']} "
+                    f"--sgld_samples:{sgld_diag.get('sample_count')} "
+                    f"--sgld_lr:{sgld_diag.get('sgld_lr')} "
+                    f"--sgld_var_floor:{sgld_diag.get('sgld_var_floor')} "
+                    f"--precision_mode:{sgld_diag.get('precision_mode')} "
+                    f"--precision_temperature:{sgld_diag.get('precision_temperature')} "
+                    f"--precision_target:{sgld_diag.get('precision_target')} "
+                    f"--raw_var_mean:{sgld_diag.get('raw_var_mean')} "
+                    f"--raw_var_min:{sgld_diag.get('raw_var_min')} "
+                    f"--raw_var_max:{sgld_diag.get('raw_var_max')} "
+                    f"--raw_var_under_floor_pct:{sgld_diag.get('raw_var_under_floor_pct')} "
+                    f"--unclipped_precision_mean:{sgld_diag.get('unclipped_precision_mean')} "
+                    f"--unclipped_precision_max:{sgld_diag.get('unclipped_precision_max')} "
+                    f"--unclipped_precision_over_ai_max_pct:"
+                    f"{sgld_diag.get('unclipped_precision_over_ai_max_pct')}"
+                )
+        finally:
+            if evidence_model is not None:
+                del evidence_model
+            if (
+                str(self.device).startswith("cuda")
+                and torch.cuda.is_available()
+                and self.bayes_empty_cache_after_client_evidence
+            ):
+                torch.cuda.empty_cache()
+
+        total_evidence_sec = time.perf_counter() - total_start_time
+        per_expert_mean_sec = sum(sgld_times) / max(len(sgld_times), 1)
+        self.logger.info(
+            f"--client: {self.client_id} --bayes_evidence_time "
+            f"--build_model_sec:{build_model_sec:.4f} "
+            f"--total_sec:{total_evidence_sec:.4f} "
+            f"--per_expert_mean_sec:{per_expert_mean_sec:.4f} "
+            f"--active_experts:{len(active_experts)} "
+            f"--cached_experts:{cached_expert_count}"
+        )
 
         return evidence_by_layer
 

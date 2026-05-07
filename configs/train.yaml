@@ -10,12 +10,39 @@ client_epochs: 1
 # 训练设备，例如 cpu 或 cuda
 device: cuda
 
-# expert_bayes_meta 服务端 Bayes meta update 使用的设备：
-# auto 表示跟随 device 使用 GPU；没有 CUDA 时自动回退 CPU
+# expert_bayes_meta 服务端 Bayes meta update 使用的设备。
+# 只影响服务器聚合阶段中每个 expert 的 Bayes meta loss / backward / Adam update，
+# 不影响客户端普通训练，也不影响 FedAvg / ExpertFedAvg。
+# 可选值：
+# - auto：推荐。若 device 是 cuda 且 CUDA 可用，则在 GPU 上做 Bayes meta update；否则自动回退 CPU。
+# - cpu：强制服务端 Bayes meta update 使用 CPU，最稳但通常较慢。
+# - cuda：强制使用默认 CUDA 设备；如果 CUDA 不可用会回退 CPU。
+# - cuda:0 / cuda:1：指定某张 GPU 做服务端 Bayes meta update。
+# 计算完成后 model_state / server_bayes_state.pth 仍会转回 CPU 保存。
 bayes_meta_device: auto
 
-# true 时每轮 Bayes 聚合后清理 CUDA cache；通常保持 false 更快
+# 是否在每轮服务端 Bayes 聚合结束后调用 torch.cuda.empty_cache()。
+# false：推荐，速度更快，PyTorch 会复用显存缓存。
+# true：显存紧张或多实验共用同一张卡时可打开，但会降低速度。
+# 只影响 expert_bayes_meta 的服务端聚合阶段。
 bayes_empty_cache_after_aggregation: false
+
+# 是否在每个客户端完成整轮 Bayes evidence extraction 后清理 CUDA cache。
+# false：推荐，避免每个 client / 每轮频繁清 cache 带来的额外开销。
+# true：如果 evidence extraction 后显存占用影响后续 client，可打开。
+# 注意：现在不会在每个 expert 后清 cache，只会在整个客户端 evidence 完成后按需清理。
+bayes_empty_cache_after_client_evidence: false
+
+# Bayes evidence batch cache 存放设备。
+# 这个 cache 是客户端本地训练后，为每个 active expert 保存的少量输入 batch，
+# 后续 SGLD 会反复读取这些 batch 来估计 local_mean / local_precision。
+# 可选值：
+# - cpu：默认旧行为。cache 放 CPU，最省显存，但 SGLD 每次会 CPU -> GPU 搬运。
+# - cuda：cache 直接放 self.device，对 SGLD 更快，但会多占 GPU 显存。
+# - auto：若 self.device 是 cuda 且 bayes_evidence_batches <= 4，则放 GPU；否则放 CPU。
+# 如果出现 CUDA OOM，优先把这里改回 cpu。
+# 日志中可看 --bayes_cache_diag 的 cached_batch_device 和 estimated_cache_memory_mb。
+bayes_cache_device: cpu
 
 # 实验输出根目录；最终会自动派生 save/{run_name}/data|model|result
 save_root: save
