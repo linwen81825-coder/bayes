@@ -8,6 +8,11 @@ from torchvision.datasets import CIFAR10, CIFAR100
 
 EXPECTED_PROTOCOL = "server_test_client_train_index_partition"
 EXPECTED_VERSION = 2
+PARTITION_REGEN_HINT = (
+    "Please choose a new `run_name`, or set `allow_overwrite: true`, "
+    "or set `force_repartition: true` if you really want to regenerate partition files. "
+    "You can also run `python -m data.data` manually after updating the YAML config."
+)
 
 
 def get_cifar_stats(data_name):
@@ -54,7 +59,8 @@ def load_partition_meta(args):
     if not os.path.exists(meta_path):
         raise FileNotFoundError(
             f"Missing partition metadata: {meta_path}. "
-            "Update the YAML config files if needed, then run `python -m data.data` before training."
+            "Partition metadata is missing. If `auto_prepare_data: true`, `train.py` should create it "
+            "before Server starts. Otherwise run `python -m data.data` manually, or check your YAML config."
         )
 
     meta = torch.load(meta_path, weights_only=False)
@@ -90,7 +96,7 @@ def validate_partition_structure(meta, args):
     if not isinstance(splits, dict):
         raise ValueError(
             "partition_meta is incomplete: missing a valid `splits` dictionary. "
-            "Please regenerate partition_meta.pt and partition_stats.json."
+            + PARTITION_REGEN_HINT
         )
 
     required_split_keys = {
@@ -102,13 +108,13 @@ def validate_partition_structure(meta, args):
     if missing:
         raise ValueError(
             f"partition_meta is incomplete: missing split keys {sorted(missing)}. "
-            "Please regenerate partition_meta.pt and partition_stats.json."
+            + PARTITION_REGEN_HINT
         )
 
     if not isinstance(splits["client_train_indices"], dict):
         raise ValueError(
             "`splits['client_train_indices']` must be a dict. "
-            "Please regenerate partition_meta.pt and partition_stats.json."
+            + PARTITION_REGEN_HINT
         )
 
     expected_client_keys = {str(i) for i in range(1, args.num_clients + 1)}
@@ -117,21 +123,21 @@ def validate_partition_structure(meta, args):
         raise ValueError(
             "partition_meta has incomplete client_train_indices keys: "
             f"expected {sorted(expected_client_keys)}, found {sorted(actual_client_keys)}. "
-            "Please regenerate partition_meta.pt and partition_stats.json."
+            + PARTITION_REGEN_HINT
         )
 
     for client_id, indices in splits["client_train_indices"].items():
         if not isinstance(indices, (list, tuple)):
             raise ValueError(
                 f"`splits['client_train_indices']['{client_id}']` must be a list or tuple. "
-                "Please regenerate partition_meta.pt and partition_stats.json."
+                + PARTITION_REGEN_HINT
             )
 
     for key in ["federated_train_pool_indices", "global_test_indices"]:
         if not isinstance(splits[key], (list, tuple)):
             raise ValueError(
                 f"`splits['{key}']` must be a list or tuple. "
-                "Please regenerate partition_meta.pt and partition_stats.json."
+                + PARTITION_REGEN_HINT
             )
 
 
@@ -150,8 +156,7 @@ def metadata_value_matches(actual, expected, value_type):
 def raise_partition_mismatch(field, actual, expected):
     raise ValueError(
         f"partition_meta mismatch for `{field}`: found {actual!r}, expected {expected!r}. "
-        "Please update the YAML config files and re-run `python -m data.data` "
-        "to regenerate partition_meta.pt."
+        + PARTITION_REGEN_HINT
     )
 
 

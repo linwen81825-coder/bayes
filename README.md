@@ -44,7 +44,7 @@ conda activate bayes_env
 
 这三份 YAML 的顶层都必须是 key-value mapping；空文件会按空配置处理。
 三份 YAML 配置文件会在启动时读取并合并。为避免歧义，顶层 key 必须全局唯一；如果出现重复 key，`load_args()` 会直接报错，而不是静默覆盖。
-默认假设从项目根目录运行 `python -m data.data` 和 `python train.py`；除非显式传入绝对路径，否则会读取项目根目录下的 `configs/data.yaml`、`configs/train.yaml` 和 `configs/model.yaml`。
+默认假设从项目根目录运行 `python train.py`；除非显式传入绝对路径，否则会读取项目根目录下的 `configs/data.yaml`、`configs/train.yaml` 和 `configs/model.yaml`。
 
 ## 实验切换方式
 
@@ -60,15 +60,15 @@ conda activate bayes_env
   - `switch_transformer` 现在支持显式 `patch_size`；该字段只对标准 Switch 生效
   - `hybrid_switch_transformer` 仍然使用 `token_grid_size` 控制 token 网格
   - 结果文件名现在会区分 `model_type`；对 `switch_transformer` 还会进一步区分 `patch_size`
-- 改完 YAML 后，如果变动涉及数据划分（例如 `data_name`、`alpha`、`num_clients`），先运行 `python -m data.data`，再运行 `python train.py`
-- 如果只改训练或模型配置，且不影响数据划分，可以直接重新训练；否则先重建 partition
+- 默认 `auto_prepare_data: true`，运行 `python train.py` 时会自动检查并准备数据划分
+- 如果 partition 不存在，训练入口会自动生成；如果 partition 已存在且匹配当前 YAML，会直接复用
+- 如果 partition 已存在但与当前 YAML 不匹配，会默认报错，提示更换 `run_name` 或设置 `allow_overwrite: true` / `force_repartition: true`
+- 如果想保留旧的手动方式，仍然可以先运行 `python -m data.data`
 - 如果想切换另一套 YAML，也可以使用轻量命令行入口：
 
 ```bash
-python -m data.data
 python train.py
 
-python -m data.data --data_cfg configs/exp/cifar10.yaml --train_cfg configs/exp/train_fedavg.yaml --model_cfg configs/model.yaml
 python train.py --data_cfg configs/exp/cifar10.yaml --train_cfg configs/exp/train_fedavg.yaml --model_cfg configs/model.yaml
 ```
 
@@ -76,16 +76,28 @@ python train.py --data_cfg configs/exp/cifar10.yaml --train_cfg configs/exp/trai
 
 ## 运行顺序
 
-先按需要修改上述 YAML 文件，再生成数据划分：
-
-```bash
-python -m data.data
-```
-
-再启动训练：
+先按需要修改上述 YAML 文件，然后直接启动训练：
 
 ```bash
 python train.py
+```
+
+默认 `auto_prepare_data: true`，训练入口会自动检查：
+
+- `{save_root}/{run_name}/data/partition_meta.pt`
+- `{save_root}/{run_name}/data/partition_stats.json`
+
+行为如下：
+
+- 如果不存在：自动生成
+- 如果存在且匹配当前 YAML：直接复用
+- 如果存在但与当前 YAML 不匹配：默认报错，防止误覆盖
+- 如果确实想覆盖旧 partition：设置 `allow_overwrite: true` 或 `force_repartition: true`
+
+旧的手动生成 partition 命令仍然保留：
+
+```bash
+python -m data.data
 ```
 
 ## 数据协议
@@ -105,7 +117,7 @@ python train.py
 
 动态构造 `Dataset` / `DataLoader`。
 
-如果训练时报原始 CIFAR 缺失，请检查 `configs/data.yaml` 中的 `data_path`，或者重新运行：
+如果训练时报原始 CIFAR 缺失，请检查 `configs/data.yaml` 中的 `data_path`。默认情况下可以直接重新运行 `python train.py` 触发自动数据准备；也可以使用旧的手动命令：
 
 ```bash
 python -m data.data

@@ -1,5 +1,6 @@
 import collections
 import math
+import time
 from collections import OrderedDict
 
 import torch
@@ -246,6 +247,7 @@ def run_expert_sgld_fit(
     precision_min=20.0,
     precision_max=300.0,
     precision_eps=1.0e-12,
+    sgld_concat_cache=False,
 ):
     # 参考 fewshot_vit/niwmeta.py 中的 run_sgld_gaussian_fit：
     # 对 burn-in 后的参数样本做均值 / 方差统计，再把方差倒数当作 precision。
@@ -260,7 +262,21 @@ def run_expert_sgld_fit(
     if len(target_params) == 0:
         raise ValueError(f"Missing target expert parameters for layer {layer_id}, expert {expert_id}")
 
-    model.to(device)
+    def _first_param_device(module):
+        for param in module.parameters():
+            return param.device
+        return torch.device("cpu")
+
+    def _normalize_device(device_like):
+        resolved = torch.device(device_like)
+        if resolved.type == "cuda" and resolved.index is None and torch.cuda.is_available():
+            resolved = torch.device(f"cuda:{torch.cuda.current_device()}")
+        return resolved
+
+    target_device = _normalize_device(device)
+    current_device = _first_param_device(model)
+    if current_device != target_device:
+        model.to(target_device)
     model.train()
 
     total_samples = sum(int(labels.size(0)) for _, labels in batch_cache)
@@ -273,28 +289,41 @@ def run_expert_sgld_fit(
     optim = torch.optim.Adam(params=target_params, lr=sgld_lr)
     noise_scale = math.sqrt(1.0 / sgld_lr)
 
+    prepare_start = time.perf_counter()
+    prepared_batch_cache = []
+    for cached_inputs, cached_labels in batch_cache:
+        if cached_inputs.device != target_device:
+            cached_inputs = cached_inputs.to(target_device, non_blocking=True)
+        if cached_labels.device != target_device:
+            cached_labels = cached_labels.to(target_device, non_blocking=True)
+        prepared_batch_cache.append((cached_inputs, cached_labels))
+
+    concat_cached_samples = int(total_samples)
+    if sgld_concat_cache:
+        concat_inputs = torch.cat([cached_inputs for cached_inputs, _ in prepared_batch_cache], dim=0)
+        concat_labels = torch.cat([cached_labels for _, cached_labels in prepared_batch_cache], dim=0)
+        prepared_batch_cache = [(concat_inputs, concat_labels)]
+        concat_cached_samples = int(concat_labels.size(0))
+    prepare_cache_time_sec = time.perf_counter() - prepare_start
+
     moment1 = None
     moment2 = None
     sample_count = 0
 
     fallback_precision = 1e-4
     last_seen_samples = 0
-    target_device = torch.device(device)
+    forward_backward_time_sec = 0.0
+    sample_moment_time_sec = 0.0
 
     for step_idx in range(steps):
         weighted_loss = None
         seen_samples = 0
         optim.zero_grad(set_to_none=True)
 
-        for cached_inputs, cached_labels in batch_cache:
-            if cached_inputs.device == target_device:
-                inputs = cached_inputs
-            else:
-                inputs = cached_inputs.to(device, non_blocking=True)
-            if cached_labels.device == target_device:
-                labels = cached_labels
-            else:
-                labels = cached_labels.to(device, non_blocking=True)
+        step_fb_start = time.perf_counter()
+        for cached_inputs, cached_labels in prepared_batch_cache:
+            inputs = cached_inputs
+            labels = cached_labels
             result = model(inputs)
             logits = result["logits"]
             batch_loss = criterion(logits, labels)
@@ -308,6 +337,7 @@ def run_expert_sgld_fit(
             seen_samples += batch_weight
 
         if weighted_loss is None or seen_samples <= 0:
+            forward_backward_time_sec += time.perf_counter() - step_fb_start
             break
 
         last_seen_samples = int(seen_samples)
@@ -323,11 +353,13 @@ def run_expert_sgld_fit(
                 param.grad.add_(noise_scale * torch.randn_like(param))
 
         optim.step()
+        forward_backward_time_sec += time.perf_counter() - step_fb_start
 
+        step_sample_start = time.perf_counter()
         with torch.no_grad():
             param_vector = torch.nn.utils.parameters_to_vector(
                 [param.detach() for param in target_params]
-            ).detach().cpu()
+            ).detach()
 
             if step_idx == burnin:
                 moment1 = param_vector.clone()
@@ -337,6 +369,7 @@ def run_expert_sgld_fit(
                 moment1 = (param_vector + sample_count * moment1) / (sample_count + 1)
                 moment2 = (param_vector.square() + sample_count * moment2) / (sample_count + 1)
                 sample_count += 1
+        sample_moment_time_sec += time.perf_counter() - step_sample_start
 
     with torch.no_grad():
         reference_state = model.state_dict()
@@ -357,11 +390,20 @@ def run_expert_sgld_fit(
             "unclipped_precision_min": None,
             "unclipped_precision_max": None,
             "unclipped_precision_over_ai_max_pct": None,
+            "sgld_fit_time_sec": None,
+            "sgld_forward_backward_time_sec": round(float(forward_backward_time_sec), 6),
+            "sgld_sample_moment_time_sec": round(float(sample_moment_time_sec), 6),
+            "sgld_prepare_cache_time_sec": round(float(prepare_cache_time_sec), 6),
+            "sgld_device": str(target_device),
+            "sgld_cache_device": str(prepared_batch_cache[0][0].device) if prepared_batch_cache else str(target_device),
+            "sgld_param_vector_device": None,
+            "sgld_concat_cache": bool(sgld_concat_cache),
+            "concat_cached_samples": int(concat_cached_samples),
         }
         if moment1 is None:
             mean_vector = torch.nn.utils.parameters_to_vector(
                 [param.detach() for param in target_params]
-            ).detach().cpu()
+            ).detach()
             precision_vector = torch.full_like(mean_vector, fill_value=fallback_precision)
         elif sample_count <= 1:
             mean_vector = moment1
@@ -403,6 +445,12 @@ def run_expert_sgld_fit(
             )
             mean_vector = moment1
 
-    mean_state = vector_to_named_state(reference_state, target_names, mean_vector)
-    precision_state = vector_to_named_state(reference_state, target_names, precision_vector)
+    sgld_diag["sgld_fit_time_sec"] = round(
+        float(prepare_cache_time_sec + forward_backward_time_sec + sample_moment_time_sec),
+        6,
+    )
+    sgld_diag["sgld_param_vector_device"] = str(mean_vector.device)
+
+    mean_state = vector_to_named_state(reference_state, target_names, mean_vector.detach().cpu())
+    precision_state = vector_to_named_state(reference_state, target_names, precision_vector.detach().cpu())
     return mean_state, precision_state, sgld_diag

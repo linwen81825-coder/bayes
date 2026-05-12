@@ -10,6 +10,13 @@ client_epochs: 1
 # 训练设备，例如 cpu 或 cuda
 device: cuda
 
+# 是否保存每个客户端训练后的 checkpoint：save/{run_name}/model/{client_id}.pth。
+# false：推荐。客户端参数会通过内存中的 local_state_dict 直接交给 server 聚合，
+#        不再每轮写客户端模型，减少磁盘 I/O 和硬盘占用。
+# true：保持旧行为，每个客户端每轮训练结束后额外保存自己的 checkpoint。
+# 注意：server.pth、server_bayes_state.pth、CSV 和日志不受这个开关影响，仍会正常保存。
+save_client_models: false
+
 # expert_bayes_meta 服务端 Bayes meta update 使用的设备。
 # 只影响服务器聚合阶段中每个 expert 的 Bayes meta loss / backward / Adam update，
 # 不影响客户端普通训练，也不影响 FedAvg / ExpertFedAvg。
@@ -52,6 +59,30 @@ run_name: exp1
 
 # false 时，如果本次实验的目标输出目录已经非空，会直接报错防止覆盖
 allow_overwrite: false
+
+# 是否启用 tqdm 进度条总开关
+use_tqdm: true
+
+# 是否显示 round/client 级动态进度条；false 时只保留每轮 clean summary
+progress_bar: true
+
+# tqdm 动态条是否在完成后保留在终端里
+progress_bar_leave: false
+
+# tqdm 动态刷新的最小间隔，避免日志太密
+progress_bar_mininterval: 1.0
+
+# tqdm 进度条总宽度；固定宽度更容易显示完整的 unicode bar
+progress_ncols: 140
+
+# clean progress summary 的日志间隔；当前默认每轮都会打印
+progress_log_interval: 1
+
+# stdout 不是 tty 时，是否强制显示动态 tqdm；默认 false，nohup/重定向时会自动退化为纯日志
+progress_force_tty: false
+
+# 预留开关：是否显示 expert 级进度条；当前默认关闭
+progress_expert_bar: false
 
 # 聚合方法：
 # - fedavg

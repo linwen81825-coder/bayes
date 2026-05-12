@@ -27,3 +27,13 @@ num_workers: 0
 
 # 是否为 DataLoader 开启 pinned memory，加速 CPU->GPU 拷贝
 pin_memory: false
+
+# 训练入口是否自动检查/生成数据划分
+# true：运行 python train.py 时，如果 partition 缺失则自动生成
+# false：保持旧行为，必须手动先运行 python -m data.data
+auto_prepare_data: true
+
+# 是否强制重新生成 partition
+# false：已有且匹配则复用；已有但不匹配时默认报错
+# true：运行 train.py 时强制重新划分并覆盖旧 partition 文件
+force_repartition: false

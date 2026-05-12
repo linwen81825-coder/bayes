@@ -176,6 +176,69 @@ class CIFARPartitionBuilder:
         print(f"Saved partition meta to {meta_path}")
         print(f"Saved partition stats to {stats_path}")
 
+
+def get_partition_paths(args):
+    meta_path = os.path.join(args.data_save_path, args.partition_meta_name)
+    stats_path = os.path.join(args.data_save_path, args.partition_stats_name)
+    return meta_path, stats_path
+
+
+def ensure_partition_ready(args, logger=None):
+    """Ensure partition files are ready before Server starts training."""
+
+    auto_prepare_data = bool(getattr(args, "auto_prepare_data", True))
+    force_repartition = bool(getattr(args, "force_repartition", False))
+    allow_overwrite = bool(getattr(args, "allow_overwrite", False))
+
+    def log(message):
+        if logger is not None:
+            logger.info(message)
+        else:
+            print(message)
+
+    if not auto_prepare_data:
+        log("--partition_prepare : auto_prepare_data=false, skip automatic partition preparation")
+        return None
+
+    # Keep validation owned by loader.py, but avoid making loader.py depend on this builder.
+    from data.loader import validate_partition_meta
+
+    meta_path, stats_path = get_partition_paths(args)
+
+    def build_partition(reason):
+        log(f"--partition_prepare : build partition because {reason}")
+        meta, _ = CIFARPartitionBuilder(args=args).build()
+        log(f"--partition_prepare : saved meta to {meta_path}")
+        log(f"--partition_prepare : saved stats to {stats_path}")
+        return meta
+
+    if force_repartition:
+        return build_partition("force_repartition=true")
+
+    if not os.path.exists(meta_path) or not os.path.exists(stats_path):
+        return build_partition("partition files are missing")
+
+    try:
+        meta = torch.load(meta_path, weights_only=False)
+        validate_partition_meta(meta, args)
+        log(f"--partition_prepare : reuse valid partition {meta_path}")
+        return meta
+    except Exception as exc:
+        if allow_overwrite:
+            return build_partition(
+                f"existing partition is invalid or mismatched and allow_overwrite=true: {exc}"
+            )
+
+        raise RuntimeError(
+            "Existing partition files were found but they do not match the current YAML config. "
+            f"meta_path={meta_path}, stats_path={stats_path}. "
+            "To protect old experiment data, automatic overwrite is blocked. "
+            "Please choose a new `run_name`, or set `allow_overwrite: true`, "
+            "or set `force_repartition: true` if you really want to regenerate partition files. "
+            f"Original error: {exc}"
+        ) from exc
+
+
 if __name__ == '__main__':
     cli_parser = argparse.ArgumentParser(description="Build CIFAR partitions from YAML configuration files.")
     add_config_path_arguments(cli_parser)

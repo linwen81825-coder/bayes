@@ -2,11 +2,42 @@ import csv
 import os
 import random
 import re
+import sys
+import math
 
 import numpy as np
 import torch
 
 _STEM_SAFE_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+class _NoOpProgress:
+    def __init__(self, iterable):
+        self._iterable = iterable
+
+    def __iter__(self):
+        return iter(self._iterable)
+
+    def __len__(self):
+        try:
+            return len(self._iterable)
+        except TypeError:
+            return 0
+
+    def set_postfix(self, *args, **kwargs):
+        return None
+
+    def set_postfix_str(self, *args, **kwargs):
+        return None
+
+    def update(self, *args, **kwargs):
+        return None
+
+    def refresh(self, *args, **kwargs):
+        return None
+
+    def close(self):
+        return None
 
 
 def set_seed(seed:int):
@@ -20,6 +51,76 @@ def set_seed(seed:int):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
+
+def should_use_tqdm(args):
+    if not bool(getattr(args, "use_tqdm", True)):
+        return False
+    if not bool(getattr(args, "progress_bar", True)):
+        return False
+    if bool(getattr(args, "progress_force_tty", False)):
+        return True
+    stream = getattr(sys, "stdout", None)
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
+def format_seconds(seconds):
+    if seconds is None:
+        return "n/a"
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return "n/a"
+    if not math.isfinite(seconds) or seconds < 0:
+        return "n/a"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(seconds, 60.0)
+    if minutes < 60:
+        return f"{int(minutes)}m{sec:04.1f}s"
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours}h{minutes:02d}m{sec:04.1f}s"
+
+
+def estimate_eta(elapsed, completed, total):
+    try:
+        elapsed = float(elapsed)
+        completed = int(completed)
+        total = int(total)
+    except (TypeError, ValueError):
+        return None, None
+    if elapsed < 0 or completed <= 0 or total <= 0:
+        return None, None
+    avg_round_time = elapsed / max(completed, 1)
+    eta = max((total - completed) * avg_round_time, 0.0)
+    return eta, avg_round_time
+
+
+def make_tqdm(iterable, args, **kwargs):
+    if not should_use_tqdm(args):
+        return _NoOpProgress(iterable)
+
+    try:
+        from tqdm import tqdm
+    except Exception:
+        return _NoOpProgress(iterable)
+
+    kwargs.setdefault(
+        "leave",
+        bool(getattr(args, "progress_leave", getattr(args, "progress_bar_leave", False))),
+    )
+    kwargs.setdefault("mininterval", float(getattr(args, "progress_bar_mininterval", 1.0)))
+    kwargs.setdefault("dynamic_ncols", False)
+    kwargs.setdefault("ncols", int(getattr(args, "progress_ncols", 140)))
+    kwargs.setdefault("miniters", 1)
+    kwargs.setdefault("position", 0)
+    kwargs.setdefault("ascii", False)
+    kwargs.setdefault(
+        "bar_format",
+        "{desc}: {percentage:3.0f}%|{bar:32}| {n_fmt}/{total_fmt} "
+        "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+    )
+    return tqdm(iterable, **kwargs)
 
 
 def get_experiment_stem(args):

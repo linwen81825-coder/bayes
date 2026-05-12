@@ -1,5 +1,6 @@
 import math
 import os
+import time
 from types import SimpleNamespace
 
 import torch
@@ -9,7 +10,14 @@ from data.loader import build_global_eval_loader, get_client_train_size, load_pa
 from fl.aggregators import build_aggregator
 from fl.client import Client
 from model import build_model_from_args
-from utils.utils import init_result_csv, init_server_result_csv, record_server_result
+from utils.utils import (
+    estimate_eta,
+    format_seconds,
+    init_result_csv,
+    init_server_result_csv,
+    make_tqdm,
+    record_server_result,
+)
 
 class Server:
     # Server 表示联邦学习中的服务端。
@@ -23,6 +31,7 @@ class Server:
         # 客户端编号从 1 开始，例如 num_clients=4 时为 [1, 2, 3, 4]。
         self.clientsID_list = [i+1 for i in range(self.num_clients)]
         self.device = self.args.device
+        self.save_client_models = bool(getattr(self.args, "save_client_models", False))
         # 服务端模型保存路径，例如 ./save/model/server.pth。
         self.model_path = self.args.model_save_path + f"/server.pth"
         self.bayes_state_path = os.path.join(self.args.model_save_path, "server_bayes_state.pth")
@@ -44,6 +53,8 @@ class Server:
         self.criterion = nn.CrossEntropyLoss()
         self.last_client_expert_usages = []
         self.last_client_bayes_evidence = []
+        self.last_client_model_states = []
+        self.logger.info(f"--save_client_models : {self.save_client_models}")
         # 初始化 CSV 结果文件，后续客户端训练会不断追加记录。
         init_result_csv(self.args)
         init_server_result_csv(self.args)
@@ -172,6 +183,10 @@ class Server:
         return aggregation_output, None, {}
 
     def sync_clients_model(self):
+        if not self.save_client_models:
+            self.logger.info("--sync_clients_model : skipped client checkpoints because save_client_models=False")
+            return
+
         server_state_dict = {
             key: value.detach().cpu().clone()
             for key, value in self.model.state_dict().items()
@@ -186,14 +201,33 @@ class Server:
 
     def train(self):
         # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
+        training_start = time.perf_counter()
+        best_acc = float("-inf")
+        last_acc = None
+        progress_steps_per_round = len(self.clientsID_list) + 1
+        progress_total_steps = self.server_epochs * progress_steps_per_round
+        progress_iter = make_tqdm(
+            range(progress_total_steps),
+            self.args,
+            desc=f"Training[{self.args.agg_method}]",
+            total=progress_total_steps,
+            leave=True,
+        )
         for c_T in range(self.server_epochs):
+            round_start = time.perf_counter()
             self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
             round_expert_usage_summary = torch.zeros(self.args.num_experts)
             round_layer_stats = {}
             round_client_expert_usages = []
             round_client_bayes_evidences = []
-            for id in self.clientsID_list:
+            round_client_model_states = []
+            round_client_train_total = 0.0
+            round_client_evidence_total = 0.0
+            round_aggregation_time = 0.0
+            round_eval_time = 0.0
+            for client_index, id in enumerate(self.clientsID_list, start=1):
                 # 每个客户端执行本地训练，并返回本轮信息。
+                client_start = time.perf_counter()
                 client_stats = Client(
                     args=self.args,
                     client_id=id,
@@ -201,25 +235,47 @@ class Server:
                     c_T=c_T,
                     partition_meta=self.partition_meta,
                 ).train()
+                client_time = time.perf_counter() - client_start
+                local_train_time = float(client_stats.get("local_train_time", 0.0) or 0.0)
+                bayes_evidence_time = float(client_stats.get("bayes_evidence_time", 0.0) or 0.0)
+                round_client_train_total += local_train_time
+                round_client_evidence_total += bayes_evidence_time
                 client_expert_usage = client_stats["expert_activations"].float().cpu()
-                round_client_expert_usages.append(client_stats)
+                round_client_expert_usages.append(
+                    {
+                        "expert_activations": client_stats["expert_activations"],
+                        "expert_stats_by_layer": client_stats.get("expert_stats_by_layer", {}),
+                        "expert_activations_by_layer": client_stats.get("expert_activations_by_layer", {}),
+                    }
+                )
                 round_client_bayes_evidences.append(client_stats.get("bayes_evidence_by_layer", {}))
+                round_client_model_states.append(client_stats["local_state_dict"])
                 round_expert_usage_summary += client_expert_usage
                 for layer_id, stats in client_stats.get("expert_stats_by_layer", {}).items():
                     if layer_id not in round_layer_stats:
                         round_layer_stats[layer_id] = {
-                            "expert_activations": torch.zeros(self.args.num_experts),
-                            "overflow_counts": torch.zeros(self.args.num_experts),
-                            "capacity": stats.get("capacity", 0),
-                        }
+                        "expert_activations": torch.zeros(self.args.num_experts),
+                        "overflow_counts": torch.zeros(self.args.num_experts),
+                        "capacity": stats.get("capacity", 0),
+                    }
                     round_layer_stats[layer_id]["expert_activations"] += stats["expert_activations"].float().cpu()
                     round_layer_stats[layer_id]["overflow_counts"] += stats["overflow_counts"].float().cpu()
                     round_layer_stats[layer_id]["capacity"] = stats.get("capacity", round_layer_stats[layer_id]["capacity"])
+                if hasattr(progress_iter, "set_postfix_str"):
+                    progress_iter.set_postfix_str(
+                        f"r={c_T + 1}/{self.server_epochs}, "
+                        f"c={client_index}/{len(self.clientsID_list)}, "
+                        f"tr={local_train_time:.1f}s",
+                        refresh=False,
+                    )
+                if hasattr(progress_iter, "update"):
+                    progress_iter.update(1)
 
             usage_list = [int(v) for v in round_expert_usage_summary.tolist()]
             self.logger.info(f"--round_expert_usage_summary : {usage_list}\n")
             self.last_client_expert_usages = round_client_expert_usages
             self.last_client_bayes_evidence = round_client_bayes_evidences
+            self.last_client_model_states = round_client_model_states
             client_usage_list = [
                 [int(v) for v in stats["expert_activations"].tolist()]
                 for stats in round_client_expert_usages
@@ -240,10 +296,17 @@ class Server:
             self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
             self.logger.info(f"--client_bayes_evidence_counts : {client_bayes_counts}\n")
             # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
+            aggregation_start = time.perf_counter()
             self.aggregation()
+            round_aggregation_time = time.perf_counter() - aggregation_start
 
             # 不再单独划分验证集；服务端每轮直接在官方 test set 上测试当前全局模型。
+            eval_start = time.perf_counter()
             test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
+            round_eval_time = time.perf_counter() - eval_start
+            if test_acc > best_acc:
+                best_acc = test_acc
+            last_acc = test_acc
             self.logger.info(f"--server_global_test_loss : {test_loss:.4f} --server_global_test_acc : {test_acc:.4f}\n")
             record_server_result(
                 {
@@ -258,6 +321,29 @@ class Server:
             # 每轮结束保存当前服务端模型，供下一轮客户端同步。
             self.save_server_model()
             torch.cuda.empty_cache()
+
+            round_elapsed = time.perf_counter() - round_start
+            elapsed = time.perf_counter() - training_start
+            eta, avg_round_time = estimate_eta(elapsed, c_T + 1, self.server_epochs)
+            if hasattr(progress_iter, "update"):
+                progress_iter.update(1)
+            progress_summary = (
+                f"[progress] round={c_T + 1}/{self.server_epochs} "
+                f"elapsed={format_seconds(elapsed)} "
+                f"eta={format_seconds(eta)} "
+                f"last_round={format_seconds(round_elapsed)} "
+                f"avg_round={format_seconds(avg_round_time)} "
+                f"train={format_seconds(round_client_train_total)} "
+                f"evidence={format_seconds(round_client_evidence_total)} "
+                f"aggregation={format_seconds(round_aggregation_time)} "
+                f"eval={format_seconds(round_eval_time)} "
+                f"acc={test_acc:.4f} "
+                f"best={best_acc:.4f} "
+                f"agg={self.args.agg_method}"
+            )
+            self.logger.info(progress_summary)
+        if hasattr(progress_iter, "close"):
+            progress_iter.close()
 
     def evaluate_global_model(self, data_loader):
         self.model.to(self.device)
@@ -292,11 +378,19 @@ class Server:
         # - expert_bayes_meta：在 expert 粒度额外接收客户端上传的局部贝叶斯证据和服务端先验状态。
         client_states = []
         client_sizes = []
-        for id in self.clientsID_list:
-            client_state_dict = torch.load(
-                self.args.model_save_path + f"/{id}.pth",
-                map_location="cpu",
-            )
+        cached_client_states = getattr(self, "last_client_model_states", None)
+        use_returned_states = (
+            isinstance(cached_client_states, list)
+            and len(cached_client_states) == len(self.clientsID_list)
+        )
+        for index, id in enumerate(self.clientsID_list):
+            if use_returned_states:
+                client_state_dict = cached_client_states[index]
+            else:
+                client_state_dict = torch.load(
+                    self.args.model_save_path + f"/{id}.pth",
+                    map_location="cpu",
+                )
             client_states.append(client_state_dict)
             client_sizes.append(self.get_client_train_size(id))
 

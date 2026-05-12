@@ -66,6 +66,16 @@ _REQUIRED_CONFIG_KEYS = (
 _DEFAULT_CONFIG_VALUES = {
     "save_root": "save",
     "allow_overwrite": False,
+    "auto_prepare_data": True,
+    "force_repartition": False,
+    "use_tqdm": True,
+    "progress_bar": True,
+    "progress_bar_leave": False,
+    "progress_bar_mininterval": 1.0,
+    "progress_ncols": 140,
+    "progress_log_interval": 1,
+    "progress_force_tty": False,
+    "progress_expert_bar": False,
 }
 _RUN_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -170,10 +180,8 @@ def _derive_output_paths(merged_config: dict, train_cfg_path: Path) -> None:
     run_dir = save_root / sanitized_run_name
 
     merged_config["run_name"] = sanitized_run_name
-    merged_config["allow_overwrite"] = _as_bool(
-        merged_config["allow_overwrite"],
-        "allow_overwrite",
-    )
+    for bool_key in ["allow_overwrite", "auto_prepare_data", "force_repartition"]:
+        merged_config[bool_key] = _as_bool(merged_config[bool_key], bool_key)
     merged_config["run_dir"] = str(run_dir)
     merged_config["data_save_path"] = str(run_dir / "data")
     merged_config["model_save_path"] = str(run_dir / "model")

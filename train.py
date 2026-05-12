@@ -4,8 +4,9 @@ import os
 import warnings
 
 from configs import add_config_path_arguments, load_args
+from data.data import ensure_partition_ready
 from fl.server import Server
-from utils.utils import get_experiment_stem, set_seed
+from utils.utils import get_experiment_stem, set_seed, should_use_tqdm
 
 warnings.filterwarnings("ignore")
 
@@ -55,9 +56,22 @@ def main():
     )
     set_seed(args.seed)
     logger = build_logger(args)
+    ensure_partition_ready(args, logger=logger)
+    # Re-seed after optional partition generation so model init/training randomness stays stable.
+    set_seed(args.seed)
 
     # 项目主入口：创建服务端对象，然后启动联邦训练流程。
-    Server(args=args, logger=logger).train()
+    try:
+        from tqdm.contrib.logging import logging_redirect_tqdm
+    except Exception:
+        logging_redirect_tqdm = None
+
+    server = Server(args=args, logger=logger)
+    if logging_redirect_tqdm is not None and should_use_tqdm(args):
+        with logging_redirect_tqdm():
+            server.train()
+    else:
+        server.train()
 
 
 if __name__ == "__main__":
