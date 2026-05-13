@@ -10,6 +10,21 @@ client_epochs: 1
 # 训练设备，例如 cpu 或 cuda
 device: cuda
 
+# 客户端本地训练的 round-level 学习率调度器。
+# - none / constant / off：保持固定 learning_rate，不做调度。
+# - cosine：从 base_lr 余弦退火到 lr_min。
+# - cosine_warmup：先 warmup，再余弦退火。
+lr_scheduler: cosine
+
+# 余弦退火 / warmup 的最低学习率；为 null 时默认 base_lr * 0.1。
+lr_min: 0.00005
+
+# warmup round 数；只在 lr_scheduler=cosine_warmup 时生效。
+lr_warmup_rounds: 0
+
+# warmup 的起始学习率；为 null 时默认 lr_min。
+lr_warmup_start_lr: 0.00005
+
 # 是否保存每个客户端训练后的 checkpoint：save/{run_name}/model/{client_id}.pth。
 # false：推荐。客户端参数会通过内存中的 local_state_dict 直接交给 server 聚合，
 #        不再每轮写客户端模型，减少磁盘 I/O 和硬盘占用。
@@ -39,6 +54,12 @@ bayes_empty_cache_after_aggregation: false
 # true：如果 evidence extraction 后显存占用影响后续 client，可打开。
 # 注意：现在不会在每个 expert 后清 cache，只会在整个客户端 evidence 完成后按需清理。
 bayes_empty_cache_after_client_evidence: false
+
+# 是否在每轮联邦训练结束后清理 CUDA cache。
+# false：推荐，减少反复 empty_cache 带来的训练变慢。
+# true：如果你在多实验共卡或显存紧张，可打开，但会牺牲一点速度。
+# 只在 device 是 cuda 且 CUDA 可用时生效。
+empty_cache_after_round: false
 
 # Bayes evidence batch cache 存放设备。
 # 这个 cache 是客户端本地训练后，为每个 active expert 保存的少量输入 batch，

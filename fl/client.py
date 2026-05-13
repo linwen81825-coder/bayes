@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.optim as optim
 import time
@@ -12,9 +13,18 @@ from utils.utils import record_result
 class Client:
     # Client 表示联邦学习里的一个客户端。
     # 每个客户端有自己的数据和模型，服务端每一轮会让多个客户端分别训练。
-    def __init__(self, args: SimpleNamespace, client_id: int, logger, c_T: int, partition_meta=None):
+    def __init__(
+        self,
+        args: SimpleNamespace,
+        client_id: int,
+        logger,
+        c_T: int,
+        partition_meta=None,
+        server_state_dict=None,
+    ):
         self.args = args
         self.client_id = client_id
+        self.server_state_dict = server_state_dict
         self.save_client_models = bool(getattr(self.args, "save_client_models", False))
         # 从 save/model/{client_id}.pth 加载这个客户端自己的模型。
         self.model = self.load_client_model()
@@ -25,7 +35,8 @@ class Client:
         self.client_epochs = self.args.client_epochs
         # 分类任务常用交叉熵损失。
         self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        self.current_learning_rate = self.get_current_learning_rate()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.current_learning_rate)
 
         self.batch_size = self.args.batch_size
         self.partition_meta = partition_meta
@@ -61,6 +72,50 @@ class Client:
         if self.bayes_cache_device not in {"cpu", "cuda", "auto"}:
             raise ValueError("bayes_cache_device must be one of: cpu, cuda, auto")
 
+    def get_current_learning_rate(self):
+        base_lr = float(self.args.learning_rate)
+        scheduler = str(getattr(self.args, "lr_scheduler", "none")).lower()
+        total_rounds = max(int(getattr(self.args, "server_epochs", 1)), 1)
+        round_idx = min(max(int(self.c_T), 0), total_rounds - 1)
+
+        lr_min_value = getattr(self.args, "lr_min", None)
+        lr_min = base_lr * 0.1 if lr_min_value is None else float(lr_min_value)
+        warmup_rounds = max(int(getattr(self.args, "lr_warmup_rounds", 0)), 0)
+        warmup_start_value = getattr(self.args, "lr_warmup_start_lr", None)
+        warmup_start_lr = lr_min if warmup_start_value is None else float(warmup_start_value)
+
+        if scheduler in {"none", "constant", "off"}:
+            return base_lr
+
+        if scheduler == "cosine":
+            if total_rounds <= 1:
+                return base_lr
+            progress = round_idx / (total_rounds - 1)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return lr_min + (base_lr - lr_min) * cosine
+
+        if scheduler == "cosine_warmup":
+            warmup_rounds = min(warmup_rounds, total_rounds)
+            if warmup_rounds > 0 and round_idx < warmup_rounds:
+                if warmup_rounds == 1:
+                    return base_lr
+                warmup_progress = round_idx / (warmup_rounds - 1)
+                return warmup_start_lr + (base_lr - warmup_start_lr) * warmup_progress
+
+            remaining_rounds = total_rounds - warmup_rounds
+            if remaining_rounds <= 1:
+                return base_lr if remaining_rounds <= 0 else lr_min
+
+            cosine_idx = round_idx - warmup_rounds
+            progress = cosine_idx / (remaining_rounds - 1)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return lr_min + (base_lr - lr_min) * cosine
+
+        raise ValueError(
+            f"Unsupported lr_scheduler: {scheduler!r}. "
+            "Expected one of: none, constant, off, cosine, cosine_warmup."
+        )
+
     def load_client_model(self):
         # 客户端模型路径，例如 ./save/model/1.pth。
         self.model_path = self.args.model_save_path + f"/{self.client_id}.pth"
@@ -90,10 +145,13 @@ class Client:
 
     def renew_model(self):
         # 每一轮本地训练前，客户端同步服务端 state_dict。
-        server_state_dict = torch.load(
-            self.args.model_save_path + f"/server.pth",
-            map_location="cpu",
-        )
+        if self.server_state_dict is not None:
+            server_state_dict = self.server_state_dict
+        else:
+            server_state_dict = torch.load(
+                self.args.model_save_path + f"/server.pth",
+                map_location="cpu",
+            )
         self.model.load_state_dict(server_state_dict)
 
     def get_auxiliary_losses(self, result):
@@ -502,6 +560,11 @@ class Client:
     def train(self):
         # 本地训练保持普通监督学习；不同模型通过 forward 返回的 aux loss / stats 接入路由约束和日志。
         self.renew_model()
+        self.logger.info(
+            f"--client: {self.client_id} --round:{self.c_T + 1} "
+            f"--learning_rate:{self.current_learning_rate:.8f} "
+            f"--lr_scheduler:{getattr(self.args, 'lr_scheduler', 'none')}"
+        )
 
         local_train_start = time.perf_counter()
         last_avg_router_probs = torch.zeros(self.args.num_experts, device=self.device)
