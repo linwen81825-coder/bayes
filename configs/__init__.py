@@ -66,6 +66,23 @@ _REQUIRED_CONFIG_KEYS = (
 _DEFAULT_CONFIG_VALUES = {
     "save_root": "save",
     "allow_overwrite": False,
+    "bayes_sgld_fit_mode": "adam_noise",
+    "bayes_map_steps": 8,
+    "bayes_map_lr": None,
+    "bayes_plain_sgld_steps": 32,
+    "bayes_plain_sgld_burnin": 16,
+    "bayes_plain_sgld_lr": 1.0e-6,
+    "bayes_sgld_temperature": 1.0,
+    "bayes_plain_sgld_noise_scale": 1.0,
+    "bayes_plain_sgld_loss_scale": 1.0,
+    "bayes_plain_sgld_prior_precision": 0.0,
+    "bayes_plain_sgld_sample_interval": 1,
+    "bayes_precision_mode": "floor_inverse",
+    "bayes_precision_temperature": 0.25,
+    "bayes_precision_target": 50.0,
+    "bayes_precision_min": 10.0,
+    "bayes_precision_max": 150.0,
+    "bayes_precision_eps": 1.0e-12,
 }
 _RUN_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -180,6 +197,15 @@ def _derive_output_paths(merged_config: dict, train_cfg_path: Path) -> None:
     merged_config["save_result"] = str(run_dir / "result")
 
 
+def _configure_runtime_defaults(args: SimpleNamespace) -> None:
+    try:
+        from fl.bayes_utils import configure_bayes_sgld_fit_defaults
+    except ImportError:
+        return
+
+    configure_bayes_sgld_fit_defaults(args)
+
+
 def _is_non_empty_dir(path: Path) -> bool:
     return path.exists() and path.is_dir() and any(path.iterdir())
 
@@ -257,6 +283,7 @@ def load_args(
     _raise_if_missing_required_keys(merged_config)
 
     args = SimpleNamespace(**merged_config)
+    _configure_runtime_defaults(args)
     _check_output_overwrite(args, output_phase)
     return args
 
