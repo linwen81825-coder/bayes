@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from data.loader import build_global_eval_loader, get_client_train_size, load_partition_meta
+from data.loader import build_client_train_loader, build_global_eval_loader, get_client_train_size, load_partition_meta
 from fl.aggregators import build_aggregator
 from fl.client import Client
 from model import build_model_from_args
@@ -44,6 +44,14 @@ class Server:
             split="global_test",
             meta=self.partition_meta,
         )
+        self.client_train_loaders = {
+            client_id: build_client_train_loader(
+                args=self.args,
+                client_id=client_id,
+                meta=self.partition_meta,
+            )
+            for client_id in self.clientsID_list
+        }
         # 初始化全局模型，并保存到 server.pth。
         self.init_global_model()
         # 贝叶斯 expert 聚合会额外维护一份服务端先验状态。
@@ -241,6 +249,7 @@ class Server:
                         logger=self.logger,
                         c_T=c_T,
                         partition_meta=self.partition_meta,
+                        train_loader=self.client_train_loaders.get(id),
                         server_state_dict=server_state_dict,
                     ).train()
                     client_time = time.perf_counter() - client_start
@@ -362,8 +371,8 @@ class Server:
     def evaluate_global_model(self, data_loader):
         self.model.to(self.device)
         self.model.eval()
-        running_loss = 0.0
-        running_corrects = 0
+        running_loss = torch.zeros((), device=self.device)
+        running_corrects = torch.zeros((), device=self.device)
 
         with torch.no_grad():
             for inputs, labels in data_loader:
@@ -372,14 +381,14 @@ class Server:
                 outputs = result["logits"]
                 loss = self.criterion(outputs, labels)
 
-                running_loss += loss.item() * inputs.size(0)
+                running_loss += loss.detach() * inputs.size(0)
                 _, preds = torch.max(outputs, 1)
                 running_corrects += torch.sum(preds == labels.data)
 
-        eval_loss = running_loss / len(data_loader.dataset)
-        eval_acc = running_corrects.double() / len(data_loader.dataset)
+        eval_loss = (running_loss / len(data_loader.dataset)).item()
+        eval_acc = (running_corrects.double() / len(data_loader.dataset)).item()
         self.model.to("cpu")
-        return eval_loss, eval_acc.item()
+        return eval_loss, eval_acc
 
     def get_client_train_size(self,client_id):
         # FedAvg 使用客户端训练样本数作为聚合权重。

@@ -22,11 +22,11 @@ partition_meta_name: partition_meta.pt
 # 划分统计信息文件名
 partition_stats_name: partition_stats.json
 
-# DataLoader 的子进程数量，0 表示主进程加载
-num_workers: 0
+# DataLoader 的子进程数量，推荐 4；>0 时会启用 persistent_workers 和 prefetch_factor
+num_workers: 4
 
 # 是否为 DataLoader 开启 pinned memory，加速 CPU->GPU 拷贝
-pin_memory: false
+pin_memory: true
 
 # 训练入口是否自动检查/生成数据划分
 # true：运行 python train.py 时，如果 partition 缺失则自动生成

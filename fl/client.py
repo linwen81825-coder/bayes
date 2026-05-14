@@ -20,6 +20,7 @@ class Client:
         logger,
         c_T: int,
         partition_meta=None,
+        train_loader=None,
         server_state_dict=None,
     ):
         self.args = args
@@ -40,9 +41,10 @@ class Client:
 
         self.batch_size = self.args.batch_size
         self.partition_meta = partition_meta
-        self.train_loader = None
-        # 加载当前客户端的训练索引，并动态封装成 DataLoader。
-        self.get_dataloader()
+        self.train_loader = train_loader
+        if self.train_loader is None:
+            # 加载当前客户端的训练索引，并动态封装成 DataLoader。
+            self.get_dataloader()
 
         self.logger = logger
         self.router_aux_loss_coef = self.args.router_aux_loss_coef
@@ -574,17 +576,19 @@ class Client:
 
         for epoch in range(self.client_epochs):
             self.model.train()
-            running_loss = 0.0
-            running_aux_loss = 0.0
-            running_z_loss = 0.0
-            running_corrects = 0
+            running_loss = torch.zeros((), device=self.device)
+            running_aux_loss = torch.zeros((), device=self.device)
+            running_z_loss = torch.zeros((), device=self.device)
+            running_corrects = torch.zeros((), device=self.device)
             total_samples = 0
             usage_total = torch.zeros(self.args.num_experts, device=self.device)
             layer_usage_total = {}
             router_prob_sum = torch.zeros(self.args.num_experts, device=self.device)
+            non_blocking = bool(getattr(self.args, "pin_memory", False)) and str(self.device).startswith("cuda")
 
             for inputs, labels in self.train_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                inputs = inputs.to(self.device, non_blocking=non_blocking)
+                labels = labels.to(self.device, non_blocking=non_blocking)
                 self.optimizer.zero_grad()
 
                 result = self.model(inputs)
@@ -596,9 +600,9 @@ class Client:
                 self.optimizer.step()
 
                 batch_size = inputs.size(0)
-                running_loss += loss.item() * batch_size
-                running_aux_loss += router_aux_loss.item() * batch_size
-                running_z_loss += router_z_loss.item() * batch_size
+                running_loss += loss.detach() * batch_size
+                running_aux_loss += router_aux_loss.detach() * batch_size
+                running_z_loss += router_z_loss.detach() * batch_size
                 total_samples += batch_size
                 _, preds = torch.max(outputs, 1)
                 running_corrects += torch.sum(preds == labels.data)
@@ -614,10 +618,10 @@ class Client:
                 )
                 router_prob_sum += self.get_avg_router_probs(result) * batch_size
 
-            train_loss = running_loss / len(self.train_loader.dataset)
-            train_acc = running_corrects.double() / len(self.train_loader.dataset)
-            avg_aux_loss = running_aux_loss / max(total_samples, 1)
-            avg_z_loss = running_z_loss / max(total_samples, 1)
+            train_loss = (running_loss / len(self.train_loader.dataset)).item()
+            train_acc = (running_corrects.double() / len(self.train_loader.dataset)).item()
+            avg_aux_loss = (running_aux_loss / max(total_samples, 1)).item()
+            avg_z_loss = (running_z_loss / max(total_samples, 1)).item()
             local_usage_total += usage_total.detach()
             self.add_layer_stats(local_layer_usage_total, layer_usage_total)
             last_avg_router_probs = router_prob_sum / max(total_samples, 1)
@@ -647,7 +651,7 @@ class Client:
                 'client_epoch': epoch+1,
                 'client_id': self.client_id,
                 "train_loss": train_loss,
-                "train_acc": train_acc.item(),
+                "train_acc": train_acc,
                 "router_aux_loss": avg_aux_loss,
                 "router_z_loss": avg_z_loss,
             }
