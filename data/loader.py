@@ -1,4 +1,7 @@
 import os
+import random
+
+import numpy as np
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -238,16 +241,35 @@ def build_index_dataset(args, split, client_id=None, meta=None):
     return Subset(dataset, indices)
 
 
-def _build_dataloader_kwargs(args, shuffle):
+def _compute_loader_seed(args, split, client_id=None):
+    base_seed = int(getattr(args, "seed", 0))
+    split_token = str(split)
+    split_offset = sum((idx + 1) * ord(char) for idx, char in enumerate(split_token))
+    client_offset = 0 if client_id is None else int(client_id) * 10007
+    return (base_seed * 1000003 + split_offset * 97 + client_offset) % (2**32)
+
+
+def _seed_worker(worker_id):
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def _build_dataloader_kwargs(args, shuffle, split, client_id=None):
     kwargs = {
         "batch_size": args.batch_size,
         "shuffle": shuffle,
         "num_workers": args.num_workers,
         "pin_memory": args.pin_memory,
     }
+    generator = torch.Generator()
+    generator.manual_seed(_compute_loader_seed(args, split=split, client_id=client_id))
+    kwargs["generator"] = generator
     if int(getattr(args, "num_workers", 0)) > 0:
-        kwargs["persistent_workers"] = True
-        kwargs["prefetch_factor"] = 2
+        kwargs["persistent_workers"] = bool(getattr(args, "persistent_workers", False))
+        kwargs["prefetch_factor"] = int(getattr(args, "prefetch_factor", 2))
+        kwargs["worker_init_fn"] = _seed_worker
     return kwargs
 
 
@@ -258,7 +280,10 @@ def build_client_train_loader(args, client_id, meta=None):
         client_id=client_id,
         meta=meta,
     )
-    return DataLoader(dataset, **_build_dataloader_kwargs(args, shuffle=True))
+    return DataLoader(
+        dataset,
+        **_build_dataloader_kwargs(args, shuffle=True, split="client_train", client_id=client_id),
+    )
 
 
 def build_global_eval_loader(args, split, meta=None):
@@ -266,7 +291,7 @@ def build_global_eval_loader(args, split, meta=None):
         raise ValueError("split must be global_test")
 
     dataset = build_index_dataset(args=args, split=split, meta=meta)
-    return DataLoader(dataset, **_build_dataloader_kwargs(args, shuffle=False))
+    return DataLoader(dataset, **_build_dataloader_kwargs(args, shuffle=False, split=split))
 
 
 def get_client_train_size(args, client_id, meta=None):

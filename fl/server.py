@@ -232,8 +232,10 @@ class Server:
                 round_client_expert_usages = []
                 round_client_bayes_evidences = []
                 round_client_model_states = []
+                round_client_total = 0.0
                 round_client_train_total = 0.0
                 round_client_evidence_total = 0.0
+                round_client_overhead_total = 0.0
                 round_aggregation_time = 0.0
                 round_eval_time = 0.0
                 server_state_dict = {
@@ -255,8 +257,11 @@ class Server:
                     client_time = time.perf_counter() - client_start
                     local_train_time = float(client_stats.get("local_train_time", 0.0) or 0.0)
                     bayes_evidence_time = float(client_stats.get("bayes_evidence_time", 0.0) or 0.0)
+                    client_overhead_time = max(client_time - local_train_time - bayes_evidence_time, 0.0)
+                    round_client_total += client_time
                     round_client_train_total += local_train_time
                     round_client_evidence_total += bayes_evidence_time
+                    round_client_overhead_total += client_overhead_time
                     client_expert_usage = client_stats["expert_activations"].float().cpu()
                     round_client_expert_usages.append(
                         {
@@ -357,6 +362,8 @@ class Server:
                     f"avg_round={format_seconds(avg_round_time)} "
                     f"train={format_seconds(round_client_train_total)} "
                     f"evidence={format_seconds(round_client_evidence_total)} "
+                    f"client_total={format_seconds(round_client_total)} "
+                    f"client_overhead={format_seconds(round_client_overhead_total)} "
                     f"aggregation={format_seconds(round_aggregation_time)} "
                     f"eval={format_seconds(round_eval_time)} "
                     f"acc={test_acc:.4f} "
@@ -373,10 +380,12 @@ class Server:
         self.model.eval()
         running_loss = torch.zeros((), device=self.device)
         running_corrects = torch.zeros((), device=self.device)
+        non_blocking = bool(getattr(self.args, "pin_memory", False)) and str(self.device).startswith("cuda")
 
         with torch.no_grad():
             for inputs, labels in data_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                inputs = inputs.to(self.device, non_blocking=non_blocking)
+                labels = labels.to(self.device, non_blocking=non_blocking)
                 result = self.model(inputs)
                 outputs = result["logits"]
                 loss = self.criterion(outputs, labels)

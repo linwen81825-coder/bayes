@@ -589,7 +589,7 @@ class Client:
             for inputs, labels in self.train_loader:
                 inputs = inputs.to(self.device, non_blocking=non_blocking)
                 labels = labels.to(self.device, non_blocking=non_blocking)
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
 
                 result = self.model(inputs)
                 outputs = result["logits"]

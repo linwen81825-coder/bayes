@@ -68,6 +68,8 @@ _DEFAULT_CONFIG_VALUES = {
     "allow_overwrite": False,
     "auto_prepare_data": True,
     "force_repartition": False,
+    "persistent_workers": False,
+    "prefetch_factor": 2,
     "empty_cache_after_round": False,
     "lr_scheduler": "none",
     "lr_min": None,

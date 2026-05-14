@@ -28,6 +28,12 @@ num_workers: 4
 # 是否为 DataLoader 开启 pinned memory，加速 CPU->GPU 拷贝
 pin_memory: true
 
+# DataLoader 是否保持 worker 常驻；多实验并跑时建议 false，单实验长跑可手动改 true
+persistent_workers: false
+
+# DataLoader 预取因子；num_workers>0 时生效
+prefetch_factor: 2
+
 # 训练入口是否自动检查/生成数据划分
 # true：运行 python train.py 时，如果 partition 缺失则自动生成
 # false：保持旧行为，必须手动先运行 python -m data.data
