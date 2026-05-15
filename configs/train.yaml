@@ -124,8 +124,18 @@ progress_expert_bar: false
 # - expert_bayes_meta
 agg_method: expert_fedavg
 
-# Bayesian expert aggregation:
-# 客户端局部证据提取阶段的 SGLD 迭代步数
+# Bayesian expert aggregation
+
+# 客户端局部证据提取模式。
+# 可选：
+# - adam_noise: 旧逻辑。Adam optimizer + Langevin noise 注入到 gradient 上。
+# - two_stage_plain: 先 Adam 找 local MAP，再用手写 plain SGLD 采样。
+bayes_sgld_fit_mode: adam_noise
+
+# --- adam_noise 专用参数 ---
+# 只有 bayes_sgld_fit_mode: adam_noise 时使用。
+
+# 客户端局部证据提取阶段的 SGLD / optimizer 迭代步数
 bayes_sgld_steps: 10
 
 # SGLD burn-in 步数；小于总步数
@@ -134,8 +144,69 @@ bayes_sgld_burnin: 5
 # 客户端提取局部 expert 证据时的 SGLD 学习率
 bayes_sgld_lr: 0.00005
 
+# --- two_stage_plain 专用参数 ---
+# 只有 bayes_sgld_fit_mode: two_stage_plain 时使用。
+
+# 阶段 1：Adam MAP 步数
+bayes_map_steps: 8
+
+# 阶段 1：Adam MAP 学习率；空值/null 表示使用 bayes_sgld_lr
+bayes_map_lr:
+
+# 阶段 2：plain SGLD 总步数
+bayes_plain_sgld_steps: 32
+
+# 阶段 2：plain SGLD burn-in 步数
+bayes_plain_sgld_burnin: 16
+
+# 阶段 2：plain SGLD 手写参数更新学习率
+bayes_plain_sgld_lr: 0.000001
+
+# 阶段 2：plain SGLD Langevin 温度；噪声尺度为 sqrt(2 * lr * temperature)
+bayes_sgld_temperature: 1.0
+
+# 阶段 2：plain SGLD 噪声独立缩放；最终噪声尺度为该值 * sqrt(2 * lr * temperature)
+bayes_plain_sgld_noise_scale: 1.0
+
+# 阶段 2：data_loss 梯度缩放，用于诊断梯度更新过弱
+bayes_plain_sgld_loss_scale: 1.0
+
+# 阶段 2：以 MAP 参数为中心的二次 prior precision；0 表示不加 MAP 回拉项
+bayes_plain_sgld_prior_precision: 0.0
+
+# 阶段 2：burn-in 后每隔多少步收集一次参数样本
+bayes_plain_sgld_sample_interval: 1
+
+# --- 两种证据提取模式共用参数 ---
+
+# 局部样本方差下限；floor_inverse 模式下会用它做 variance floor
+bayes_sgld_var_floor: 0.0
+
 # 对角精度上限，防止局部方差过小导致数值不稳定
 bayes_ai_max: 1000.0
+
+# local posterior precision 估计模式。
+# 可选：
+# - floor_inverse: 旧默认逻辑，precision = 1 / clamp(raw_var, bayes_sgld_var_floor)
+# - normalized_power: 对 raw_var 做 power tempering 后归一化到 target
+# - scalar_normalized_power: 每个参数张量共享一个 normalized_power precision
+# - relative_normalized_power: 先按 mean_state 参数尺度归一化 raw_var，再做 normalized_power
+bayes_precision_mode: floor_inverse
+
+# normalized_power / scalar_normalized_power / relative_normalized_power 的 power 温度
+bayes_precision_temperature: 0.25
+
+# normalized_power / relative_normalized_power 的目标 precision 均值；沿用当前 main 默认值
+bayes_precision_target: 100.0
+
+# normalized_power / relative_normalized_power 的 precision 下限；沿用当前 main 默认值
+bayes_precision_min: 20.0
+
+# normalized_power / relative_normalized_power 的 precision 上限；沿用当前 main 默认值
+bayes_precision_max: 300.0
+
+# precision 计算时的数值稳定 eps
+bayes_precision_eps: 1.0e-12
 
 # 每个 expert 在客户端最多抽多少个 batch 来估计局部证据
 bayes_evidence_batches: 4
