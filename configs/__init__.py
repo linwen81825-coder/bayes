@@ -68,6 +68,9 @@ _DEFAULT_CONFIG_VALUES = {
     "allow_overwrite": False,
     "auto_prepare_data": True,
     "force_repartition": False,
+    "resume": False,
+    "resume_checkpoint_path": None,
+    "resume_allow_legacy_checkpoint": True,
     "persistent_workers": False,
     "prefetch_factor": 2,
     "empty_cache_after_round": False,
@@ -187,7 +190,13 @@ def _derive_output_paths(merged_config: dict, train_cfg_path: Path) -> None:
     run_dir = save_root / sanitized_run_name
 
     merged_config["run_name"] = sanitized_run_name
-    for bool_key in ["allow_overwrite", "auto_prepare_data", "force_repartition"]:
+    for bool_key in [
+        "allow_overwrite",
+        "auto_prepare_data",
+        "force_repartition",
+        "resume",
+        "resume_allow_legacy_checkpoint",
+    ]:
         merged_config[bool_key] = _as_bool(merged_config[bool_key], bool_key)
     merged_config["run_dir"] = str(run_dir)
     merged_config["data_save_path"] = str(run_dir / "data")
@@ -201,6 +210,9 @@ def _is_non_empty_dir(path: Path) -> bool:
 
 def _check_output_overwrite(args: SimpleNamespace, output_phase: str | None) -> None:
     if output_phase is None or args.allow_overwrite:
+        return
+
+    if bool(getattr(args, "resume", False)) and output_phase in {"train", "all"}:
         return
 
     phase_targets = {

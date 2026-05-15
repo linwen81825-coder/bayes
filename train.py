@@ -33,12 +33,17 @@ def build_logger(args):
     console_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 
     # 文件日志：同时把训练过程保存到 save/{run_name}/result/logs/*.log。
-    file_handler = logging.FileHandler(os.path.join(log_dir, f"{logger_name}.log"), mode="w")
+    log_path = os.path.join(log_dir, f"{logger_name}.log")
+    log_mode = "a" if bool(getattr(args, "resume", False)) else "w"
+    file_handler = logging.FileHandler(log_path, mode=log_mode)
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 
     logger.addHandler(console_handler)
     logger.addHandler(file_handler)
+    if bool(getattr(args, "resume", False)):
+        logger.info("[Resume] Append to existing log file.")
+        logger.info(f"[Resume] log_path: {log_path}")
     return logger
 
 

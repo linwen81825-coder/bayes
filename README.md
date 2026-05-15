@@ -93,6 +93,7 @@ python train.py
 - 如果存在且匹配当前 YAML：直接复用
 - 如果存在但与当前 YAML 不匹配：默认报错，防止误覆盖
 - 如果确实想覆盖旧 partition：设置 `allow_overwrite: true` 或 `force_repartition: true`
+- 如果想安全续跑同一个实验：设置 `resume: true`，训练会从 `save/{run_name}/model/resume_checkpoint.pth` 继续，日志和 CSV 都会追加写入
 
 旧的手动生成 partition 命令仍然保留：
 
@@ -151,6 +152,8 @@ python -m data.data
 
 - `save/{run_name}/model/server.pth`
   - 当前轮 / 最后一轮服务端模型的纯 `state_dict`
+- `save/{run_name}/model/resume_checkpoint.pth`
+  - 安全续跑用的完整训练状态，包含已完成轮数、服务端模型和 `expert_bayes_meta` 的 Bayes 状态
 - `save/{run_name}/model/server_bayes_state.pth`
   - `expert_bayes_meta` 使用的服务端贝叶斯状态
 - `save/{run_name}/model/{client_id}.pth`
@@ -182,6 +185,32 @@ CSV 和日志文件名都会包含：
   - 纯模型参数，直接保存 `state_dict`
 - `server_bayes_state.pth`
   - `expert_bayes_meta` 的全局贝叶斯状态，不是模型 `state_dict`
+
+## 安全续跑
+
+如果实验中断，推荐直接在原 `run_name` 下继续：
+
+```yaml
+run_name: exp1
+server_epochs: 80
+resume: true
+resume_checkpoint_path: null
+allow_overwrite: false
+```
+
+然后重新运行：
+
+```bash
+python train.py
+```
+
+续跑时：
+
+- 日志文件会追加，不会覆盖
+- detail CSV 和 server CSV 会追加，不会重写表头
+- `round` 会接着之前的完成轮数继续
+- `expert_bayes_meta` 会同时恢复 `server_bayes_state.pth`
+- `resume_allow_legacy_checkpoint: true` 时，如果没有 `resume_checkpoint.pth`，会尝试用 `server.pth` + server CSV 做兼容续跑
 
 ## 常用命令
 

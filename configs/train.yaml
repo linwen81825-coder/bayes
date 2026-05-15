@@ -81,6 +81,19 @@ run_name: exp1
 # false 时，如果本次实验的目标输出目录已经非空，会直接报错防止覆盖
 allow_overwrite: false
 
+# 续跑开关：
+# false：新实验，仍然受 allow_overwrite 保护。
+# true：从 save/{run_name}/model/resume_checkpoint.pth 续跑，日志和 CSV 追加写入。
+resume: false
+
+# null 表示默认使用 save/{run_name}/model/resume_checkpoint.pth
+resume_checkpoint_path: null
+
+# 允许旧版本输出文件 fallback：
+# 没有 resume_checkpoint.pth 时，尝试用 server.pth + server CSV 推断轮数。
+# expert_bayes_meta 还需要 server_bayes_state.pth。
+resume_allow_legacy_checkpoint: true
+
 # 是否启用 tqdm 进度条总开关
 use_tqdm: true
 

@@ -31,6 +31,9 @@ class Server:
         # 客户端编号从 1 开始，例如 num_clients=4 时为 [1, 2, 3, 4]。
         self.clientsID_list = [i+1 for i in range(self.num_clients)]
         self.device = self.args.device
+        self.resume = bool(getattr(self.args, "resume", False))
+        self.start_round = 0
+        self.resume_checkpoint_path = self.resolve_resume_checkpoint_path()
         self.save_client_models = bool(getattr(self.args, "save_client_models", False))
         self.empty_cache_after_round = bool(getattr(self.args, "empty_cache_after_round", False))
         # 服务端模型保存路径，例如 ./save/model/server.pth。
@@ -52,10 +55,16 @@ class Server:
             )
             for client_id in self.clientsID_list
         }
-        # 初始化全局模型，并保存到 server.pth。
-        self.init_global_model()
-        # 贝叶斯 expert 聚合会额外维护一份服务端先验状态。
-        self.init_bayes_state()
+        # 初始化全局模型和（如需要）Bayes 状态；resume 只在显式开关打开时触发。
+        self.model = build_model_from_args(self.args)
+        self.bayes_state = None
+        if self.resume:
+            self.load_resume_checkpoint()
+        else:
+            self.logger.info("--resume : False")
+            self.logger.info("--start_round : 1")
+            self.save_server_model()
+            self.init_bayes_state()
         # 客户端初始模型直接来自同一个服务端模型，避免额外随机初始化。
         self.sync_clients_model()
         self.num_experts = self.args.num_experts
@@ -71,15 +80,8 @@ class Server:
 
 
     def init_global_model(self):
-        # 根据 model_type 初始化全局模型。
+        # 保留旧接口，但不再隐式恢复旧 checkpoint。
         self.model = build_model_from_args(self.args)
-        if self.has_bayesian_resume_checkpoint():
-            server_state_dict = torch.load(self.model_path, map_location="cpu")
-            self.model.load_state_dict(server_state_dict)
-            self.logger.info(f"--resume_server_model : {self.model_path}")
-            return
-
-        # 初始化完成后立即保存，客户端 renew_model 时会读取这个文件。
         self.save_server_model()
 
     def save_server_model(self):
@@ -93,28 +95,143 @@ class Server:
     def uses_bayesian_aggregation(self):
         return self.args.agg_method == "expert_bayes_meta"
 
-    def has_bayesian_resume_checkpoint(self):
-        return (
-            self.uses_bayesian_aggregation()
-            and os.path.exists(self.model_path)
-            and os.path.exists(self.bayes_state_path)
-        )
+    def resolve_resume_checkpoint_path(self):
+        path = getattr(self.args, "resume_checkpoint_path", None)
+        if path is None:
+            return os.path.join(self.args.model_save_path, "resume_checkpoint.pth")
+        path_str = str(path).strip()
+        if path_str == "" or path_str.lower() == "null":
+            return os.path.join(self.args.model_save_path, "resume_checkpoint.pth")
+        return path_str
 
     def init_bayes_state(self):
         if not self.uses_bayesian_aggregation():
             self.bayes_state = None
             return
 
-        if self.has_bayesian_resume_checkpoint():
-            self.bayes_state = torch.load(self.bayes_state_path, map_location="cpu")
-            self.logger.info(
-                f"--resume_bayes_state : {self.bayes_state_path} "
-                f"--resume_bayes_round : {int(self.bayes_state.get('round', 0))}"
-            )
-            return
-
         self.bayes_state = self.build_initial_bayes_state()
         self.save_bayes_state()
+
+    def load_resume_checkpoint(self):
+        if os.path.exists(self.resume_checkpoint_path):
+            checkpoint = torch.load(self.resume_checkpoint_path, map_location="cpu")
+            completed_round = int(checkpoint.get("completed_round", 0))
+
+            server_state = checkpoint.get("server_model_state_dict")
+            if server_state is None:
+                raise KeyError(
+                    f"Missing server_model_state_dict in resume checkpoint: {self.resume_checkpoint_path}"
+                )
+
+            self.model.load_state_dict(server_state)
+            self.bayes_state = checkpoint.get("bayes_state", None)
+
+            if self.uses_bayesian_aggregation() and self.bayes_state is None:
+                raise RuntimeError(
+                    "resume=True with expert_bayes_meta requires bayes_state in resume_checkpoint.pth"
+                )
+
+            self.start_round = completed_round
+            self.save_server_model()
+            if self.uses_bayesian_aggregation():
+                self.save_bayes_state()
+            self.logger.info("--resume : True")
+            self.logger.info("--resume_mode : checkpoint")
+            self.logger.info(f"--resume_checkpoint_path : {self.resume_checkpoint_path}")
+            self.logger.info(f"--resume_completed_round : {completed_round}")
+            self.logger.info(f"--resume_start_round : {self.start_round + 1}")
+            self.logger.info(f"--target_server_epochs : {self.server_epochs}")
+            return
+
+        if bool(getattr(self.args, "resume_allow_legacy_checkpoint", True)):
+            self.load_legacy_resume_checkpoint()
+            return
+
+        raise FileNotFoundError(
+            f"resume=True but resume checkpoint not found: {self.resume_checkpoint_path}"
+        )
+
+    def infer_completed_round_from_server_csv(self):
+        import csv
+
+        from utils.utils import get_server_csv_path
+
+        csv_path = get_server_csv_path(self.args)
+        if not os.path.exists(csv_path):
+            return 0
+
+        completed_round = 0
+        with open(csv_path, "r", newline="") as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                phase = str(row.get("phase", "")).strip().lower()
+                if phase != "test":
+                    continue
+                try:
+                    round_id = int(float(row.get("round", 0)))
+                except (TypeError, ValueError):
+                    continue
+                completed_round = max(completed_round, round_id)
+        return completed_round
+
+    def infer_best_acc_from_server_csv(self):
+        import csv
+
+        from utils.utils import get_server_csv_path
+
+        csv_path = get_server_csv_path(self.args)
+        if not os.path.exists(csv_path):
+            return float("-inf")
+
+        best_acc = float("-inf")
+        with open(csv_path, "r", newline="") as csvfile:
+            reader = csv.DictReader(csvfile)
+            for row in reader:
+                phase = str(row.get("phase", "")).strip().lower()
+                if phase != "test":
+                    continue
+                try:
+                    acc = float(row.get("test_acc"))
+                except (TypeError, ValueError):
+                    continue
+                best_acc = max(best_acc, acc)
+        return best_acc
+
+    def load_legacy_resume_checkpoint(self):
+        if not os.path.exists(self.model_path):
+            raise FileNotFoundError(
+                f"resume=True legacy fallback requires server model: {self.model_path}"
+            )
+
+        server_state = torch.load(self.model_path, map_location="cpu")
+        self.model.load_state_dict(server_state)
+
+        self.bayes_state = None
+        if self.uses_bayesian_aggregation():
+            if not os.path.exists(self.bayes_state_path):
+                raise FileNotFoundError(
+                    "resume=True with expert_bayes_meta requires server_bayes_state.pth "
+                    f"for legacy fallback, but not found: {self.bayes_state_path}"
+                )
+            self.bayes_state = torch.load(self.bayes_state_path, map_location="cpu")
+
+        completed_round = self.infer_completed_round_from_server_csv()
+        if completed_round <= 0 and self.uses_bayesian_aggregation() and self.bayes_state is not None:
+            completed_round = int(self.bayes_state.get("round", 0))
+
+        self.start_round = int(completed_round)
+        self.save_server_model()
+        if self.uses_bayesian_aggregation():
+            self.save_bayes_state()
+
+        self.logger.info("--resume : True")
+        self.logger.info("--resume_mode : legacy_fallback")
+        self.logger.info(f"--resume_server_model : {self.model_path}")
+        if self.uses_bayesian_aggregation():
+            self.logger.info(f"--resume_bayes_state : {self.bayes_state_path}")
+        self.logger.info(f"--resume_completed_round : {self.start_round}")
+        self.logger.info(f"--resume_start_round : {self.start_round + 1}")
+        self.logger.info(f"--target_server_epochs : {self.server_epochs}")
 
     def build_initial_bayes_state(self):
         gamma0_init = max(float(getattr(self.args, "bayes_gamma0_init", 1.0)), 1e-8)
@@ -156,6 +273,27 @@ class Server:
         if self.bayes_state is None:
             return
         torch.save(self.bayes_state, self.bayes_state_path)
+
+    def save_resume_checkpoint(self, completed_round: int):
+        os.makedirs(self.args.model_save_path, exist_ok=True)
+        resume_dir = os.path.dirname(self.resume_checkpoint_path)
+        if resume_dir:
+            os.makedirs(resume_dir, exist_ok=True)
+        checkpoint = {
+            "completed_round": int(completed_round),
+            "server_model_state_dict": {
+                key: value.detach().cpu().clone()
+                for key, value in self.model.state_dict().items()
+            },
+            "bayes_state": self.bayes_state,
+            "args_snapshot": vars(self.args).copy(),
+            "agg_method": self.args.agg_method,
+        }
+        torch.save(checkpoint, self.resume_checkpoint_path)
+        self.logger.info(
+            f"--save_resume_checkpoint : {self.resume_checkpoint_path} "
+            f"--completed_round : {int(completed_round)}"
+        )
 
     def parse_expert_ref(self, key):
         parts = key.split(".")
@@ -212,10 +350,18 @@ class Server:
     def train(self):
         # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
         training_start = time.perf_counter()
-        best_acc = float("-inf")
+        best_acc = self.infer_best_acc_from_server_csv() if self.resume else float("-inf")
         last_acc = None
+        if self.start_round >= self.server_epochs:
+            self.logger.info(
+                f"[Resume] completed_round={self.start_round} >= "
+                f"server_epochs={self.server_epochs}; nothing to train."
+            )
+            return
+
+        remaining_rounds = self.server_epochs - self.start_round
         progress_steps_per_round = len(self.clientsID_list) + 1
-        progress_total_steps = self.server_epochs * progress_steps_per_round
+        progress_total_steps = remaining_rounds * progress_steps_per_round
         progress_iter = make_tqdm(
             range(progress_total_steps),
             self.args,
@@ -224,7 +370,7 @@ class Server:
             leave=True,
         )
         try:
-            for c_T in range(self.server_epochs):
+            for c_T in range(self.start_round, self.server_epochs):
                 round_start = time.perf_counter()
                 self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
                 round_expert_usage_summary = torch.zeros(self.args.num_experts)
@@ -342,6 +488,7 @@ class Server:
 
                 # 每轮结束保存当前服务端模型，供下一轮客户端同步。
                 self.save_server_model()
+                self.save_resume_checkpoint(completed_round=c_T + 1)
                 if (
                     self.empty_cache_after_round
                     and str(self.device).startswith("cuda")
@@ -351,7 +498,8 @@ class Server:
 
                 round_elapsed = time.perf_counter() - round_start
                 elapsed = time.perf_counter() - training_start
-                eta, avg_round_time = estimate_eta(elapsed, c_T + 1, self.server_epochs)
+                completed_this_run = c_T + 1 - self.start_round
+                eta, avg_round_time = estimate_eta(elapsed, completed_this_run, remaining_rounds)
                 if hasattr(progress_iter, "update"):
                     progress_iter.update(1)
                 progress_summary = (

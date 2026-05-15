@@ -158,6 +158,15 @@ def get_server_csv_path(args):
     return os.path.join(server_dir, filename)
 
 
+def _init_csv_if_needed(csv_path, fieldnames, resume=False):
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    if resume and os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+        return
+    with open(csv_path, "w", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+
 def init_result_csv(args):
     """初始化结果 CSV，写入表头。
 
@@ -165,25 +174,27 @@ def init_result_csv(args):
     """
 
     csv_path = get_csv_path(args)
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    with open(csv_path, 'w', newline='') as csvfile:
-        fieldnames = ['T', 'client_epoch', 'client_id',"train_loss","train_acc","router_aux_loss","router_z_loss"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
+    fieldnames = [
+        "T",
+        "client_epoch",
+        "client_id",
+        "train_loss",
+        "train_acc",
+        "router_aux_loss",
+        "router_z_loss",
+    ]
+    _init_csv_if_needed(csv_path, fieldnames, resume=bool(getattr(args, "resume", False)))
 
 
 def init_server_result_csv(args):
     csv_path = get_server_csv_path(args)
-    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-    with open(csv_path, 'w', newline='') as csvfile:
-        fieldnames = [
-            'phase',
-            'round',
-            'test_loss',
-            'test_acc',
-        ]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
+    fieldnames = [
+        "phase",
+        "round",
+        "test_loss",
+        "test_acc",
+    ]
+    _init_csv_if_needed(csv_path, fieldnames, resume=bool(getattr(args, "resume", False)))
 
 def record_result(record_dic:dict, args):
     """追加写入一条客户端训练记录。"""
