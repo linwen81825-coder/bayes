@@ -315,6 +315,8 @@ class ExpertBayesMetaAggregator(Aggregator):
                 prior_state=prior_state,
                 prior_n0=prior_n0,
                 client_payloads=client_payloads,
+                layer_id=layer_id,
+                expert_id=expert_id,
             )
         )
 
@@ -356,6 +358,8 @@ class ExpertBayesMetaAggregator(Aggregator):
         prior_state,
         prior_n0,
         client_payloads,
+        layer_id=None,
+        expert_id=None,
     ):
         prior_mean_params = collections.OrderedDict()
         log_precision_params = collections.OrderedDict()
@@ -423,6 +427,9 @@ class ExpertBayesMetaAggregator(Aggregator):
 
         optimizer = torch.optim.Adam(optim_params, lr=self.meta_lr)
         local_posterior_count = 0
+        last_finite_meta_loss_value = None
+        last_finite_local_posterior_count = 0
+        encountered_nonfinite = False
         for _ in range(self.meta_steps):
             optimizer.zero_grad()
             meta_loss, local_posterior_count = self._compute_expert_meta_loss(
@@ -432,25 +439,52 @@ class ExpertBayesMetaAggregator(Aggregator):
                 log_n0_param=log_n0_param,
                 client_payloads=client_payloads,
             )
+            if not torch.isfinite(meta_loss).item():
+                encountered_nonfinite = True
+                layer_label = "unknown" if layer_id is None else str(layer_id)
+                expert_label = "unknown" if expert_id is None else str(expert_id)
+                print(
+                    "[ExpertBayesMetaAggregator] warning: non-finite meta_loss "
+                    f"layer={layer_label} expert={expert_label}; "
+                    "skipping backward and optimizer.step, keeping last finite prior parameters."
+                )
+                break
             meta_loss.backward()
             optimizer.step()
             self._project_meta_params(log_precision_params, log_n0_param)
 
-        with torch.no_grad():
-            final_meta_loss, final_local_posterior_count = self._compute_expert_meta_loss(
-                expert_keys=expert_keys,
-                prior_mean_params=prior_mean_params,
-                log_precision_params=log_precision_params,
-                log_n0_param=log_n0_param,
-                client_payloads=client_payloads,
-            )
+            last_finite_meta_loss_value = float(meta_loss.detach().cpu().item())
+            last_finite_local_posterior_count = local_posterior_count
+
+        final_local_posterior_count = local_posterior_count
+        final_meta_loss_value = float("nan")
+        if not encountered_nonfinite:
+            with torch.no_grad():
+                final_meta_loss, final_local_posterior_count = self._compute_expert_meta_loss(
+                    expert_keys=expert_keys,
+                    prior_mean_params=prior_mean_params,
+                    log_precision_params=log_precision_params,
+                    log_n0_param=log_n0_param,
+                    client_payloads=client_payloads,
+                )
+            if torch.isfinite(final_meta_loss).item():
+                final_meta_loss_value = float(final_meta_loss.detach().cpu().item())
+            elif last_finite_meta_loss_value is not None:
+                final_meta_loss_value = last_finite_meta_loss_value
+                final_local_posterior_count = last_finite_local_posterior_count
+            else:
+                final_meta_loss_value = float("nan")
+        else:
+            if last_finite_meta_loss_value is not None:
+                final_meta_loss_value = last_finite_meta_loss_value
+                final_local_posterior_count = last_finite_local_posterior_count
 
         return (
             prior_mean_params,
             log_precision_params,
             log_n0_param,
             final_local_posterior_count,
-            float(final_meta_loss.detach().cpu().item()),
+            final_meta_loss_value,
         )
 
     def _summarize_client_payloads(self, client_payloads, expert_keys):

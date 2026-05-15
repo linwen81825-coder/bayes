@@ -312,7 +312,7 @@ class Client:
                 if expert_usage <= 0:
                     continue
                 expert_cache = batch_cache_by_expert.setdefault(str(layer_id), {}).setdefault(str(expert_id), [])
-                expert_cache.append((expert_usage, cached_inputs.clone(), cached_labels.clone()))
+                expert_cache.append((expert_usage, cached_inputs, cached_labels))
                 expert_cache.sort(key=lambda item: item[0], reverse=True)
                 if len(expert_cache) > self.bayes_evidence_batches:
                     del expert_cache[self.bayes_evidence_batches:]
@@ -618,8 +618,9 @@ class Client:
                 )
                 router_prob_sum += self.get_avg_router_probs(result) * batch_size
 
-            train_loss = (running_loss / len(self.train_loader.dataset)).item()
-            train_acc = (running_corrects.double() / len(self.train_loader.dataset)).item()
+            denom = max(total_samples, 1)
+            train_loss = (running_loss / denom).item()
+            train_acc = (running_corrects.double() / denom).item()
             avg_aux_loss = (running_aux_loss / max(total_samples, 1)).item()
             avg_z_loss = (running_z_loss / max(total_samples, 1)).item()
             local_usage_total += usage_total.detach()
