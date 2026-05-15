@@ -112,6 +112,52 @@ class Server:
         self.bayes_state = self.build_initial_bayes_state()
         self.save_bayes_state()
 
+    def validate_resume_args_snapshot(self, checkpoint):
+        saved_args = checkpoint.get("args_snapshot", {}) or {}
+
+        strict_keys = [
+            "data_name",
+            "num_clients",
+            "alpha",
+            "seed",
+            "partition_meta_name",
+            "partition_stats_name",
+            "model_type",
+            "num_experts",
+            "embed_dim",
+            "num_heads",
+            "mlp_ratio",
+            "depth",
+            "num_layers",
+            "moe_layers",
+            "top_k",
+            "stem_channels",
+            "token_grid_size",
+            "use_cls_token",
+            "agg_method",
+        ]
+
+        mismatches = []
+        for key in strict_keys:
+            if key not in saved_args or not hasattr(self.args, key):
+                continue
+            old_value = saved_args.get(key)
+            new_value = getattr(self.args, key)
+            if old_value != new_value:
+                mismatches.append((key, old_value, new_value))
+
+        if mismatches:
+            details = ", ".join(
+                f"{key}: checkpoint={old!r}, current={new!r}"
+                for key, old, new in mismatches
+            )
+            raise RuntimeError(
+                "Resume checkpoint config mismatch. "
+                f"{details}. "
+                "Please keep core data/model/aggregation config unchanged when resuming, "
+                "or use a new run_name for a new experiment."
+            )
+
     def load_resume_checkpoint(self):
         if os.path.exists(self.resume_checkpoint_path):
             checkpoint = torch.load(self.resume_checkpoint_path, map_location="cpu")
@@ -125,6 +171,8 @@ class Server:
                     f"current args.agg_method={self.args.agg_method!r}. "
                     "Please use the same aggregation method when resuming, or start a new run_name."
                 )
+
+            self.validate_resume_args_snapshot(checkpoint)
 
             server_state = checkpoint.get("server_model_state_dict")
             if server_state is None:
@@ -309,7 +357,9 @@ class Server:
             "args_snapshot": vars(self.args).copy(),
             "agg_method": self.args.agg_method,
         }
-        torch.save(checkpoint, self.resume_checkpoint_path)
+        tmp_path = f"{self.resume_checkpoint_path}.tmp"
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, self.resume_checkpoint_path)
         self.logger.info(
             f"--save_resume_checkpoint : {self.resume_checkpoint_path} "
             f"--completed_round : {int(completed_round)}"

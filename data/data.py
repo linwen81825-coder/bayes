@@ -189,6 +189,14 @@ def ensure_partition_ready(args, logger=None):
     auto_prepare_data = bool(getattr(args, "auto_prepare_data", True))
     force_repartition = bool(getattr(args, "force_repartition", False))
     allow_overwrite = bool(getattr(args, "allow_overwrite", False))
+    resume = bool(getattr(args, "resume", False))
+
+    if resume and force_repartition:
+        raise RuntimeError(
+            "Invalid config: resume=True cannot be used with force_repartition=True. "
+            "Resuming must reuse the original data partition. "
+            "Please set force_repartition: false, or use a new run_name for a new experiment."
+        )
 
     def log(message):
         if logger is not None:
