@@ -600,7 +600,7 @@ class Server:
         running_corrects = torch.zeros((), device=self.device)
         non_blocking = bool(getattr(self.args, "pin_memory", False)) and str(self.device).startswith("cuda")
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for inputs, labels in data_loader:
                 inputs = inputs.to(self.device, non_blocking=non_blocking)
                 labels = labels.to(self.device, non_blocking=non_blocking)

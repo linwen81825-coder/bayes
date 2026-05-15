@@ -16,6 +16,7 @@ PARTITION_REGEN_HINT = (
     "or set `force_repartition: true` if you really want to regenerate partition files. "
     "You can also run `python -m data.data` manually after updating the YAML config."
 )
+_RAW_CIFAR_DATASET_CACHE = {}
 
 
 def get_cifar_stats(data_name):
@@ -164,9 +165,19 @@ def raise_partition_mismatch(field, actual, expected):
 
 
 def build_raw_cifar_dataset(args, train, transform):
+    cache_key = (
+        str(args.data_name).lower(),
+        os.path.abspath(os.path.normpath(str(args.data_path))),
+        bool(train),
+        repr(transform),
+    )
+    cached_dataset = _RAW_CIFAR_DATASET_CACHE.get(cache_key)
+    if cached_dataset is not None:
+        return cached_dataset
+
     dataset_cls, _, _, _ = get_cifar_stats(args.data_name)
     try:
-        return dataset_cls(
+        dataset = dataset_cls(
             root=args.data_path,
             train=train,
             download=False,
@@ -218,6 +229,9 @@ def build_raw_cifar_dataset(args, train, transform):
             "the original CIFAR files. Please check data_path or re-run: "
             "`python -m data.data`."
         ) from e
+
+    _RAW_CIFAR_DATASET_CACHE[cache_key] = dataset
+    return dataset
 
 
 def build_index_dataset(args, split, client_id=None, meta=None):
