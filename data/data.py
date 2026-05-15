@@ -220,6 +220,31 @@ def ensure_partition_ready(args, logger=None):
         log(f"--partition_prepare : saved stats to {stats_path}")
         return meta
 
+    if resume:
+        if not os.path.exists(meta_path) or not os.path.exists(stats_path):
+            raise FileNotFoundError(
+                "resume=True requires existing partition files. "
+                f"meta_path={meta_path}, stats_path={stats_path}. "
+                "Resuming must reuse the original data partition. "
+                "Please restore the old partition files, or start a new run_name."
+            )
+
+        try:
+            meta = torch.load(meta_path, weights_only=False)
+            validate_partition_meta(meta, args)
+            log(f"--partition_prepare : resume reuse valid partition {meta_path}")
+            return meta
+        except Exception as exc:
+            raise RuntimeError(
+                "resume=True found existing partition files, but they do not match "
+                "the current YAML config or cannot be loaded. "
+                f"meta_path={meta_path}, stats_path={stats_path}. "
+                "Resuming must reuse a valid original partition; automatic rebuild is disabled. "
+                "Please check data_name, num_clients, alpha, seed, partition file names, "
+                "or start a new run_name for a new experiment. "
+                f"Original error: {exc}"
+            ) from exc
+
     if force_repartition:
         return build_partition("force_repartition=true")
 
