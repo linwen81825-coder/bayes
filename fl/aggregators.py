@@ -1,5 +1,6 @@
 import collections
 import copy
+import logging
 import math
 import time
 from abc import ABC, abstractmethod
@@ -163,6 +164,8 @@ class ExpertBayesMetaAggregator(Aggregator):
                 "bayes_client_weight_mode must be one of: "
                 "uniform, sqrt_usage, usage"
             )
+        self.direction_diag = bool(getattr(args, "bayes_direction_diag", False))
+        self.direction_diag_detail = bool(getattr(args, "bayes_direction_diag_detail", False))
         print(
             "[ExpertBayesMetaAggregator] "
             f"bayes_meta_device={self.meta_device} "
@@ -205,6 +208,7 @@ class ExpertBayesMetaAggregator(Aggregator):
             raise ValueError("ExpertBayesMeta requires expert_evidence from clients")
         if len(expert_evidence) != len(client_updates):
             raise ValueError("expert_evidence and client_updates must have the same length")
+        expert_weights = kwargs.get("expert_weights")
 
         bayes_state = kwargs.get("bayes_state")
         if bayes_state is None:
@@ -218,6 +222,11 @@ class ExpertBayesMetaAggregator(Aggregator):
         )
         updated_bayes_state = copy.deepcopy(bayes_state)
         expert_groups = group_expert_keys(global_state)
+        old_expert_state = (
+            self._clone_expert_state_for_direction_diag(global_state, expert_groups)
+            if self.direction_diag
+            else None
+        )
         metrics = {
             "updated_experts": 0,
             "skipped_experts": 0,
@@ -248,6 +257,17 @@ class ExpertBayesMetaAggregator(Aggregator):
 
             for key, value in expert_params.items():
                 aggregated_state[key] = value
+
+        if self.direction_diag:
+            direction_summary = self._log_direction_diagnostics(
+                old_expert_state=old_expert_state,
+                aggregated_state=aggregated_state,
+                client_updates=client_updates,
+                client_weights=client_weights,
+                client_expert_usages=expert_weights,
+                expert_groups=expert_groups,
+            )
+            metrics["bayes_vs_fedavg_direction_summary"] = direction_summary
 
         updated_bayes_state["round"] = int(updated_bayes_state.get("round", 0)) + 1
         metrics["bayes_aggregation_time_sec"] = round(
@@ -794,6 +814,299 @@ class ExpertBayesMetaAggregator(Aggregator):
                 }
             )
         return payloads
+
+    def _clone_expert_state_for_direction_diag(self, global_state, expert_groups):
+        old_state = {}
+        for expert_keys in expert_groups.values():
+            for key in expert_keys:
+                value = global_state.get(key)
+                if torch.is_tensor(value) and torch.is_floating_point(value):
+                    old_state[key] = value.detach().cpu().clone()
+        return old_state
+
+    def _get_direction_diag_usage(self, client_usage, layer_id, expert_id):
+        if client_usage is None:
+            return None
+        expert_index = int(expert_id)
+        if isinstance(client_usage, dict):
+            layer_stats = client_usage.get("expert_stats_by_layer", {}).get(str(layer_id), {})
+            usage = layer_stats.get("expert_activations")
+            if usage is None:
+                usage = client_usage.get("expert_activations_by_layer", {}).get(str(layer_id))
+            if usage is None:
+                usage = client_usage.get("expert_activations") if layer_id is None else None
+            if usage is None or expert_index >= len(usage):
+                return None
+            return max(float(usage[expert_index]), 0.0)
+
+        if expert_index >= len(client_usage):
+            return None
+        return max(float(client_usage[expert_index]), 0.0)
+
+    def _get_direction_diag_fedavg_weights(
+        self,
+        layer_id,
+        expert_id,
+        client_weights,
+        client_expert_usages,
+        num_clients,
+    ):
+        usage_weights = []
+        missing_usage = False
+        for client_idx in range(num_clients):
+            client_usage = None
+            if isinstance(client_expert_usages, list) and client_idx < len(client_expert_usages):
+                client_usage = client_expert_usages[client_idx]
+            usage = self._get_direction_diag_usage(client_usage, layer_id, expert_id)
+            if usage is None:
+                missing_usage = True
+                usage = 0.0
+            usage_weights.append(float(usage))
+
+        fallback_mode = None
+        weights = usage_weights
+        total_weight = float(sum(weights))
+        if missing_usage or total_weight <= 0.0:
+            sample_weights = [float(weight) for weight in client_weights]
+            sample_total = float(sum(sample_weights))
+            if sample_total > 0.0:
+                weights = sample_weights
+                total_weight = sample_total
+                fallback_mode = "sample_count"
+            else:
+                weights = [1.0 for _ in range(num_clients)]
+                total_weight = float(num_clients)
+                fallback_mode = "uniform"
+
+        if total_weight <= 0.0:
+            weights = [1.0 for _ in range(num_clients)]
+            total_weight = float(num_clients)
+            fallback_mode = "uniform"
+
+        max_ratio = max(weights) / max(total_weight, 1e-12) if weights else 0.0
+        return weights, total_weight, max_ratio, fallback_mode
+
+    def _compute_direction_metrics_for_expert(
+        self,
+        layer_id,
+        expert_id,
+        expert_keys,
+        old_expert_state,
+        aggregated_state,
+        client_updates,
+        client_weights,
+        client_expert_usages,
+    ):
+        """Compare Bayes expert update direction with a diagnostic ExpertFedAvg candidate.
+
+        cos_bayes_fedavg close to 1 means Bayes and FedAvg move in the same direction.
+        A value close to 0 means weakly related directions; a negative value means conflict.
+        A small bayes_vs_fedavg_rel means Bayes and FedAvg are practically similar.
+        A large bayes_vs_fedavg_rel with poor test accuracy can indicate over-deviation.
+        bayes_delta_rel > fedavg_delta_rel means Bayes is more aggressive; smaller means conservative.
+        """
+        weights, weight_sum, weight_max_ratio, fallback_mode = self._get_direction_diag_fedavg_weights(
+            layer_id=layer_id,
+            expert_id=expert_id,
+            client_weights=client_weights,
+            client_expert_usages=client_expert_usages,
+            num_clients=len(client_updates),
+        )
+        normalized_weights = [weight / max(weight_sum, 1e-12) for weight in weights]
+
+        old_norm2 = 0.0
+        fedavg_norm2 = 0.0
+        fedavg_delta_norm2 = 0.0
+        bayes_delta_norm2 = 0.0
+        bayes_vs_fedavg_norm2 = 0.0
+        dot = 0.0
+        skipped_key_count = 0
+        valid_key_count = 0
+
+        with torch.no_grad():
+            for key in expert_keys:
+                old_value = old_expert_state.get(key)
+                bayes_value = aggregated_state.get(key)
+                if old_value is None or bayes_value is None:
+                    skipped_key_count += 1
+                    continue
+                if not torch.is_tensor(old_value) or not torch.is_tensor(bayes_value):
+                    skipped_key_count += 1
+                    continue
+                if not torch.is_floating_point(old_value) or not torch.is_floating_point(bayes_value):
+                    skipped_key_count += 1
+                    continue
+                if any(key not in update for update in client_updates):
+                    skipped_key_count += 1
+                    continue
+
+                old_tensor = old_value.detach().cpu().float()
+                bayes_tensor = bayes_value.detach().cpu().float()
+                fedavg_tensor = torch.zeros_like(old_tensor)
+                for update, weight in zip(client_updates, normalized_weights):
+                    update_value = update[key]
+                    if not torch.is_tensor(update_value) or not torch.is_floating_point(update_value):
+                        continue
+                    fedavg_tensor.add_(update_value.detach().cpu().float(), alpha=float(weight))
+
+                fedavg_delta = fedavg_tensor - old_tensor
+                bayes_delta = bayes_tensor - old_tensor
+                bayes_vs_fedavg = bayes_tensor - fedavg_tensor
+
+                old_norm2 += float(old_tensor.square().sum().item())
+                fedavg_norm2 += float(fedavg_tensor.square().sum().item())
+                fedavg_delta_norm2 += float(fedavg_delta.square().sum().item())
+                bayes_delta_norm2 += float(bayes_delta.square().sum().item())
+                bayes_vs_fedavg_norm2 += float(bayes_vs_fedavg.square().sum().item())
+                dot += float((bayes_delta * fedavg_delta).sum().item())
+                valid_key_count += 1
+
+        if valid_key_count == 0:
+            return {
+                "layer": str(layer_id),
+                "expert": str(expert_id),
+                "skipped": True,
+                "skipped_key_count": int(skipped_key_count),
+                "fedavg_weight_sum": round(float(weight_sum), 6),
+                "fedavg_weight_max_ratio": round(float(weight_max_ratio), 6),
+                "fedavg_weight_fallback": fallback_mode is not None,
+                "fedavg_weight_fallback_mode": fallback_mode,
+            }
+
+        eps = 1e-12
+        old_norm = math.sqrt(max(old_norm2, 0.0))
+        fedavg_norm = math.sqrt(max(fedavg_norm2, 0.0))
+        fedavg_delta_norm = math.sqrt(max(fedavg_delta_norm2, 0.0))
+        bayes_delta_norm = math.sqrt(max(bayes_delta_norm2, 0.0))
+        bayes_vs_fedavg_norm = math.sqrt(max(bayes_vs_fedavg_norm2, 0.0))
+        cos_valid = fedavg_delta_norm > eps and bayes_delta_norm > eps
+        cos_value = None
+        if cos_valid:
+            cos_value = dot / max(bayes_delta_norm * fedavg_delta_norm, eps)
+            cos_value = max(min(float(cos_value), 1.0), -1.0)
+
+        return {
+            "layer": str(layer_id),
+            "expert": str(expert_id),
+            "skipped": False,
+            "skipped_key_count": int(skipped_key_count),
+            "valid_key_count": int(valid_key_count),
+            "old_norm": round(float(old_norm), 6),
+            "fedavg_delta_rel": round(float(fedavg_delta_norm / max(old_norm, eps)), 6),
+            "bayes_delta_rel": round(float(bayes_delta_norm / max(old_norm, eps)), 6),
+            "bayes_vs_fedavg_rel": round(float(bayes_vs_fedavg_norm / max(fedavg_norm, eps)), 6),
+            "cos_bayes_fedavg": None if cos_value is None else round(float(cos_value), 6),
+            "cos_valid": bool(cos_valid),
+            "fedavg_weight_sum": round(float(weight_sum), 6),
+            "fedavg_weight_max_ratio": round(float(weight_max_ratio), 6),
+            "fedavg_weight_fallback": fallback_mode is not None,
+            "fedavg_weight_fallback_mode": fallback_mode,
+        }
+
+    def _summary_stat(self, values):
+        finite_values = [float(value) for value in values if value is not None and math.isfinite(float(value))]
+        if not finite_values:
+            return None, None, None
+        return (
+            round(sum(finite_values) / len(finite_values), 6),
+            round(min(finite_values), 6),
+            round(max(finite_values), 6),
+        )
+
+    def _summarize_direction_metrics(self, details):
+        valid_details = [detail for detail in details if not detail.get("skipped")]
+        cos_values = [
+            detail.get("cos_bayes_fedavg")
+            for detail in valid_details
+            if detail.get("cos_valid") and detail.get("cos_bayes_fedavg") is not None
+        ]
+        fedavg_delta_mean, fedavg_delta_min, fedavg_delta_max = self._summary_stat(
+            [detail.get("fedavg_delta_rel") for detail in valid_details]
+        )
+        bayes_delta_mean, bayes_delta_min, bayes_delta_max = self._summary_stat(
+            [detail.get("bayes_delta_rel") for detail in valid_details]
+        )
+        bayes_vs_mean, bayes_vs_min, bayes_vs_max = self._summary_stat(
+            [detail.get("bayes_vs_fedavg_rel") for detail in valid_details]
+        )
+        cos_mean, cos_min, cos_max = self._summary_stat(cos_values)
+        weight_ratio_mean, _, weight_ratio_max = self._summary_stat(
+            [detail.get("fedavg_weight_max_ratio") for detail in details]
+        )
+
+        return {
+            "enabled": True,
+            "num_experts": int(len(details)),
+            "num_valid_cos": int(len(cos_values)),
+            "skipped_expert_count": int(sum(1 for detail in details if detail.get("skipped"))),
+            "skipped_key_count": int(sum(int(detail.get("skipped_key_count", 0)) for detail in details)),
+            "fedavg_delta_rel_mean": fedavg_delta_mean,
+            "fedavg_delta_rel_min": fedavg_delta_min,
+            "fedavg_delta_rel_max": fedavg_delta_max,
+            "bayes_delta_rel_mean": bayes_delta_mean,
+            "bayes_delta_rel_min": bayes_delta_min,
+            "bayes_delta_rel_max": bayes_delta_max,
+            "bayes_vs_fedavg_rel_mean": bayes_vs_mean,
+            "bayes_vs_fedavg_rel_min": bayes_vs_min,
+            "bayes_vs_fedavg_rel_max": bayes_vs_max,
+            "cos_bayes_fedavg_mean": cos_mean,
+            "cos_bayes_fedavg_min": cos_min,
+            "cos_bayes_fedavg_max": cos_max,
+            "cos_negative_count": int(sum(1 for value in cos_values if value < 0.0)),
+            "cos_low_count": int(sum(1 for value in cos_values if value < 0.2)),
+            "cos_mid_count": int(sum(1 for value in cos_values if 0.2 <= value <= 0.8)),
+            "cos_high_count": int(sum(1 for value in cos_values if value > 0.8)),
+            "fedavg_weight_fallback_count": int(
+                sum(1 for detail in details if detail.get("fedavg_weight_fallback"))
+            ),
+            "fedavg_weight_max_ratio_mean": weight_ratio_mean,
+            "fedavg_weight_max_ratio_max": weight_ratio_max,
+        }
+
+    def _emit_direction_diag_log(self, prefix, payload):
+        message = f"{prefix} : {payload}"
+        emitted = False
+        for logger_obj in logging.Logger.manager.loggerDict.values():
+            if not isinstance(logger_obj, logging.Logger):
+                continue
+            if not any(isinstance(handler, logging.FileHandler) for handler in logger_obj.handlers):
+                continue
+            logger_obj.info(message)
+            emitted = True
+        if not emitted:
+            logging.getLogger(__name__).info(message)
+
+    def _log_direction_diagnostics(
+        self,
+        old_expert_state,
+        aggregated_state,
+        client_updates,
+        client_weights,
+        client_expert_usages,
+        expert_groups,
+    ):
+        details = []
+        for (layer_id, expert_id), expert_keys in expert_groups.items():
+            detail = self._compute_direction_metrics_for_expert(
+                layer_id=layer_id,
+                expert_id=expert_id,
+                expert_keys=expert_keys,
+                old_expert_state=old_expert_state or {},
+                aggregated_state=aggregated_state,
+                client_updates=client_updates,
+                client_weights=client_weights,
+                client_expert_usages=client_expert_usages,
+            )
+            details.append(detail)
+
+        summary = self._summarize_direction_metrics(details)
+        self._emit_direction_diag_log("--bayes_vs_fedavg_direction_summary", summary)
+
+        if self.direction_diag_detail:
+            for detail in details[:32]:
+                self._emit_direction_diag_log("--bayes_vs_fedavg_direction_detail", detail)
+
+        return summary
 
     def _get_or_init_prior_state(self, updated_bayes_state, layer_id, expert_id, expert_keys, global_state):
         expert_state = get_bayes_expert_state(
