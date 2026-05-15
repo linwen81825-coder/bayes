@@ -1028,6 +1028,34 @@ _BAYES_SGLD_FIT_CONFIG_TO_PARAM = {
 }
 
 
+def _coerce_bayes_sgld_default_value(param_name, value):
+    if value is None:
+        return None
+
+    if param_name == "sgld_fit_mode":
+        return str(value).strip().lower()
+
+    if param_name in {
+        "map_steps",
+        "plain_sgld_steps",
+        "plain_sgld_burnin",
+        "plain_sgld_sample_interval",
+    }:
+        return int(value)
+
+    if param_name in {
+        "map_lr",
+        "plain_sgld_lr",
+        "sgld_temperature",
+        "plain_sgld_noise_scale",
+        "plain_sgld_loss_scale",
+        "plain_sgld_prior_precision",
+    }:
+        return float(value)
+
+    return value
+
+
 def configure_bayes_sgld_fit_defaults(config):
     """Apply YAML-level SGLD fit defaults without changing client.py call sites."""
 
@@ -1041,6 +1069,6 @@ def configure_bayes_sgld_fit_defaults(config):
             if not hasattr(config, config_key):
                 continue
             value = getattr(config, config_key)
-        kwdefaults[param_name] = value
+        kwdefaults[param_name] = _coerce_bayes_sgld_default_value(param_name, value)
 
     run_expert_sgld_fit.__kwdefaults__ = kwdefaults
