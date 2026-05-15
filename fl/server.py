@@ -117,6 +117,15 @@ class Server:
             checkpoint = torch.load(self.resume_checkpoint_path, map_location="cpu")
             completed_round = int(checkpoint.get("completed_round", 0))
 
+            ckpt_agg_method = checkpoint.get("agg_method")
+            if ckpt_agg_method is not None and ckpt_agg_method != self.args.agg_method:
+                raise RuntimeError(
+                    "Resume checkpoint agg_method mismatch: "
+                    f"checkpoint agg_method={ckpt_agg_method!r}, "
+                    f"current args.agg_method={self.args.agg_method!r}. "
+                    "Please use the same aggregation method when resuming, or start a new run_name."
+                )
+
             server_state = checkpoint.get("server_model_state_dict")
             if server_state is None:
                 raise KeyError(
@@ -216,8 +225,19 @@ class Server:
             self.bayes_state = torch.load(self.bayes_state_path, map_location="cpu")
 
         completed_round = self.infer_completed_round_from_server_csv()
-        if completed_round <= 0 and self.uses_bayesian_aggregation() and self.bayes_state is not None:
-            completed_round = int(self.bayes_state.get("round", 0))
+        if self.uses_bayesian_aggregation() and self.bayes_state is not None:
+            bayes_round = int(self.bayes_state.get("round", 0))
+            if completed_round > 0 and bayes_round > 0 and completed_round != bayes_round:
+                raise RuntimeError(
+                    "Legacy Bayes resume state is inconsistent: "
+                    f"server_csv_completed_round={completed_round}, "
+                    f"bayes_state_round={bayes_round}. "
+                    "This may mean the previous run was interrupted during a round. "
+                    "Please inspect server.pth, server_bayes_state.pth and server CSV manually, "
+                    "or resume from resume_checkpoint.pth if available."
+                )
+            if completed_round <= 0 and bayes_round > 0:
+                completed_round = bayes_round
 
         self.start_round = int(completed_round)
         self.save_server_model()

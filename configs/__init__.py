@@ -212,9 +212,6 @@ def _check_output_overwrite(args: SimpleNamespace, output_phase: str | None) -> 
     if output_phase is None or args.allow_overwrite:
         return
 
-    if bool(getattr(args, "resume", False)) and output_phase in {"train", "all"}:
-        return
-
     phase_targets = {
         "data": [args.data_save_path],
         "train": [args.model_save_path, args.save_result],
@@ -226,9 +223,16 @@ def _check_output_overwrite(args: SimpleNamespace, output_phase: str | None) -> 
             "Expected one of: data, train, all."
         )
 
+    targets = phase_targets[output_phase]
+    if bool(getattr(args, "resume", False)):
+        if output_phase == "train":
+            return
+        if output_phase == "all":
+            targets = [args.data_save_path]
+
     blocked_paths = [
         path
-        for path in phase_targets[output_phase]
+        for path in targets
         if _is_non_empty_dir(_resolve_config_path(path))
     ]
     if not blocked_paths:
