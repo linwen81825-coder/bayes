@@ -511,6 +511,7 @@ class ExpertBayesMetaAggregator(Aggregator):
         if not client_payloads:
             return {
                 "bayes_client_weight_mode": self.client_weight_mode,
+                "precision_source_counts": {},
                 "usage_total": 0.0,
                 "usage_max": 0.0,
                 "usage_weight_sum": 0.0,
@@ -525,6 +526,11 @@ class ExpertBayesMetaAggregator(Aggregator):
                 "local_precision_max": None,
                 "local_precision_low_pct": None,
                 "local_precision_high_pct": None,
+                "laplace_precision_mean_avg": None,
+                "laplace_precision_std_avg": None,
+                "laplace_hessian_negative_frac_avg": None,
+                "laplace_precision_at_min_clip_frac_avg": None,
+                "laplace_precision_at_max_clip_frac_avg": None,
             }
 
         usage_values = [float(payload.get("usage", 0.0)) for payload in client_payloads]
@@ -534,6 +540,10 @@ class ExpertBayesMetaAggregator(Aggregator):
         ]
         usage_weight_sum = float(sum(usage_weight_values))
         batch_values = [int(payload.get("num_batches", 0)) for payload in client_payloads]
+        precision_source_counts = collections.Counter(
+            str(payload.get("precision_source") or "unknown")
+            for payload in client_payloads
+        )
         precision_values = []
         for payload in client_payloads:
             precision_state = payload.get("precision_state", {})
@@ -544,6 +554,7 @@ class ExpertBayesMetaAggregator(Aggregator):
 
         summary = {
             "bayes_client_weight_mode": self.client_weight_mode,
+            "precision_source_counts": dict(precision_source_counts),
             "usage_total": round(float(sum(usage_values)), 6),
             "usage_max": round(float(max(usage_values)), 6),
             "usage_weight_sum": round(usage_weight_sum, 6),
@@ -560,6 +571,30 @@ class ExpertBayesMetaAggregator(Aggregator):
             "num_batches_total": int(sum(batch_values)),
             "num_batches_mean": round(float(sum(batch_values) / max(len(batch_values), 1)), 6),
         }
+        summary.update(
+            {
+                "laplace_precision_mean_avg": self._mean_payload_field(
+                    client_payloads,
+                    "laplace_precision_mean",
+                ),
+                "laplace_precision_std_avg": self._mean_payload_field(
+                    client_payloads,
+                    "laplace_precision_std",
+                ),
+                "laplace_hessian_negative_frac_avg": self._mean_payload_field(
+                    client_payloads,
+                    "laplace_hessian_negative_frac",
+                ),
+                "laplace_precision_at_min_clip_frac_avg": self._mean_payload_field(
+                    client_payloads,
+                    "laplace_precision_at_min_clip_frac",
+                ),
+                "laplace_precision_at_max_clip_frac_avg": self._mean_payload_field(
+                    client_payloads,
+                    "laplace_precision_at_max_clip_frac",
+                ),
+            }
+        )
         if not precision_values:
             summary.update(
                 {
@@ -591,6 +626,26 @@ class ExpertBayesMetaAggregator(Aggregator):
             }
         )
         return summary
+
+    def _mean_payload_field(self, client_payloads, field_name):
+        values = []
+        for payload in client_payloads:
+            value = payload.get(field_name)
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    continue
+                value = value.detach().cpu().float().item()
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values.append(value)
+        if not values:
+            return None
+        return round(float(sum(values) / len(values)), 6)
 
     def _summarize_mean_update(self, global_state, optimized_mean_state, expert_keys):
         if global_state is None or optimized_mean_state is None:
@@ -791,6 +846,20 @@ class ExpertBayesMetaAggregator(Aggregator):
         return metric
 
     def _collect_client_payloads(self, expert_evidence, layer_id, expert_id):
+        diagnostic_keys = [
+            "precision_source",
+            "mean_state_source",
+            "precision_state_source",
+            "raw_var_used_for_precision",
+            "laplace_precision_mean",
+            "laplace_precision_min",
+            "laplace_precision_max",
+            "laplace_precision_std",
+            "laplace_hessian_negative_frac",
+            "laplace_precision_at_min_clip_frac",
+            "laplace_precision_at_max_clip_frac",
+            "laplace_compute_time_sec",
+        ]
         payloads = []
         for client_evidence in expert_evidence:
             evidence = get_client_expert_evidence(
@@ -805,14 +874,16 @@ class ExpertBayesMetaAggregator(Aggregator):
             if usage <= 0:
                 continue
 
-            payloads.append(
-                {
-                    "usage": usage,
-                    "num_batches": int(evidence.get("num_batches", 0)),
-                    "mean_state": evidence.get("mean_state", {}),
-                    "precision_state": evidence.get("precision_state", {}),
-                }
-            )
+            payload = {
+                "usage": usage,
+                "num_batches": int(evidence.get("num_batches", 0)),
+                "mean_state": evidence.get("mean_state", {}),
+                "precision_state": evidence.get("precision_state", {}),
+            }
+            for key in diagnostic_keys:
+                if key in evidence:
+                    payload[key] = evidence.get(key)
+            payloads.append(payload)
         return payloads
 
     def _clone_expert_state_for_direction_diag(self, global_state, expert_groups):
