@@ -208,6 +208,30 @@ bayes_precision_max: 300.0
 # precision 计算时的数值稳定 eps
 bayes_precision_eps: 1.0e-12
 
+# 客户端上传 precision 的来源：
+# - sgld_variance：旧默认逻辑，使用 SGLD 参数样本方差估计 precision。
+# - laplace_diag：先做 MAP adaptation，再用 Hutchinson HVP 估计 Hessian diagonal。
+bayes_precision_source: sgld_variance
+
+# --- laplace_diag 专用参数 ---
+# 第一版建议先和 post_train evidence 搭配验证，不要同时打开 prior-start。
+bayes_laplace_map_steps: 5
+bayes_laplace_map_lr: 0.0001
+bayes_laplace_map_optimizer: adam
+bayes_laplace_batches: 4
+bayes_laplace_hessian_estimator: hutchinson_diag
+bayes_laplace_hutchinson_samples: 2
+bayes_laplace_hutchinson_distribution: rademacher
+bayes_laplace_positive_mode: softplus
+bayes_laplace_softplus_beta: 10.0
+bayes_laplace_damping: 0.000001
+bayes_laplace_normalize: global
+bayes_laplace_target_precision: 100.0
+bayes_laplace_min_precision: 10.0
+bayes_laplace_max_precision: 300.0
+bayes_laplace_eval_mode: false
+bayes_laplace_include_router_loss: false
+
 # 每个 expert 在客户端最多抽多少个 batch 来估计局部证据
 bayes_evidence_batches: 4
 

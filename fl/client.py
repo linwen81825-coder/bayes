@@ -64,6 +64,68 @@ class Client:
         self.bayes_precision_min = float(getattr(self.args, "bayes_precision_min", 20.0))
         self.bayes_precision_max = float(getattr(self.args, "bayes_precision_max", 300.0))
         self.bayes_precision_eps = float(getattr(self.args, "bayes_precision_eps", 1.0e-12))
+        self.bayes_precision_source = str(
+            getattr(self.args, "bayes_precision_source", "sgld_variance")
+        ).lower()
+        if self.bayes_precision_source not in {"sgld_variance", "laplace_diag"}:
+            raise ValueError("bayes_precision_source must be sgld_variance or laplace_diag")
+
+        self.bayes_laplace_map_steps = int(getattr(self.args, "bayes_laplace_map_steps", 5))
+        self.bayes_laplace_map_lr = float(getattr(self.args, "bayes_laplace_map_lr", 1.0e-4))
+        self.bayes_laplace_map_optimizer = str(
+            getattr(self.args, "bayes_laplace_map_optimizer", "adam")
+        ).lower()
+        self.bayes_laplace_batches = int(getattr(self.args, "bayes_laplace_batches", 4))
+        self.bayes_laplace_hessian_estimator = str(
+            getattr(self.args, "bayes_laplace_hessian_estimator", "hutchinson_diag")
+        ).lower()
+        self.bayes_laplace_hutchinson_samples = int(
+            getattr(self.args, "bayes_laplace_hutchinson_samples", 2)
+        )
+        self.bayes_laplace_hutchinson_distribution = str(
+            getattr(self.args, "bayes_laplace_hutchinson_distribution", "rademacher")
+        ).lower()
+        self.bayes_laplace_positive_mode = str(
+            getattr(self.args, "bayes_laplace_positive_mode", "softplus")
+        ).lower()
+        self.bayes_laplace_softplus_beta = float(
+            getattr(self.args, "bayes_laplace_softplus_beta", 10.0)
+        )
+        self.bayes_laplace_damping = float(getattr(self.args, "bayes_laplace_damping", 1.0e-6))
+        self.bayes_laplace_normalize = str(
+            getattr(self.args, "bayes_laplace_normalize", "global")
+        ).lower()
+        self.bayes_laplace_target_precision = float(
+            getattr(self.args, "bayes_laplace_target_precision", 100.0)
+        )
+        self.bayes_laplace_min_precision = float(
+            getattr(self.args, "bayes_laplace_min_precision", 10.0)
+        )
+        self.bayes_laplace_max_precision = float(
+            getattr(self.args, "bayes_laplace_max_precision", 300.0)
+        )
+        self.bayes_laplace_eval_mode = bool(
+            getattr(self.args, "bayes_laplace_eval_mode", False)
+        )
+        self.bayes_laplace_include_router_loss = bool(
+            getattr(self.args, "bayes_laplace_include_router_loss", False)
+        )
+        if self.bayes_laplace_map_optimizer not in {"adam", "sgd"}:
+            raise ValueError("bayes_laplace_map_optimizer must be adam or sgd")
+        if self.bayes_laplace_hessian_estimator != "hutchinson_diag":
+            raise ValueError("bayes_laplace_hessian_estimator must be hutchinson_diag")
+        if self.bayes_laplace_hutchinson_distribution != "rademacher":
+            raise ValueError("bayes_laplace_hutchinson_distribution must be rademacher")
+        if self.bayes_laplace_positive_mode not in {"softplus", "relu", "abs"}:
+            raise ValueError("bayes_laplace_positive_mode must be softplus, relu, or abs")
+        if self.bayes_laplace_normalize not in {"global", "per_tensor", "none"}:
+            raise ValueError("bayes_laplace_normalize must be global, per_tensor, or none")
+        if self.bayes_laplace_min_precision > self.bayes_laplace_max_precision:
+            raise ValueError("bayes_laplace_min_precision must be <= bayes_laplace_max_precision")
+        if self.bayes_laplace_hutchinson_samples < 1:
+            raise ValueError("bayes_laplace_hutchinson_samples must be >= 1")
+        if self.bayes_laplace_map_steps < 1:
+            raise ValueError("bayes_laplace_map_steps must be >= 1")
         self.bayes_evidence_batches = max(int(getattr(self.args, "bayes_evidence_batches", 8)), 1)
         self.bayes_evidence_log_detail = bool(getattr(self.args, "bayes_evidence_log_detail", False))
         self.bayes_sgld_concat_cache = bool(getattr(self.args, "bayes_sgld_concat_cache", False))
@@ -73,6 +135,13 @@ class Client:
         self.bayes_cache_device = str(getattr(self.args, "bayes_cache_device", "cpu")).lower()
         if self.bayes_cache_device not in {"cpu", "cuda", "auto"}:
             raise ValueError("bayes_cache_device must be one of: cpu, cuda, auto")
+        self.logger.info(
+            f"--client: {self.client_id} --bayes_precision_source:{self.bayes_precision_source} "
+            f"--bayes_laplace_map_steps:{self.bayes_laplace_map_steps} "
+            f"--bayes_laplace_map_lr:{self.bayes_laplace_map_lr} "
+            f"--bayes_laplace_batches:{self.bayes_laplace_batches} "
+            f"--bayes_laplace_hutchinson_samples:{self.bayes_laplace_hutchinson_samples}"
+        )
 
     def get_current_learning_rate(self):
         base_lr = float(self.args.learning_rate)
@@ -416,10 +485,53 @@ class Client:
                 precision_max=self.bayes_precision_max,
                 precision_eps=self.bayes_precision_eps,
                 sgld_concat_cache=self.bayes_sgld_concat_cache,
+                precision_source=self.bayes_precision_source,
+                laplace_map_steps=self.bayes_laplace_map_steps,
+                laplace_map_lr=self.bayes_laplace_map_lr,
+                laplace_map_optimizer=self.bayes_laplace_map_optimizer,
+                laplace_batches=self.bayes_laplace_batches,
+                laplace_hessian_estimator=self.bayes_laplace_hessian_estimator,
+                laplace_hutchinson_samples=self.bayes_laplace_hutchinson_samples,
+                laplace_hutchinson_distribution=self.bayes_laplace_hutchinson_distribution,
+                laplace_positive_mode=self.bayes_laplace_positive_mode,
+                laplace_softplus_beta=self.bayes_laplace_softplus_beta,
+                laplace_damping=self.bayes_laplace_damping,
+                laplace_normalize=self.bayes_laplace_normalize,
+                laplace_target_precision=self.bayes_laplace_target_precision,
+                laplace_min_precision=self.bayes_laplace_min_precision,
+                laplace_max_precision=self.bayes_laplace_max_precision,
+                laplace_eval_mode=self.bayes_laplace_eval_mode,
+                laplace_include_router_loss=self.bayes_laplace_include_router_loss,
             )
         finally:
             self.restore_expert_params(evidence_model, expert_backup)
             del expert_backup
+
+        precision_payload = {
+            "precision_source": sgld_diag.get("precision_source", self.bayes_precision_source),
+            "mean_state_source": sgld_diag.get("mean_state_source"),
+            "precision_state_source": sgld_diag.get("precision_state_source"),
+            "raw_var_used_for_precision": sgld_diag.get("raw_var_used_for_precision"),
+        }
+        for key in [
+            "laplace_map_steps",
+            "laplace_map_lr",
+            "laplace_map_loss_start",
+            "laplace_map_loss_end",
+            "laplace_hessian_raw_mean",
+            "laplace_hessian_raw_min",
+            "laplace_hessian_raw_max",
+            "laplace_hessian_negative_frac",
+            "laplace_precision_mean",
+            "laplace_precision_min",
+            "laplace_precision_max",
+            "laplace_precision_std",
+            "laplace_precision_at_min_clip_frac",
+            "laplace_precision_at_max_clip_frac",
+            "laplace_compute_time_sec",
+        ]:
+            if key in sgld_diag:
+                precision_payload[key] = sgld_diag.get(key)
 
         return {
             "usage": usage,
@@ -427,6 +539,7 @@ class Client:
             "mean_state": mean_state,
             "precision_state": precision_state,
             "sgld_diag": sgld_diag,
+            **precision_payload,
         }
 
     def extract_bayesian_evidence(self, layer_stats, batch_cache_by_expert):
@@ -446,6 +559,7 @@ class Client:
         )
         self.logger.info(
             f"--client: {self.client_id} --bayes_cache_diag "
+            f"--precision_source:{self.bayes_precision_source} "
             f"--bayes_cache_device:{self.bayes_cache_device} "
             f"--resolved_cache_device:{self.resolve_bayes_cache_device()} "
             f"--cached_batch_device:{self.get_cached_batch_device(batch_cache_by_expert)} "
@@ -500,6 +614,23 @@ class Client:
                         f"--detail:true "
                         f"--layer:{layer_id} --expert:{expert_id} --usage:{int(usage)} "
                         f"--batches:{len(batch_cache)} --cached_samples:{self.count_cached_samples(batch_cache)} "
+                        f"--precision_source:{sgld_diag.get('precision_source')} "
+                        f"--mean_state_source:{sgld_diag.get('mean_state_source')} "
+                        f"--precision_state_source:{sgld_diag.get('precision_state_source')} "
+                        f"--raw_var_used_for_precision:{sgld_diag.get('raw_var_used_for_precision')} "
+                        f"--laplace_map_loss_start:{sgld_diag.get('laplace_map_loss_start')} "
+                        f"--laplace_map_loss_end:{sgld_diag.get('laplace_map_loss_end')} "
+                        f"--laplace_hessian_raw_mean:{sgld_diag.get('laplace_hessian_raw_mean')} "
+                        f"--laplace_hessian_raw_min:{sgld_diag.get('laplace_hessian_raw_min')} "
+                        f"--laplace_hessian_raw_max:{sgld_diag.get('laplace_hessian_raw_max')} "
+                        f"--laplace_hessian_negative_frac:{sgld_diag.get('laplace_hessian_negative_frac')} "
+                        f"--laplace_precision_mean:{sgld_diag.get('laplace_precision_mean')} "
+                        f"--laplace_precision_min:{sgld_diag.get('laplace_precision_min')} "
+                        f"--laplace_precision_max:{sgld_diag.get('laplace_precision_max')} "
+                        f"--laplace_precision_std:{sgld_diag.get('laplace_precision_std')} "
+                        f"--laplace_precision_at_min_clip_frac:{sgld_diag.get('laplace_precision_at_min_clip_frac')} "
+                        f"--laplace_precision_at_max_clip_frac:{sgld_diag.get('laplace_precision_at_max_clip_frac')} "
+                        f"--laplace_compute_time_sec:{sgld_diag.get('laplace_compute_time_sec')} "
                         f"--mean_numel:{mean_summary['numel']} "
                         f"--precision_mean:{precision_summary['mean']} "
                         f"--precision_min:{precision_summary['min']} "
@@ -549,6 +680,7 @@ class Client:
             f"--bayes_per_expert_min_sec:{per_expert_min_sec:.4f} "
             f"--bayes_active_experts:{len(active_experts)} "
             f"--bayes_cached_experts:{cached_expert_count} "
+            f"--precision_source:{self.bayes_precision_source} "
             f"--bayes_evidence_log_detail:{self.bayes_evidence_log_detail} "
             f"--build_model_sec:{build_model_sec:.4f} "
             f"--total_sec:{total_evidence_sec:.4f} "

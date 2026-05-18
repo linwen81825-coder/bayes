@@ -1,4 +1,5 @@
 import collections
+import contextlib
 import logging
 import math
 import time
@@ -205,6 +206,440 @@ def _compute_cached_average_loss(model, batch_cache, criterion, device):
         return None, 0
 
     return weighted_loss / float(seen_samples), int(seen_samples)
+
+
+def _flatten_optional_tensors(tensors, like_params):
+    flat_parts = []
+    for tensor, param in zip(tensors, like_params):
+        if tensor is None:
+            flat_parts.append(torch.zeros_like(param).reshape(-1))
+        else:
+            flat_parts.append(tensor.reshape(-1))
+    if not flat_parts:
+        return torch.empty(0)
+    return torch.cat(flat_parts)
+
+
+def _normalize_torch_device(device_like):
+    resolved = torch.device(device_like)
+    if resolved.type == "cuda" and resolved.index is None and torch.cuda.is_available():
+        resolved = torch.device(f"cuda:{torch.cuda.current_device()}")
+    return resolved
+
+
+def _first_param_device(module):
+    for param in module.parameters():
+        return param.device
+    return torch.device("cpu")
+
+
+def _laplace_second_order_context(device):
+    resolved = torch.device(device)
+    if resolved.type != "cuda" or not torch.cuda.is_available():
+        return contextlib.nullcontext()
+    sdp_kernel = getattr(torch.backends.cuda, "sdp_kernel", None)
+    if sdp_kernel is None:
+        return contextlib.nullcontext()
+    return sdp_kernel(
+        enable_flash=False,
+        enable_math=True,
+        enable_mem_efficient=False,
+        enable_cudnn=False,
+    )
+
+
+def _laplace_limited_batch_cache(batch_cache, max_batches):
+    if len(batch_cache) == 0:
+        raise ValueError("Laplace evidence extraction requires at least one cached batch")
+    max_batches = int(max_batches)
+    if max_batches <= 0:
+        return list(batch_cache)
+    return list(batch_cache[:max_batches])
+
+
+def _add_optional_router_loss(loss, result):
+    for key in ["router_loss", "aux_loss", "load_balance_loss", "router_aux_loss"]:
+        value = result.get(key)
+        if torch.is_tensor(value):
+            loss = loss + value
+    return loss
+
+
+def _finite_stat_vector(vector):
+    return torch.nan_to_num(
+        vector.detach().float(),
+        nan=0.0,
+        posinf=1.0e6,
+        neginf=-1.0e6,
+    )
+
+
+def _compute_laplace_hessian_diag_hutchinson(
+    model,
+    batch_cache,
+    criterion,
+    target_params,
+    device,
+    max_batches=0,
+    num_samples=2,
+    distribution="rademacher",
+    eval_mode=False,
+    include_router_loss=False,
+):
+    if len(batch_cache) == 0:
+        raise ValueError("Laplace Hessian diagonal estimation requires at least one cached batch")
+    if not target_params:
+        raise ValueError("Laplace Hessian diagonal estimation requires target parameters")
+
+    distribution = str(distribution or "rademacher").lower()
+    if distribution != "rademacher":
+        raise ValueError("Only rademacher Hutchinson vectors are supported")
+    num_samples = max(int(num_samples), 1)
+    target_device = _normalize_torch_device(device)
+    original_training = bool(model.training)
+    if eval_mode:
+        model.eval()
+    else:
+        model.train()
+
+    batches = _laplace_limited_batch_cache(batch_cache, max_batches)
+    vector_template = torch.nn.utils.parameters_to_vector(
+        [param.detach() for param in target_params]
+    ).detach()
+    if vector_template.numel() == 0:
+        raise ValueError("Laplace Hessian diagonal estimation got an empty parameter vector")
+
+    diag_accum = torch.zeros_like(vector_template)
+    batches_used = 0
+    try:
+        for cached_inputs, cached_labels in batches:
+            inputs = cached_inputs.to(target_device, non_blocking=True)
+            labels = cached_labels.to(target_device, non_blocking=True)
+            with _laplace_second_order_context(target_device):
+                result = model(inputs)
+                loss = criterion(result["logits"], labels)
+                if include_router_loss:
+                    loss = _add_optional_router_loss(loss, result)
+                if not loss.requires_grad:
+                    model.zero_grad(set_to_none=True)
+                    continue
+
+                grads = torch.autograd.grad(
+                    loss,
+                    target_params,
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                grad_vector = _flatten_optional_tensors(grads, target_params)
+                if grad_vector.numel() == 0:
+                    raise ValueError("Laplace Hessian diagonal estimation got an empty gradient vector")
+                if not grad_vector.requires_grad:
+                    model.zero_grad(set_to_none=True)
+                    continue
+
+                batch_diag = torch.zeros_like(grad_vector)
+                for sample_idx in range(num_samples):
+                    v = torch.empty_like(grad_vector).bernoulli_(0.5).mul_(2.0).sub_(1.0)
+                    gv = torch.sum(grad_vector * v)
+                    hv = torch.autograd.grad(
+                        gv,
+                        target_params,
+                        retain_graph=sample_idx < num_samples - 1,
+                        create_graph=False,
+                        allow_unused=True,
+                    )
+                    hv_vector = _flatten_optional_tensors(hv, target_params)
+                    batch_diag = batch_diag + v * hv_vector.detach()
+            diag_accum = diag_accum + batch_diag / float(num_samples)
+            batches_used += 1
+            model.zero_grad(set_to_none=True)
+    finally:
+        model.zero_grad(set_to_none=True)
+        if original_training:
+            model.train()
+        else:
+            model.eval()
+
+    if batches_used > 0:
+        hessian_diag = diag_accum / float(batches_used)
+    else:
+        hessian_diag = diag_accum
+
+    stat_vector = _finite_stat_vector(hessian_diag)
+    hessian_stats = {
+        "laplace_hessian_batches_used": int(batches_used),
+        "laplace_hessian_samples": int(num_samples),
+        "laplace_hessian_raw_mean": round(float(stat_vector.mean().item()), 12),
+        "laplace_hessian_raw_min": round(float(stat_vector.min().item()), 12),
+        "laplace_hessian_raw_max": round(float(stat_vector.max().item()), 12),
+        "laplace_hessian_raw_std": round(float(stat_vector.std(unbiased=False).item()), 12),
+        "laplace_hessian_negative_frac": round(float((stat_vector < 0).float().mean().item()), 6),
+        "laplace_hessian_zero_frac": round(float((stat_vector == 0).float().mean().item()), 6),
+        "laplace_hessian_nan_count": int(torch.isnan(hessian_diag).sum().item()),
+        "laplace_hessian_inf_count": int(torch.isinf(hessian_diag).sum().item()),
+    }
+    return hessian_diag.detach(), hessian_stats
+
+
+def _project_laplace_hessian_to_precision(
+    hessian_diag,
+    positive_mode="softplus",
+    softplus_beta=10.0,
+    damping=1.0e-6,
+):
+    positive_mode = str(positive_mode or "softplus").lower()
+    softplus_beta = max(float(softplus_beta), 1.0e-12)
+    damping = max(float(damping), 0.0)
+
+    if positive_mode == "softplus":
+        precision_raw = torch.nn.functional.softplus(hessian_diag * softplus_beta) / softplus_beta
+    elif positive_mode == "relu":
+        precision_raw = torch.relu(hessian_diag)
+    elif positive_mode == "abs":
+        precision_raw = torch.abs(hessian_diag)
+    else:
+        raise ValueError("laplace positive_mode must be one of: softplus, relu, abs")
+
+    precision_raw = precision_raw + damping
+    precision_raw = torch.nan_to_num(
+        precision_raw,
+        nan=damping,
+        posinf=1.0e6,
+        neginf=damping,
+    )
+    stat_vector = precision_raw.detach().float()
+    projection_stats = {
+        "laplace_positive_mode": positive_mode,
+        "laplace_softplus_beta": float(softplus_beta),
+        "laplace_damping": float(damping),
+        "laplace_precision_raw_mean": round(float(stat_vector.mean().item()), 12),
+        "laplace_precision_raw_min": round(float(stat_vector.min().item()), 12),
+        "laplace_precision_raw_max": round(float(stat_vector.max().item()), 12),
+        "laplace_precision_raw_std": round(float(stat_vector.std(unbiased=False).item()), 12),
+    }
+    return precision_raw, projection_stats
+
+
+def _calibrate_laplace_precision_vector(
+    precision_raw,
+    reference_state,
+    target_names,
+    normalize="global",
+    target=100.0,
+    min_value=10.0,
+    max_value=300.0,
+    eps=1.0e-12,
+):
+    normalize = str(normalize or "global").lower()
+    eps = max(float(eps), 1.0e-12)
+    target = max(float(target), eps)
+    min_value = max(float(min_value), eps)
+    max_value = max(float(max_value), min_value)
+    precision_raw = torch.nan_to_num(
+        precision_raw,
+        nan=eps,
+        posinf=max_value,
+        neginf=eps,
+    ).clamp_min(eps)
+
+    if normalize == "none":
+        calibrated = precision_raw
+    elif normalize == "global":
+        calibrated = precision_raw / precision_raw.mean().clamp_min(eps) * target
+    elif normalize == "per_tensor":
+        calibrated = torch.empty_like(precision_raw)
+        for _, start, end in _vector_segments(reference_state, target_names):
+            segment = precision_raw[start:end]
+            calibrated[start:end] = segment / segment.mean().clamp_min(eps) * target
+    else:
+        raise ValueError("laplace_normalize must be one of: global, per_tensor, none")
+
+    precision = calibrated.clamp(min=min_value, max=max_value)
+    stat_vector = precision.detach().float()
+    calibration_stats = {
+        "laplace_normalize": normalize,
+        "laplace_target_precision": float(target),
+        "laplace_min_precision": float(min_value),
+        "laplace_max_precision": float(max_value),
+        "laplace_precision_mean": round(float(stat_vector.mean().item()), 6),
+        "laplace_precision_min": round(float(stat_vector.min().item()), 6),
+        "laplace_precision_max": round(float(stat_vector.max().item()), 6),
+        "laplace_precision_std": round(float(stat_vector.std(unbiased=False).item()), 6),
+        "laplace_precision_at_min_clip_frac": round(float((calibrated <= min_value).float().mean().item()), 6),
+        "laplace_precision_at_max_clip_frac": round(float((calibrated >= max_value).float().mean().item()), 6),
+    }
+    return precision, calibration_stats
+
+
+def _run_expert_laplace_fit(
+    model,
+    batch_cache,
+    criterion,
+    layer_id,
+    expert_id,
+    device,
+    map_steps=5,
+    map_lr=1.0e-4,
+    map_optimizer="adam",
+    laplace_batches=4,
+    hutchinson_samples=2,
+    hutchinson_distribution="rademacher",
+    positive_mode="softplus",
+    softplus_beta=10.0,
+    damping=1.0e-6,
+    normalize="global",
+    target_precision=100.0,
+    min_precision=10.0,
+    max_precision=300.0,
+    eval_mode=False,
+    include_router_loss=False,
+):
+    if len(batch_cache) == 0:
+        raise ValueError("Laplace evidence extraction requires at least one cached batch")
+
+    laplace_start_time = time.perf_counter()
+    target_names, target_params = freeze_all_but_target_expert(
+        model=model,
+        layer_id=layer_id,
+        expert_id=expert_id,
+    )
+    if len(target_params) == 0:
+        raise ValueError(f"Missing target expert parameters for layer {layer_id}, expert {expert_id}")
+
+    target_device = _normalize_torch_device(device)
+    current_device = _first_param_device(model)
+    if current_device != target_device:
+        model.to(target_device)
+
+    reference_state = {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+    map_steps = max(int(map_steps), 1)
+    map_lr = max(float(map_lr), 1.0e-12)
+    map_optimizer = str(map_optimizer or "adam").lower()
+    if map_optimizer == "adam":
+        optimizer = torch.optim.Adam(params=target_params, lr=map_lr)
+    elif map_optimizer == "sgd":
+        optimizer = torch.optim.SGD(params=target_params, lr=map_lr)
+    else:
+        raise ValueError("laplace_map_optimizer must be one of: adam, sgd")
+
+    hutchinson_samples = max(int(hutchinson_samples), 1)
+    laplace_batches = int(laplace_batches)
+    prepared_batch_cache = []
+    for cached_inputs, cached_labels in _laplace_limited_batch_cache(batch_cache, laplace_batches):
+        prepared_batch_cache.append(
+            (
+                cached_inputs.to(target_device, non_blocking=True),
+                cached_labels.to(target_device, non_blocking=True),
+            )
+        )
+
+    original_training = bool(model.training)
+    if eval_mode:
+        model.eval()
+    else:
+        model.train()
+
+    map_losses = []
+    map_batches_used = 0
+    try:
+        for _ in range(map_steps):
+            weighted_loss = None
+            seen_samples = 0
+            optimizer.zero_grad(set_to_none=True)
+            for inputs, labels in prepared_batch_cache:
+                result = model(inputs)
+                batch_loss = criterion(result["logits"], labels)
+                if include_router_loss:
+                    batch_loss = _add_optional_router_loss(batch_loss, result)
+                if not batch_loss.requires_grad:
+                    continue
+                batch_weight = labels.size(0)
+                weighted_term = batch_loss * batch_weight
+                weighted_loss = weighted_term if weighted_loss is None else weighted_loss + weighted_term
+                seen_samples += batch_weight
+
+            if weighted_loss is None or seen_samples <= 0:
+                break
+            map_loss = weighted_loss / float(seen_samples)
+            map_loss.backward()
+            optimizer.step()
+            map_losses.append(float(map_loss.detach().item()))
+            map_batches_used += len(prepared_batch_cache)
+    finally:
+        model.zero_grad(set_to_none=True)
+        if original_training:
+            model.train()
+        else:
+            model.eval()
+
+    with torch.no_grad():
+        theta_map_vector = torch.nn.utils.parameters_to_vector(
+            [param.detach() for param in target_params]
+        ).detach()
+
+    hessian_diag, hessian_stats = _compute_laplace_hessian_diag_hutchinson(
+        model=model,
+        batch_cache=prepared_batch_cache,
+        criterion=criterion,
+        target_params=target_params,
+        device=target_device,
+        max_batches=laplace_batches,
+        num_samples=hutchinson_samples,
+        distribution=hutchinson_distribution,
+        eval_mode=eval_mode,
+        include_router_loss=include_router_loss,
+    )
+    precision_raw, projection_stats = _project_laplace_hessian_to_precision(
+        hessian_diag=hessian_diag,
+        positive_mode=positive_mode,
+        softplus_beta=softplus_beta,
+        damping=damping,
+    )
+    precision_vector, calibration_stats = _calibrate_laplace_precision_vector(
+        precision_raw=precision_raw,
+        reference_state=reference_state,
+        target_names=target_names,
+        normalize=normalize,
+        target=target_precision,
+        min_value=min_precision,
+        max_value=max_precision,
+    )
+
+    mean_state = vector_to_named_state(reference_state, target_names, theta_map_vector.detach().cpu())
+    precision_state = vector_to_named_state(reference_state, target_names, precision_vector.detach().cpu())
+    laplace_diag = {
+        "precision_source": "laplace_diag",
+        "mean_state_source": "map_final_params",
+        "precision_state_source": "laplace_hessian_diag",
+        "raw_var_used_for_precision": False,
+        "laplace_map_steps": int(map_steps),
+        "laplace_map_lr": float(map_lr),
+        "laplace_map_optimizer": map_optimizer,
+        "laplace_map_loss_start": _safe_round(map_losses[0], 12) if map_losses else None,
+        "laplace_map_loss_end": _safe_round(map_losses[-1], 12) if map_losses else None,
+        "laplace_map_loss_mean": _safe_round(_mean_or_none(map_losses), 12),
+        "laplace_map_batches_used": int(map_batches_used),
+        "laplace_batches": int(laplace_batches),
+        "laplace_hessian_estimator": "hutchinson_diag",
+        "laplace_hutchinson_samples": int(hutchinson_samples),
+        "laplace_hutchinson_distribution": str(hutchinson_distribution or "rademacher").lower(),
+        "laplace_eval_mode": bool(eval_mode),
+        "laplace_include_router_loss": bool(include_router_loss),
+        "laplace_compute_time_sec": round(float(time.perf_counter() - laplace_start_time), 6),
+        "sample_count": int(hutchinson_samples),
+        "sgld_fit_time_sec": round(float(time.perf_counter() - laplace_start_time), 6),
+        "precision_mean": calibration_stats["laplace_precision_mean"],
+        "precision_min": calibration_stats["laplace_precision_min"],
+        "precision_max": calibration_stats["laplace_precision_max"],
+    }
+    laplace_diag.update(hessian_stats)
+    laplace_diag.update(projection_stats)
+    laplace_diag.update(calibration_stats)
+    return mean_state, precision_state, laplace_diag
 
 
 def compute_optimal_local_posterior(
@@ -929,7 +1364,57 @@ def run_expert_sgld_fit(
     plain_sgld_loss_scale=1.0,
     plain_sgld_prior_precision=0.0,
     plain_sgld_sample_interval=1,
+    precision_source="sgld_variance",
+    laplace_map_steps=5,
+    laplace_map_lr=1.0e-4,
+    laplace_map_optimizer="adam",
+    laplace_batches=4,
+    laplace_hessian_estimator="hutchinson_diag",
+    laplace_hutchinson_samples=2,
+    laplace_hutchinson_distribution="rademacher",
+    laplace_positive_mode="softplus",
+    laplace_softplus_beta=10.0,
+    laplace_damping=1.0e-6,
+    laplace_normalize="global",
+    laplace_target_precision=100.0,
+    laplace_min_precision=10.0,
+    laplace_max_precision=300.0,
+    laplace_eval_mode=False,
+    laplace_include_router_loss=False,
 ):
+    precision_source = str(precision_source or "sgld_variance").lower()
+
+    if precision_source == "laplace_diag":
+        laplace_hessian_estimator = str(laplace_hessian_estimator or "hutchinson_diag").lower()
+        if laplace_hessian_estimator != "hutchinson_diag":
+            raise ValueError("Only hutchinson_diag is supported in the first Laplace implementation")
+        return _run_expert_laplace_fit(
+            model=model,
+            batch_cache=batch_cache,
+            criterion=criterion,
+            layer_id=layer_id,
+            expert_id=expert_id,
+            device=device,
+            map_steps=laplace_map_steps,
+            map_lr=laplace_map_lr,
+            map_optimizer=laplace_map_optimizer,
+            laplace_batches=laplace_batches,
+            hutchinson_samples=laplace_hutchinson_samples,
+            hutchinson_distribution=laplace_hutchinson_distribution,
+            positive_mode=laplace_positive_mode,
+            softplus_beta=laplace_softplus_beta,
+            damping=laplace_damping,
+            normalize=laplace_normalize,
+            target_precision=laplace_target_precision,
+            min_precision=laplace_min_precision,
+            max_precision=laplace_max_precision,
+            eval_mode=laplace_eval_mode,
+            include_router_loss=laplace_include_router_loss,
+        )
+
+    if precision_source != "sgld_variance":
+        raise ValueError("Unknown precision_source. Expected one of: sgld_variance, laplace_diag")
+
     mode = str(sgld_fit_mode or "adam_noise").lower()
     if mode == "adam_noise":
         mean_state, precision_state, sgld_diag = _run_expert_sgld_fit_adam_noise(
@@ -955,6 +1440,10 @@ def run_expert_sgld_fit(
         sgld_diag.update(
             {
                 "sgld_fit_mode": "adam_noise",
+                "precision_source": "sgld_variance",
+                "mean_state_source": "sgld_sample_mean",
+                "precision_state_source": "sgld_variance",
+                "raw_var_used_for_precision": True,
                 "map_steps": None,
                 "map_lr": None,
                 "plain_sgld_steps": None,
@@ -1003,6 +1492,14 @@ def run_expert_sgld_fit(
             plain_sgld_loss_scale=plain_sgld_loss_scale,
             plain_sgld_prior_precision=plain_sgld_prior_precision,
             plain_sgld_sample_interval=plain_sgld_sample_interval,
+        )
+        sgld_diag.update(
+            {
+                "precision_source": "sgld_variance",
+                "mean_state_source": "sgld_sample_mean",
+                "precision_state_source": "sgld_variance",
+                "raw_var_used_for_precision": True,
+            }
         )
         _emit_sgld_diag_log(sgld_diag, layer_id=layer_id, expert_id=expert_id)
         return mean_state, precision_state, sgld_diag
