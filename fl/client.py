@@ -507,40 +507,32 @@ class Client:
             self.restore_expert_params(evidence_model, expert_backup)
             del expert_backup
 
-        precision_payload = {
-            "precision_source": sgld_diag.get("precision_source", self.bayes_precision_source),
-            "mean_state_source": sgld_diag.get("mean_state_source"),
-            "precision_state_source": sgld_diag.get("precision_state_source"),
-            "raw_var_used_for_precision": sgld_diag.get("raw_var_used_for_precision"),
-        }
-        for key in [
-            "laplace_map_steps",
-            "laplace_map_lr",
-            "laplace_map_loss_start",
-            "laplace_map_loss_end",
-            "laplace_hessian_raw_mean",
-            "laplace_hessian_raw_min",
-            "laplace_hessian_raw_max",
-            "laplace_hessian_negative_frac",
-            "laplace_precision_mean",
-            "laplace_precision_min",
-            "laplace_precision_max",
-            "laplace_precision_std",
-            "laplace_precision_at_min_clip_frac",
-            "laplace_precision_at_max_clip_frac",
-            "laplace_compute_time_sec",
-        ]:
-            if key in sgld_diag:
-                precision_payload[key] = sgld_diag.get(key)
-
-        return {
+        payload = {
             "usage": usage,
             "num_batches": len(batch_cache),
             "mean_state": mean_state,
             "precision_state": precision_state,
             "sgld_diag": sgld_diag,
-            **precision_payload,
         }
+        diagnostic_keys = [
+            "precision_source",
+            "mean_state_source",
+            "precision_state_source",
+            "raw_var_used_for_precision",
+            "laplace_precision_mean",
+            "laplace_precision_min",
+            "laplace_precision_max",
+            "laplace_precision_std",
+            "laplace_hessian_negative_frac",
+            "laplace_precision_at_min_clip_frac",
+            "laplace_precision_at_max_clip_frac",
+            "laplace_compute_time_sec",
+        ]
+        for key in diagnostic_keys:
+            if key in sgld_diag:
+                payload[key] = sgld_diag[key]
+
+        return payload
 
     def extract_bayesian_evidence(self, layer_stats, batch_cache_by_expert):
         if not self.should_collect_bayes_evidence():
@@ -618,6 +610,8 @@ class Client:
                         f"--mean_state_source:{sgld_diag.get('mean_state_source')} "
                         f"--precision_state_source:{sgld_diag.get('precision_state_source')} "
                         f"--raw_var_used_for_precision:{sgld_diag.get('raw_var_used_for_precision')} "
+                        f"--laplace_map_steps:{sgld_diag.get('laplace_map_steps')} "
+                        f"--laplace_map_lr:{sgld_diag.get('laplace_map_lr')} "
                         f"--laplace_map_loss_start:{sgld_diag.get('laplace_map_loss_start')} "
                         f"--laplace_map_loss_end:{sgld_diag.get('laplace_map_loss_end')} "
                         f"--laplace_hessian_raw_mean:{sgld_diag.get('laplace_hessian_raw_mean')} "
