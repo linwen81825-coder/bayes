@@ -472,6 +472,211 @@ def _calibrate_laplace_precision_vector(
     return precision, calibration_stats
 
 
+
+def _unpack_supervised_batch(batch):
+    if isinstance(batch, dict):
+        inputs = batch.get("inputs", batch.get("data", batch.get("image")))
+        labels = batch.get("labels", batch.get("target", batch.get("label")))
+        if inputs is None or labels is None:
+            raise ValueError("Fisher precision estimation expected inputs/labels in the batch dict")
+        return inputs, labels
+
+    if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+        return batch[0], batch[1]
+
+    raise ValueError("Fisher precision estimation expected a supervised (inputs, labels) batch")
+
+
+def _extract_logits(model_result):
+    if isinstance(model_result, dict):
+        logits = model_result.get("logits")
+        if logits is None:
+            raise ValueError("Model output dict must contain a `logits` tensor")
+        return logits
+    return model_result
+
+
+def _optional_positive_int(value):
+    if value is None:
+        return None
+    value = int(value)
+    if value <= 0:
+        return None
+    return value
+
+
+def estimate_empirical_fisher_microbatch_precision(
+    model,
+    train_loader,
+    criterion,
+    device,
+    args,
+    layer_id,
+    expert_id,
+):
+    """Estimate a per-expert empirical Fisher diagonal from microbatch gradients."""
+
+    if train_loader is None:
+        raise ValueError("empirical_fisher_microbatch requires a train_loader")
+
+    target_ref = (str(layer_id), str(expert_id))
+    expert_groups = group_expert_keys(model.state_dict())
+    expert_state_keys = expert_groups.get(target_ref, [])
+    named_params = collections.OrderedDict(model.named_parameters())
+    target_names = [key for key in expert_state_keys if key in named_params]
+    target_params = [named_params[key] for key in target_names]
+    if len(target_params) == 0:
+        raise ValueError(f"Missing target expert parameters for layer {layer_id}, expert {expert_id}")
+
+    microbatch_size = max(int(getattr(args, "bayes_fisher_microbatch_size", 8)), 1)
+    max_batches = _optional_positive_int(getattr(args, "bayes_fisher_max_batches", None))
+    eps = max(float(getattr(args, "bayes_fisher_eps", 1.0e-12)), 1.0e-12)
+    target = max(float(getattr(args, "bayes_precision_target", 100.0)), eps)
+    gamma = max(float(getattr(args, "bayes_precision_gamma", 0.5)), 0.0)
+    min_precision = max(float(getattr(args, "bayes_precision_min", 20.0)), eps)
+    max_precision = max(float(getattr(args, "bayes_precision_max", 300.0)), min_precision)
+    model_mode = str(getattr(args, "bayes_fisher_model_mode", "eval") or "eval").lower()
+    if model_mode not in {"eval", "train"}:
+        raise ValueError("bayes_fisher_model_mode must be eval or train")
+
+    target_device = _normalize_torch_device(device)
+    current_device = _first_param_device(model)
+    if current_device != target_device:
+        model.to(target_device)
+
+    original_training = bool(model.training)
+    original_requires_grad = {
+        name: param.requires_grad
+        for name, param in named_params.items()
+    }
+    target_name_set = set(target_names)
+    reference_state = {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+    fisher_accum = collections.OrderedDict(
+        (name, torch.zeros_like(param.detach(), dtype=torch.float32, device=target_device))
+        for name, param in zip(target_names, target_params)
+    )
+
+    num_microbatches = 0
+    start_time = time.perf_counter()
+    try:
+        for name, param in named_params.items():
+            param.requires_grad_(name in target_name_set)
+
+        if model_mode == "eval":
+            model.eval()
+        else:
+            model.train()
+
+        for batch_idx, batch in enumerate(train_loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
+            inputs, labels = _unpack_supervised_batch(batch)
+            batch_size = int(labels.size(0))
+            if batch_size <= 0:
+                continue
+
+            for start in range(0, batch_size, microbatch_size):
+                end = min(start + microbatch_size, batch_size)
+                if end <= start:
+                    continue
+
+                inputs_micro = inputs[start:end].to(target_device, non_blocking=True)
+                labels_micro = labels[start:end].to(target_device, non_blocking=True)
+                model.zero_grad(set_to_none=True)
+                result = model(inputs_micro)
+                logits = _extract_logits(result)
+                loss = criterion(logits, labels_micro)
+                num_microbatches += 1
+                if not loss.requires_grad:
+                    continue
+
+                loss.backward()
+                for name, param in zip(target_names, target_params):
+                    grad = param.grad
+                    if grad is None:
+                        continue
+                    fisher_accum[name].add_(grad.detach().to(dtype=torch.float32).pow(2))
+    finally:
+        model.zero_grad(set_to_none=True)
+        for name, param in named_params.items():
+            param.requires_grad_(original_requires_grad[name])
+        if original_training:
+            model.train()
+        else:
+            model.eval()
+
+    raw_state = collections.OrderedDict()
+    for name in target_names:
+        raw_value = fisher_accum[name]
+        if num_microbatches > 0:
+            raw_value = raw_value / float(num_microbatches)
+        raw_value = torch.nan_to_num(
+            raw_value.detach().cpu().float(),
+            nan=0.0,
+            posinf=1.0e6,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        raw_state[name] = raw_value
+
+    raw_vector = torch.cat([value.reshape(-1) for value in raw_state.values()])
+    raw_for_norm = raw_vector + eps
+    raw_mean = raw_for_norm.mean()
+    use_fallback = (
+        num_microbatches <= 0
+        or not torch.isfinite(raw_mean).item()
+        or float(raw_mean.item()) <= eps
+    )
+
+    precision_state = collections.OrderedDict()
+    if use_fallback:
+        for name in target_names:
+            reference_tensor = reference_state[name].detach().cpu().float()
+            precision_state[name] = torch.full_like(reference_tensor, fill_value=target)
+    else:
+        raw_mean = raw_mean.clamp_min(eps)
+        for name in target_names:
+            raw = raw_state[name] + eps
+            normed = raw / raw_mean
+            precision = target * normed.pow(gamma)
+            precision = torch.nan_to_num(
+                precision,
+                nan=target,
+                posinf=max_precision,
+                neginf=min_precision,
+            ).clamp(min=min_precision, max=max_precision)
+            precision_state[name] = precision.detach().cpu().clone()
+
+    precision_vector = torch.cat([value.detach().float().reshape(-1) for value in precision_state.values()])
+    raw_stat_vector = raw_vector.detach().float()
+    fisher_diag = {
+        "precision_source": "empirical_fisher_microbatch",
+        "precision_state_source": "microbatch_empirical_fisher_diag",
+        "raw_var_used_for_precision": False,
+        "fisher_microbatch_size": int(microbatch_size),
+        "fisher_max_batches": None if max_batches is None else int(max_batches),
+        "fisher_model_mode": model_mode,
+        "fisher_precision_target": float(target),
+        "fisher_precision_gamma": float(gamma),
+        "fisher_precision_min_clip": float(min_precision),
+        "fisher_precision_max_clip": float(max_precision),
+        "fisher_precision_mean": round(float(precision_vector.mean().item()), 6),
+        "fisher_precision_std": round(float(precision_vector.std(unbiased=False).item()), 6),
+        "fisher_precision_min": round(float(precision_vector.min().item()), 6),
+        "fisher_precision_max": round(float(precision_vector.max().item()), 6),
+        "fisher_raw_mean": round(float(raw_stat_vector.mean().item()), 12),
+        "fisher_raw_std": round(float(raw_stat_vector.std(unbiased=False).item()), 12),
+        "fisher_raw_min": round(float(raw_stat_vector.min().item()), 12),
+        "fisher_raw_max": round(float(raw_stat_vector.max().item()), 12),
+        "fisher_zero_frac": round(float((raw_stat_vector <= eps).float().mean().item()), 6),
+        "fisher_num_microbatches": int(num_microbatches),
+        "fisher_compute_time_sec": round(float(time.perf_counter() - start_time), 6),
+    }
+    return precision_state, fisher_diag
+
 def _run_expert_laplace_fit(
     model,
     batch_cache,

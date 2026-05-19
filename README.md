@@ -74,6 +74,30 @@ python train.py --data_cfg configs/exp/cifar10.yaml --train_cfg configs/exp/trai
 
 两种模型当前都提供一致的 MoE 辅助接口，包括 expert/router state dict 提取和 parameter groups。
 
+## Bayes Precision 来源
+
+`expert_bayes_meta` 的客户端 evidence 可以通过 `bayes_precision_source` 选择 expert 局部 precision 来源：
+
+- `sgld_variance`：使用 SGLD 参数样本方差估计 `precision_state`
+- `laplace_diag`：MAP adaptation 后用 Hutchinson HVP 估计 Hessian diagonal
+- `empirical_fisher_microbatch`：`mean_state` 仍使用现有 SGLD/local mean 逻辑，`precision_state` 改为本地 train loader 上的 microbatch empirical Fisher diagonal
+
+`empirical_fisher_microbatch` 相关配置在 `configs/train.yaml`：
+
+```yaml
+bayes_precision_source: empirical_fisher_microbatch
+bayes_fisher_microbatch_size: 8
+bayes_fisher_max_batches: null
+bayes_fisher_eps: 1.0e-12
+bayes_precision_target: 100.0
+bayes_precision_gamma: 0.5
+bayes_precision_min: 20.0
+bayes_precision_max: 300.0
+bayes_fisher_model_mode: eval
+```
+
+该分支只改变 expert evidence 中上传给服务器的 `precision_state`，服务器端仍把它作为 `compute_optimal_local_posterior(..., local_precision=...)` 的局部 precision 使用；不会改变 FedAvg / ExpertFedAvg，也不会把 Fisher precision 当作客户端聚合权重。
+
 ## 运行顺序
 
 先按需要修改上述 YAML 文件，然后直接启动训练：

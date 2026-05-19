@@ -196,13 +196,16 @@ bayes_precision_mode: floor_inverse
 # normalized_power / scalar_normalized_power / relative_normalized_power 的 power 温度
 bayes_precision_temperature: 0.25
 
-# normalized_power / relative_normalized_power 的目标 precision 均值；沿用当前 main 默认值
+# normalized_power / relative_normalized_power / empirical_fisher_microbatch 的目标 precision 均值
 bayes_precision_target: 100.0
 
-# normalized_power / relative_normalized_power 的 precision 下限；沿用当前 main 默认值
+# empirical_fisher_microbatch 对归一化 Fisher precision 的 power tempering 指数
+bayes_precision_gamma: 0.5
+
+# normalized_power / relative_normalized_power / empirical_fisher_microbatch 的 precision 下限
 bayes_precision_min: 20.0
 
-# normalized_power / relative_normalized_power 的 precision 上限；沿用当前 main 默认值
+# normalized_power / relative_normalized_power / empirical_fisher_microbatch 的 precision 上限
 bayes_precision_max: 300.0
 
 # precision 计算时的数值稳定 eps
@@ -211,7 +214,14 @@ bayes_precision_eps: 1.0e-12
 # 客户端上传 precision 的来源：
 # - sgld_variance：旧默认逻辑，使用 SGLD 参数样本方差估计 precision。
 # - laplace_diag：先做 MAP adaptation，再用 Hutchinson HVP 估计 Hessian diagonal。
-bayes_precision_source: sgld_variance
+# - empirical_fisher_microbatch：mean_state 仍来自 SGLD/local mean，precision_state 使用 microbatch empirical Fisher diagonal。
+bayes_precision_source: empirical_fisher_microbatch
+
+# --- empirical_fisher_microbatch 专用参数 ---
+bayes_fisher_microbatch_size: 8
+bayes_fisher_max_batches: null
+bayes_fisher_eps: 1.0e-12
+bayes_fisher_model_mode: eval
 
 # --- laplace_diag 专用参数 ---
 # 第一版建议先和 post_train evidence 搭配验证，不要同时打开 prior-start。

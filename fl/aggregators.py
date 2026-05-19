@@ -524,6 +524,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                 "local_precision_mean": None,
                 "local_precision_min": None,
                 "local_precision_max": None,
+                "local_precision_std": None,
                 "local_precision_low_pct": None,
                 "local_precision_high_pct": None,
                 "laplace_precision_mean_avg": None,
@@ -531,6 +532,15 @@ class ExpertBayesMetaAggregator(Aggregator):
                 "laplace_hessian_negative_frac_avg": None,
                 "laplace_precision_at_min_clip_frac_avg": None,
                 "laplace_precision_at_max_clip_frac_avg": None,
+                "fisher_precision_mean_avg": None,
+                "fisher_precision_std_avg": None,
+                "fisher_precision_min_avg": None,
+                "fisher_precision_max_avg": None,
+                "fisher_raw_mean_avg": None,
+                "fisher_raw_std_avg": None,
+                "fisher_zero_frac_avg": None,
+                "fisher_num_microbatches_total": 0,
+                "fisher_compute_time_sec_avg": None,
             }
 
         usage_values = [float(payload.get("usage", 0.0)) for payload in client_payloads]
@@ -593,6 +603,42 @@ class ExpertBayesMetaAggregator(Aggregator):
                     client_payloads,
                     "laplace_precision_at_max_clip_frac",
                 ),
+                "fisher_precision_mean_avg": self._mean_payload_field(
+                    client_payloads,
+                    "fisher_precision_mean",
+                ),
+                "fisher_precision_std_avg": self._mean_payload_field(
+                    client_payloads,
+                    "fisher_precision_std",
+                ),
+                "fisher_precision_min_avg": self._mean_payload_field(
+                    client_payloads,
+                    "fisher_precision_min",
+                ),
+                "fisher_precision_max_avg": self._mean_payload_field(
+                    client_payloads,
+                    "fisher_precision_max",
+                ),
+                "fisher_raw_mean_avg": self._mean_payload_field(
+                    client_payloads,
+                    "fisher_raw_mean",
+                ),
+                "fisher_raw_std_avg": self._mean_payload_field(
+                    client_payloads,
+                    "fisher_raw_std",
+                ),
+                "fisher_zero_frac_avg": self._mean_payload_field(
+                    client_payloads,
+                    "fisher_zero_frac",
+                ),
+                "fisher_num_microbatches_total": self._sum_payload_field(
+                    client_payloads,
+                    "fisher_num_microbatches",
+                ),
+                "fisher_compute_time_sec_avg": self._mean_payload_field(
+                    client_payloads,
+                    "fisher_compute_time_sec",
+                ),
             }
         )
         if not precision_values:
@@ -601,6 +647,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                     "local_precision_mean": None,
                     "local_precision_min": None,
                     "local_precision_max": None,
+                    "local_precision_std": None,
                     "local_precision_low_pct": None,
                     "local_precision_high_pct": None,
                 }
@@ -615,6 +662,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                 "local_precision_mean": round(float(precision_vector.mean().item()), 6),
                 "local_precision_min": round(float(precision_vector.min().item()), 6),
                 "local_precision_max": round(float(precision_vector.max().item()), 6),
+                "local_precision_std": round(float(precision_vector.std(unbiased=False).item()), 6),
                 "local_precision_low_pct": round(
                     float((precision_vector <= low_threshold).float().mean().item()),
                     6,
@@ -646,6 +694,28 @@ class ExpertBayesMetaAggregator(Aggregator):
         if not values:
             return None
         return round(float(sum(values) / len(values)), 6)
+
+    def _sum_payload_field(self, client_payloads, field_name):
+        total = 0.0
+        found = False
+        for payload in client_payloads:
+            value = payload.get(field_name)
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    continue
+                value = value.detach().cpu().float().item()
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                total += value
+                found = True
+        if not found:
+            return 0
+        return int(round(total))
 
     def _summarize_mean_update(self, global_state, optimized_mean_state, expert_keys):
         if global_state is None or optimized_mean_state is None:
@@ -859,6 +929,17 @@ class ExpertBayesMetaAggregator(Aggregator):
             "laplace_precision_at_min_clip_frac",
             "laplace_precision_at_max_clip_frac",
             "laplace_compute_time_sec",
+            "fisher_precision_mean",
+            "fisher_precision_std",
+            "fisher_precision_min",
+            "fisher_precision_max",
+            "fisher_raw_mean",
+            "fisher_raw_std",
+            "fisher_raw_min",
+            "fisher_raw_max",
+            "fisher_zero_frac",
+            "fisher_num_microbatches",
+            "fisher_compute_time_sec",
         ]
         payloads = []
         for client_evidence in expert_evidence:
