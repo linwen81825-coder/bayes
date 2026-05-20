@@ -7,7 +7,12 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from configs import add_config_path_arguments, load_args
+from configs import (
+    add_config_path_arguments,
+    load_args,
+    print_config_paths,
+    resolve_config_paths,
+)
 from data.loader import get_cifar_stats
 from utils.utils import set_seed
 
@@ -277,11 +282,19 @@ if __name__ == '__main__':
     add_config_path_arguments(cli_parser)
     cli_args = cli_parser.parse_args()
 
+    data_cfg_path, train_cfg_path, model_cfg_path = resolve_config_paths(
+        cfg_dir=cli_args.cfg_dir,
+        data_cfg=cli_args.data_cfg,
+        train_cfg=cli_args.train_cfg,
+        model_cfg=cli_args.model_cfg,
+    )
+    print_config_paths(data_cfg_path, train_cfg_path, model_cfg_path)
+
     # Load partition settings from YAML config files under `configs/`.
     args = load_args(
-        data_cfg_path=cli_args.data_cfg,
-        train_cfg_path=cli_args.train_cfg,
-        model_cfg_path=cli_args.model_cfg,
+        data_cfg_path=data_cfg_path,
+        train_cfg_path=train_cfg_path,
+        model_cfg_path=model_cfg_path,
         output_phase="data",
     )
     set_seed(args.seed)

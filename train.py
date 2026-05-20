@@ -3,7 +3,12 @@ import logging
 import os
 import warnings
 
-from configs import add_config_path_arguments, load_args
+from configs import (
+    add_config_path_arguments,
+    load_args,
+    print_config_paths,
+    resolve_config_paths,
+)
 from data.data import ensure_partition_ready
 from fl.server import Server
 from utils.utils import get_experiment_stem, set_seed, should_use_tqdm
@@ -52,11 +57,19 @@ def main():
     add_config_path_arguments(cli_parser)
     cli_args = cli_parser.parse_args()
 
+    data_cfg_path, train_cfg_path, model_cfg_path = resolve_config_paths(
+        cfg_dir=cli_args.cfg_dir,
+        data_cfg=cli_args.data_cfg,
+        train_cfg=cli_args.train_cfg,
+        model_cfg=cli_args.model_cfg,
+    )
+    print_config_paths(data_cfg_path, train_cfg_path, model_cfg_path)
+
     # Read experiment settings from YAML config files under `configs/`.
     args = load_args(
-        data_cfg_path=cli_args.data_cfg,
-        train_cfg_path=cli_args.train_cfg,
-        model_cfg_path=cli_args.model_cfg,
+        data_cfg_path=data_cfg_path,
+        train_cfg_path=train_cfg_path,
+        model_cfg_path=model_cfg_path,
         output_phase="train",
     )
     set_seed(args.seed)

@@ -123,11 +123,16 @@ _DEFAULT_CONFIG_VALUES = {
 _RUN_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
-def _resolve_config_path(path_str: str) -> Path:
+def _resolve_config_path(path_str: str | Path) -> Path:
     path = Path(path_str)
     if path.is_absolute():
         return path
     return _PROJECT_ROOT / path
+
+
+def _raise_if_config_missing(config_path: str | Path) -> None:
+    if not _resolve_config_path(config_path).exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
 
 
 def _load_yaml_mapping(config_path: str | Path) -> dict:
@@ -292,16 +297,56 @@ def _check_output_overwrite(args: SimpleNamespace, output_phase: str | None) -> 
 def add_config_path_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add the lightweight YAML-path CLI overrides used by the entrypoints."""
 
-    parser.add_argument("--data_cfg", default=DEFAULT_DATA_CFG_PATH)
-    parser.add_argument("--train_cfg", default=DEFAULT_TRAIN_CFG_PATH)
-    parser.add_argument("--model_cfg", default=DEFAULT_MODEL_CFG_PATH)
+    parser.add_argument(
+        "--cfg_dir",
+        type=str,
+        default=None,
+        help="Directory containing data.yaml, train.yaml, and model.yaml",
+    )
+    parser.add_argument("--data_cfg", default=None)
+    parser.add_argument("--train_cfg", default=None)
+    parser.add_argument("--model_cfg", default=None)
     return parser
 
 
+def resolve_config_paths(
+    cfg_dir: str | Path | None = None,
+    data_cfg: str | Path | None = None,
+    train_cfg: str | Path | None = None,
+    model_cfg: str | Path | None = None,
+) -> tuple[str | Path, str | Path, str | Path]:
+    """Resolve CLI config path arguments into the three YAML config files."""
+
+    if cfg_dir is not None:
+        base_dir = Path(cfg_dir)
+        data_cfg_path = data_cfg if data_cfg is not None else base_dir / "data.yaml"
+        train_cfg_path = train_cfg if train_cfg is not None else base_dir / "train.yaml"
+        model_cfg_path = model_cfg if model_cfg is not None else base_dir / "model.yaml"
+    else:
+        data_cfg_path = data_cfg if data_cfg is not None else DEFAULT_DATA_CFG_PATH
+        train_cfg_path = train_cfg if train_cfg is not None else DEFAULT_TRAIN_CFG_PATH
+        model_cfg_path = model_cfg if model_cfg is not None else DEFAULT_MODEL_CFG_PATH
+
+    for config_path in [data_cfg_path, train_cfg_path, model_cfg_path]:
+        _raise_if_config_missing(config_path)
+
+    return data_cfg_path, train_cfg_path, model_cfg_path
+
+
+def print_config_paths(
+    data_cfg_path: str | Path,
+    train_cfg_path: str | Path,
+    model_cfg_path: str | Path,
+) -> None:
+    print(f"[Config] data_cfg  = {data_cfg_path}")
+    print(f"[Config] train_cfg = {train_cfg_path}")
+    print(f"[Config] model_cfg = {model_cfg_path}")
+
+
 def load_args(
-    data_cfg_path: str = DEFAULT_DATA_CFG_PATH,
-    train_cfg_path: str = DEFAULT_TRAIN_CFG_PATH,
-    model_cfg_path: str = DEFAULT_MODEL_CFG_PATH,
+    data_cfg_path: str | Path = DEFAULT_DATA_CFG_PATH,
+    train_cfg_path: str | Path = DEFAULT_TRAIN_CFG_PATH,
+    model_cfg_path: str | Path = DEFAULT_MODEL_CFG_PATH,
     output_phase: str | None = None,
 ):
     """Load flat YAML config files and return an args-like namespace."""
@@ -341,4 +386,6 @@ __all__ = [
     "DEFAULT_MODEL_CFG_PATH",
     "add_config_path_arguments",
     "load_args",
+    "print_config_paths",
+    "resolve_config_paths",
 ]
