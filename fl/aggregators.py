@@ -515,6 +515,9 @@ class ExpertBayesMetaAggregator(Aggregator):
                 "source_counts": {},
                 "neff_source_counts": {},
                 "neff_transform_counts": {},
+                "bayes_fisher_fast_all_experts_counts": {},
+                "bayes_fisher_cache_device_counts": {},
+                "bayes_fisher_fallback_reason_counts": {},
                 "neff_raw_mean": None,
                 "neff_raw_min": None,
                 "neff_raw_max": None,
@@ -551,7 +554,13 @@ class ExpertBayesMetaAggregator(Aggregator):
                 "fisher_neff_precision_clip_min_frac_avg": None,
                 "fisher_neff_precision_clip_max_frac_avg": None,
                 "fisher_num_microbatches_total": 0,
+                "fisher_active_microbatches_total": 0,
+                "fisher_forward_backward_calls_total": 0,
                 "fisher_compute_time_sec_avg": None,
+                "bayes_fisher_time_sec_avg": None,
+                "bayes_fisher_forward_backward_calls_total": 0,
+                "bayes_fisher_num_microbatches_total": 0,
+                "bayes_fisher_num_expert_groups_avg": None,
             }
 
         usage_values = [float(payload.get("usage", 0.0)) for payload in client_payloads]
@@ -573,6 +582,21 @@ class ExpertBayesMetaAggregator(Aggregator):
             str(payload.get("neff_transform") or "unknown")
             for payload in client_payloads
         )
+        bayes_fisher_fast_counts = collections.Counter(
+            str(payload.get("bayes_fisher_fast_all_experts"))
+            for payload in client_payloads
+            if payload.get("bayes_fisher_fast_all_experts") is not None
+        )
+        bayes_fisher_cache_device_counts = collections.Counter(
+            str(payload.get("bayes_fisher_cache_device") or "unknown")
+            for payload in client_payloads
+            if payload.get("bayes_fisher_cache_device") is not None
+        )
+        bayes_fisher_fallback_reason_counts = collections.Counter(
+            str(payload.get("bayes_fisher_fallback_reason"))
+            for payload in client_payloads
+            if payload.get("bayes_fisher_fallback_reason") not in {None, "None", ""}
+        )
         precision_values = []
         for payload in client_payloads:
             precision_state = payload.get("precision_state", {})
@@ -587,6 +611,9 @@ class ExpertBayesMetaAggregator(Aggregator):
             "source_counts": dict(precision_source_counts),
             "neff_source_counts": dict(neff_source_counts),
             "neff_transform_counts": dict(neff_transform_counts),
+            "bayes_fisher_fast_all_experts_counts": dict(bayes_fisher_fast_counts),
+            "bayes_fisher_cache_device_counts": dict(bayes_fisher_cache_device_counts),
+            "bayes_fisher_fallback_reason_counts": dict(bayes_fisher_fallback_reason_counts),
             "neff_raw_mean": self._mean_payload_field(client_payloads, "neff_raw"),
             "neff_raw_min": self._min_payload_field(client_payloads, "neff_raw"),
             "neff_raw_max": self._max_payload_field(client_payloads, "neff_raw"),
@@ -671,9 +698,33 @@ class ExpertBayesMetaAggregator(Aggregator):
                     client_payloads,
                     "fisher_num_microbatches",
                 ),
+                "fisher_active_microbatches_total": self._sum_payload_field(
+                    client_payloads,
+                    "fisher_active_microbatches",
+                ),
+                "fisher_forward_backward_calls_total": self._sum_payload_field(
+                    client_payloads,
+                    "fisher_forward_backward_calls",
+                ),
                 "fisher_compute_time_sec_avg": self._mean_payload_field(
                     client_payloads,
                     "fisher_compute_time_sec",
+                ),
+                "bayes_fisher_time_sec_avg": self._mean_payload_field(
+                    client_payloads,
+                    "bayes_fisher_time_sec",
+                ),
+                "bayes_fisher_forward_backward_calls_total": self._sum_payload_field(
+                    client_payloads,
+                    "bayes_fisher_forward_backward_calls",
+                ),
+                "bayes_fisher_num_microbatches_total": self._sum_payload_field(
+                    client_payloads,
+                    "bayes_fisher_num_microbatches",
+                ),
+                "bayes_fisher_num_expert_groups_avg": self._mean_payload_field(
+                    client_payloads,
+                    "bayes_fisher_num_expert_groups",
                 ),
             }
         )
@@ -1017,7 +1068,21 @@ class ExpertBayesMetaAggregator(Aggregator):
             "fisher_raw_max",
             "fisher_zero_frac",
             "fisher_num_microbatches",
+            "fisher_active_microbatches",
+            "fisher_forward_backward_calls",
+            "fisher_prepare_cache_time_sec",
+            "fisher_forward_backward_time_sec",
+            "fisher_cache_device",
             "fisher_compute_time_sec",
+            "bayes_fisher_fast_all_experts",
+            "bayes_fisher_forward_backward_calls",
+            "bayes_fisher_num_microbatches",
+            "bayes_fisher_num_expert_groups",
+            "bayes_fisher_cache_device",
+            "bayes_fisher_fallback_reason",
+            "bayes_fisher_time_sec",
+            "bayes_fisher_forward_backward_time_sec",
+            "bayes_evidence_cache_time_sec",
         ]
         payloads = []
         for client_evidence in expert_evidence:

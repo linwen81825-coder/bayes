@@ -230,17 +230,31 @@ bayes_precision_eps: 1.0e-12
 #     不再把每个 client-expert 的 precision mean 强行归一到 bayes_precision_target。
 bayes_precision_source: empirical_fisher_microbatch
 
-# --- empirical_fisher_microbatch 专用参数 ---
+# --- empirical_fisher_microbatch / empirical_fisher_neff_microbatch 专用参数 ---
+# 是否使用一次 backward 同时估计所有 expert 的 microbatch Fisher。
+# true 可以显著减少 empirical_fisher_microbatch / empirical_fisher_neff_microbatch 的 evidence 计算时间。
+# false 保留旧逐 expert Fisher 逻辑，主要用于 debug 对照。
+bayes_fisher_fast_all_experts: true
+
 bayes_fisher_microbatch_size: 8
 bayes_fisher_max_batches: null
 bayes_fisher_eps: 1.0e-12
 bayes_fisher_model_mode: eval
+
+# Speed tips for empirical_fisher_neff_microbatch:
+# - bayes_fisher_fast_all_experts: true
+# - bayes_cache_device: cuda if GPU memory is sufficient
+# - bayes_evidence_log_detail: false for long runs
+# - bayes_fisher_max_batches: 4 for diagnostics; increase only if needed
+# - keep data batch_size consistent with baselines. If configs/data.yaml is changed
+#   for debugging, restore the same batch_size before comparing against ExpertFedAvg.
 
 # empirical_fisher_neff_microbatch smoke 建议：
 # run_name: bayes_fisher_neff_microbatch_smoke_2r
 # server_epochs: 2
 # agg_method: expert_bayes_meta
 # bayes_precision_source: empirical_fisher_neff_microbatch
+# bayes_fisher_fast_all_experts: true
 # bayes_fisher_microbatch_size: 8
 # bayes_fisher_max_batches: 4
 # bayes_precision_gamma: 0.5

@@ -613,6 +613,7 @@ def estimate_empirical_fisher_microbatch_precision(
     )
 
     num_microbatches = 0
+    forward_backward_calls = 0
     start_time = time.perf_counter()
     try:
         for name, param in named_params.items():
@@ -648,6 +649,7 @@ def estimate_empirical_fisher_microbatch_precision(
                     continue
 
                 loss.backward()
+                forward_backward_calls += 1
                 for name, param in zip(target_names, target_params):
                     grad = param.grad
                     if grad is None:
@@ -726,7 +728,15 @@ def estimate_empirical_fisher_microbatch_precision(
         "fisher_raw_max": round(float(raw_stat_vector.max().item()), 12),
         "fisher_zero_frac": round(float((raw_stat_vector <= eps).float().mean().item()), 6),
         "fisher_num_microbatches": int(num_microbatches),
+        "fisher_forward_backward_calls": int(forward_backward_calls),
+        "bayes_fisher_fast_all_experts": False,
+        "bayes_fisher_forward_backward_calls": int(forward_backward_calls),
+        "bayes_fisher_num_microbatches": int(num_microbatches),
+        "bayes_fisher_num_expert_groups": 1,
+        "bayes_fisher_cache_device": str(target_device),
+        "bayes_fisher_fallback_reason": None,
         "fisher_compute_time_sec": round(float(time.perf_counter() - start_time), 6),
+        "bayes_fisher_time_sec": round(float(time.perf_counter() - start_time), 6),
     }
     return precision_state, fisher_diag
 
@@ -784,6 +794,7 @@ def estimate_empirical_fisher_neff_microbatch_precision(
     )
 
     num_microbatches = 0
+    forward_backward_calls = 0
     start_time = time.perf_counter()
     try:
         for name, param in named_params.items():
@@ -819,6 +830,7 @@ def estimate_empirical_fisher_neff_microbatch_precision(
                     continue
 
                 loss.backward()
+                forward_backward_calls += 1
                 for name, param in zip(target_names, target_params):
                     grad = param.grad
                     if grad is None:
@@ -917,9 +929,459 @@ def estimate_empirical_fisher_neff_microbatch_precision(
         "fisher_neff_precision_clip_min_frac": round(clip_min_frac, 6),
         "fisher_neff_precision_clip_max_frac": round(clip_max_frac, 6),
         "fisher_num_microbatches": int(num_microbatches),
+        "fisher_forward_backward_calls": int(forward_backward_calls),
+        "bayes_fisher_fast_all_experts": False,
+        "bayes_fisher_forward_backward_calls": int(forward_backward_calls),
+        "bayes_fisher_num_microbatches": int(num_microbatches),
+        "bayes_fisher_num_expert_groups": 1,
+        "bayes_fisher_cache_device": str(target_device),
+        "bayes_fisher_fallback_reason": None,
         "fisher_compute_time_sec": round(float(time.perf_counter() - start_time), 6),
+        "bayes_fisher_time_sec": round(float(time.perf_counter() - start_time), 6),
     }
+
     return precision_state, fisher_diag
+
+
+def _resolve_fisher_cache_device(args, target_device, max_batches=None):
+    cache_pref = str(getattr(args, "bayes_cache_device", "cpu") or "cpu").lower()
+    if cache_pref == "cuda":
+        if target_device.type == "cuda" and torch.cuda.is_available():
+            return target_device
+        return torch.device("cpu")
+    if cache_pref == "auto":
+        evidence_batches = int(getattr(args, "bayes_evidence_batches", max_batches or 0) or 0)
+        if target_device.type == "cuda" and torch.cuda.is_available() and evidence_batches <= 4:
+            return target_device
+    return torch.device("cpu")
+
+
+def _normalize_expert_refs(expert_refs):
+    normalized = []
+    seen = set()
+    for ref in expert_refs or []:
+        if len(ref) < 2:
+            continue
+        key = (str(ref[0]), str(ref[1]))
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    return normalized
+
+
+def estimate_empirical_fisher_all_experts_microbatch_precision(
+    model,
+    train_loader,
+    criterion,
+    device,
+    args,
+    expert_refs,
+    evidence_stats_by_expert=None,
+    precision_source=None,
+):
+    """Estimate microbatch empirical Fisher once and split precision by expert group."""
+
+    if train_loader is None:
+        raise ValueError("all-experts empirical Fisher requires a train_loader")
+
+    precision_source = str(
+        precision_source or getattr(args, "bayes_precision_source", "empirical_fisher_microbatch")
+    ).lower()
+    if precision_source not in {"empirical_fisher_microbatch", "empirical_fisher_neff_microbatch"}:
+        raise ValueError(f"Unsupported all-experts Fisher precision_source: {precision_source}")
+
+    selected_refs = _normalize_expert_refs(expert_refs)
+    if not selected_refs:
+        return {}, {
+            "bayes_fisher_fast_all_experts": True,
+            "bayes_fisher_num_expert_groups": 0,
+            "bayes_fisher_num_microbatches": 0,
+            "bayes_fisher_forward_backward_calls": 0,
+            "bayes_fisher_cache_device": str(_normalize_torch_device(device)),
+            "bayes_fisher_fallback_reason": None,
+            "bayes_fisher_time_sec": 0.0,
+            "bayes_evidence_cache_time_sec": 0.0,
+        }
+
+    target_device = _normalize_torch_device(device)
+    current_device = _first_param_device(model)
+    if current_device != target_device:
+        model.to(target_device)
+
+    microbatch_size = max(int(getattr(args, "bayes_fisher_microbatch_size", 8)), 1)
+    max_batches = _optional_positive_int(getattr(args, "bayes_fisher_max_batches", None))
+    eps = max(float(getattr(args, "bayes_fisher_eps", 1.0e-12)), 1.0e-12)
+    target = max(float(getattr(args, "bayes_precision_target", 100.0)), eps)
+    gamma = max(float(getattr(args, "bayes_precision_gamma", 0.5)), 0.0)
+    min_precision = max(float(getattr(args, "bayes_precision_min", 20.0)), eps)
+    max_precision = max(float(getattr(args, "bayes_precision_max", 300.0)), min_precision)
+    model_mode = str(getattr(args, "bayes_fisher_model_mode", "eval") or "eval").lower()
+    if model_mode not in {"eval", "train"}:
+        raise ValueError("bayes_fisher_model_mode must be eval or train")
+
+    expert_groups = group_expert_keys(model.state_dict())
+    named_params = collections.OrderedDict(model.named_parameters())
+    group_keys = collections.OrderedDict()
+    target_names = []
+    param_to_ref = {}
+    for ref in selected_refs:
+        keys = [key for key in expert_groups.get(ref, []) if key in named_params]
+        if not keys:
+            continue
+        group_keys[ref] = keys
+        for key in keys:
+            if key not in param_to_ref:
+                target_names.append(key)
+                param_to_ref[key] = ref
+    if not group_keys:
+        raise ValueError("No selected expert parameters found for all-experts empirical Fisher")
+
+    target_name_set = set(target_names)
+    target_params = [named_params[key] for key in target_names]
+    fisher_accum = collections.OrderedDict(
+        (name, torch.zeros_like(param.detach(), dtype=torch.float32, device=target_device))
+        for name, param in zip(target_names, target_params)
+    )
+    active_microbatches_by_ref = {ref: 0 for ref in group_keys.keys()}
+
+    original_training = bool(model.training)
+    original_requires_grad = {
+        name: param.requires_grad
+        for name, param in named_params.items()
+    }
+    fisher_cache_device = _resolve_fisher_cache_device(args, target_device, max_batches=max_batches)
+    prepared_batches = None
+    prepare_cache_time_sec = 0.0
+    start_time = time.perf_counter()
+    forward_backward_time_sec = 0.0
+    num_microbatches = 0
+    forward_backward_calls = 0
+
+    try:
+        for name, param in named_params.items():
+            param.requires_grad_(name in target_name_set)
+
+        if model_mode == "eval":
+            model.eval()
+        else:
+            model.train()
+
+        prepare_start = time.perf_counter()
+        if fisher_cache_device.type == "cuda" and max_batches is not None:
+            prepared_batches = []
+            for batch_idx, batch in enumerate(train_loader):
+                if batch_idx >= max_batches:
+                    break
+                inputs, labels = _unpack_supervised_batch(batch)
+                prepared_batches.append((
+                    inputs.to(target_device, non_blocking=True),
+                    labels.to(target_device, non_blocking=True),
+                ))
+        prepare_cache_time_sec = time.perf_counter() - prepare_start
+
+        if prepared_batches is None:
+            batch_iterable = train_loader
+        else:
+            batch_iterable = prepared_batches
+
+        for batch_idx, batch in enumerate(batch_iterable):
+            if prepared_batches is None and max_batches is not None and batch_idx >= max_batches:
+                break
+
+            inputs, labels = _unpack_supervised_batch(batch)
+            batch_size = int(labels.size(0))
+            if batch_size <= 0:
+                continue
+
+            if inputs.device != target_device and fisher_cache_device.type == "cuda":
+                inputs = inputs.to(target_device, non_blocking=True)
+                labels = labels.to(target_device, non_blocking=True)
+
+            for start in range(0, batch_size, microbatch_size):
+                end = min(start + microbatch_size, batch_size)
+                if end <= start:
+                    continue
+
+                if inputs.device == target_device:
+                    inputs_micro = inputs[start:end]
+                    labels_micro = labels[start:end]
+                else:
+                    inputs_micro = inputs[start:end].to(target_device, non_blocking=True)
+                    labels_micro = labels[start:end].to(target_device, non_blocking=True)
+
+                model.zero_grad(set_to_none=True)
+                fb_start = time.perf_counter()
+                result = model(inputs_micro)
+                logits = _extract_logits(result)
+                loss = criterion(logits, labels_micro)
+                num_microbatches += 1
+                if not loss.requires_grad:
+                    forward_backward_time_sec += time.perf_counter() - fb_start
+                    continue
+
+                loss.backward()
+                forward_backward_calls += 1
+                active_refs = set()
+                for name, param in zip(target_names, target_params):
+                    grad = param.grad
+                    if grad is None:
+                        continue
+                    fisher_accum[name].add_(grad.detach().to(dtype=torch.float32).pow(2))
+                    active_refs.add(param_to_ref[name])
+                for ref in active_refs:
+                    active_microbatches_by_ref[ref] = active_microbatches_by_ref.get(ref, 0) + 1
+                forward_backward_time_sec += time.perf_counter() - fb_start
+    finally:
+        model.zero_grad(set_to_none=True)
+        for name, param in named_params.items():
+            param.requires_grad_(original_requires_grad[name])
+        if original_training:
+            model.train()
+        else:
+            model.eval()
+
+    common_stats = {
+        "bayes_fisher_fast_all_experts": True,
+        "bayes_fisher_forward_backward_calls": int(forward_backward_calls),
+        "bayes_fisher_num_microbatches": int(num_microbatches),
+        "bayes_fisher_num_expert_groups": int(len(group_keys)),
+        "bayes_fisher_cache_device": str(fisher_cache_device),
+        "bayes_fisher_fallback_reason": None,
+        "bayes_fisher_time_sec": round(float(time.perf_counter() - start_time), 6),
+        "bayes_fisher_forward_backward_time_sec": round(float(forward_backward_time_sec), 6),
+        "bayes_evidence_cache_time_sec": round(float(prepare_cache_time_sec), 6),
+        "fisher_compute_time_sec": round(float(time.perf_counter() - start_time), 6),
+        "fisher_prepare_cache_time_sec": round(float(prepare_cache_time_sec), 6),
+        "fisher_forward_backward_time_sec": round(float(forward_backward_time_sec), 6),
+        "fisher_microbatch_size": int(microbatch_size),
+        "fisher_max_batches": None if max_batches is None else int(max_batches),
+        "fisher_model_mode": model_mode,
+        "fisher_num_microbatches": int(num_microbatches),
+        "fisher_forward_backward_calls": int(forward_backward_calls),
+        "fisher_cache_device": str(fisher_cache_device),
+    }
+
+    evidence_stats_by_expert = evidence_stats_by_expert or {}
+    results = collections.OrderedDict()
+    for ref, keys in group_keys.items():
+        raw_state = collections.OrderedDict()
+        for name in keys:
+            raw_value = fisher_accum[name]
+            if num_microbatches > 0:
+                raw_value = raw_value / float(num_microbatches)
+            raw_value = torch.nan_to_num(
+                raw_value.detach().cpu().float(),
+                nan=0.0,
+                posinf=1.0e6,
+                neginf=0.0,
+            ).clamp_min(0.0)
+            raw_state[name] = raw_value
+
+        raw_vector = torch.cat([value.reshape(-1) for value in raw_state.values()])
+        raw_stat_vector = raw_vector.detach().float()
+        precision_state = collections.OrderedDict()
+        fisher_diag = dict(common_stats)
+        fisher_diag.update({
+            "precision_source": precision_source,
+            "raw_var_used_for_precision": False,
+            "fisher_active_microbatches": int(active_microbatches_by_ref.get(ref, 0)),
+        })
+
+        if precision_source == "empirical_fisher_microbatch":
+            raw_for_norm = raw_vector + eps
+            raw_mean = raw_for_norm.mean()
+            use_fallback = (
+                num_microbatches <= 0
+                or not torch.isfinite(raw_mean).item()
+                or float(raw_mean.item()) <= eps
+            )
+            if use_fallback:
+                for name in keys:
+                    precision_state[name] = torch.full_like(raw_state[name], fill_value=target)
+            else:
+                raw_mean = raw_mean.clamp_min(eps)
+                for name in keys:
+                    raw = raw_state[name] + eps
+                    normed = raw / raw_mean
+                    precision = target * normed.pow(gamma)
+                    precision = torch.nan_to_num(
+                        precision,
+                        nan=target,
+                        posinf=max_precision,
+                        neginf=min_precision,
+                    ).clamp(min=min_precision, max=max_precision)
+                    precision_state[name] = precision.detach().cpu().clone()
+
+            precision_vector = torch.cat([
+                value.detach().float().reshape(-1)
+                for value in precision_state.values()
+            ])
+            fisher_diag.update({
+                "precision_state_source": "microbatch_empirical_fisher_diag",
+                "fisher_precision_target": float(target),
+                "fisher_precision_gamma": float(gamma),
+                "fisher_precision_min_clip": float(min_precision),
+                "fisher_precision_max_clip": float(max_precision),
+                "fisher_precision_mean": round(float(precision_vector.mean().item()), 6),
+                "fisher_precision_std": round(float(precision_vector.std(unbiased=False).item()), 6),
+                "fisher_precision_min": round(float(precision_vector.min().item()), 6),
+                "fisher_precision_max": round(float(precision_vector.max().item()), 6),
+            })
+        else:
+            neff_info = _get_effective_evidence_size(evidence_stats_by_expert.get(ref), default=1.0)
+            neff = neff_info["neff"]
+            raw_clamped = raw_vector.clamp_min(eps)
+            raw_mean = raw_clamped.mean().clamp_min(eps)
+            shape_vector = raw_clamped / raw_mean
+            shape_vector = shape_vector.clamp_min(eps).pow(gamma)
+            shape_vector = shape_vector / shape_vector.mean().clamp_min(eps)
+            shape_vector = torch.nan_to_num(
+                shape_vector,
+                nan=1.0,
+                posinf=1.0,
+                neginf=1.0,
+            ).clamp_min(eps)
+            shape_vector = shape_vector / shape_vector.mean().clamp_min(eps)
+            if num_microbatches <= 0 or not torch.isfinite(shape_vector).all().item():
+                shape_vector = torch.ones_like(raw_vector)
+
+            precision_before_clip = neff * shape_vector
+            precision = precision_before_clip.clamp(min=min_precision, max=max_precision)
+            offset = 0
+            for name in keys:
+                reference_tensor = raw_state[name]
+                numel = reference_tensor.numel()
+                precision_state[name] = (
+                    precision[offset: offset + numel]
+                    .view_as(reference_tensor)
+                    .detach()
+                    .cpu()
+                    .clone()
+                )
+                offset += numel
+
+            precision_vector = precision.detach().float()
+            shape_stat_vector = shape_vector.detach().float()
+            clip_min_frac = float((precision_before_clip < min_precision).float().mean().item())
+            clip_max_frac = float((precision_before_clip > max_precision).float().mean().item())
+            fisher_diag.update({
+                "precision_state_source": "microbatch_empirical_fisher_diag_neff",
+                "neff_raw": round(float(neff_info["neff_raw"]), 6),
+                "neff": round(float(neff), 6),
+                "neff_source": neff_info["neff_source"],
+                "neff_transform": neff_info["neff_transform"],
+                "fisher_neff": round(float(neff), 6),
+                "fisher_precision_gamma": float(gamma),
+                "fisher_precision_min_clip": float(min_precision),
+                "fisher_precision_max_clip": float(max_precision),
+                "fisher_shape_mean": round(float(shape_stat_vector.mean().item()), 6),
+                "fisher_shape_std": round(float(shape_stat_vector.std(unbiased=False).item()), 6),
+                "fisher_shape_min": round(float(shape_stat_vector.min().item()), 6),
+                "fisher_shape_max": round(float(shape_stat_vector.max().item()), 6),
+                "fisher_precision_mean": round(float(precision_vector.mean().item()), 6),
+                "fisher_precision_std": round(float(precision_vector.std(unbiased=False).item()), 6),
+                "fisher_precision_min": round(float(precision_vector.min().item()), 6),
+                "fisher_precision_max": round(float(precision_vector.max().item()), 6),
+                "fisher_precision_before_clip_mean": round(float(precision_before_clip.mean().item()), 6),
+                "fisher_neff_precision_clip_min_frac": round(clip_min_frac, 6),
+                "fisher_neff_precision_clip_max_frac": round(clip_max_frac, 6),
+            })
+
+        fisher_diag.update({
+            "fisher_raw_mean": round(float(raw_stat_vector.mean().item()), 12),
+            "fisher_raw_std": round(float(raw_stat_vector.std(unbiased=False).item()), 12),
+            "fisher_raw_min": round(float(raw_stat_vector.min().item()), 12),
+            "fisher_raw_max": round(float(raw_stat_vector.max().item()), 12),
+            "fisher_zero_frac": round(float((raw_stat_vector <= eps).float().mean().item()), 6),
+        })
+        results[ref] = {
+            "precision_state": precision_state,
+            "fisher_stats": fisher_diag,
+        }
+
+    return results, common_stats
+
+
+def validate_empirical_fisher_fast_vs_slow(
+    model,
+    train_loader,
+    criterion,
+    device,
+    args,
+    expert_refs,
+    evidence_stats_by_expert=None,
+    precision_source=None,
+):
+    """Debug helper comparing fast all-expert Fisher with the slow per-expert path."""
+
+    precision_source = str(
+        precision_source or getattr(args, "bayes_precision_source", "empirical_fisher_microbatch")
+    ).lower()
+    normalized_refs = _normalize_expert_refs(expert_refs)
+    fast_results, fast_global = estimate_empirical_fisher_all_experts_microbatch_precision(
+        model=model,
+        train_loader=train_loader,
+        criterion=criterion,
+        device=device,
+        args=args,
+        expert_refs=normalized_refs,
+        evidence_stats_by_expert=evidence_stats_by_expert,
+        precision_source=precision_source,
+    )
+    summary = {
+        "precision_source": precision_source,
+        "expert_count_fast": len(fast_results),
+        "expert_count_requested": len(normalized_refs),
+        "fast_global": fast_global,
+        "experts": {},
+    }
+    evidence_stats_by_expert = evidence_stats_by_expert or {}
+    for ref in normalized_refs:
+        if precision_source == "empirical_fisher_neff_microbatch":
+            slow_precision, slow_stats = estimate_empirical_fisher_neff_microbatch_precision(
+                model=model,
+                train_loader=train_loader,
+                criterion=criterion,
+                device=device,
+                args=args,
+                layer_id=ref[0],
+                expert_id=ref[1],
+                evidence_stats=evidence_stats_by_expert.get(ref),
+            )
+        else:
+            slow_precision, slow_stats = estimate_empirical_fisher_microbatch_precision(
+                model=model,
+                train_loader=train_loader,
+                criterion=criterion,
+                device=device,
+                args=args,
+                layer_id=ref[0],
+                expert_id=ref[1],
+            )
+        fast_entry = fast_results.get(ref, {})
+        fast_precision = fast_entry.get("precision_state", {})
+        fast_stats = fast_entry.get("fisher_stats", {})
+        fast_keys = set(fast_precision.keys())
+        slow_keys = set(slow_precision.keys())
+        finite = True
+        for state in (fast_precision, slow_precision):
+            for value in state.values():
+                if torch.is_tensor(value) and not torch.isfinite(value.detach().float()).all().item():
+                    finite = False
+                    break
+        summary["experts"][ref] = {
+            "keys_match": fast_keys == slow_keys,
+            "neff_match": fast_stats.get("neff") == slow_stats.get("neff"),
+            "neff_raw_match": fast_stats.get("neff_raw") == slow_stats.get("neff_raw"),
+            "neff_transform_match": fast_stats.get("neff_transform") == slow_stats.get("neff_transform"),
+            "fast_precision_mean": fast_stats.get("fisher_precision_mean"),
+            "slow_precision_mean": slow_stats.get("fisher_precision_mean"),
+            "fast_zero_frac": fast_stats.get("fisher_zero_frac"),
+            "slow_zero_frac": slow_stats.get("fisher_zero_frac"),
+            "finite": finite,
+        }
+    return summary
 
 
 def _run_expert_laplace_fit(

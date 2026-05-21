@@ -7,6 +7,7 @@ from torch import nn
 
 from data.loader import build_client_train_loader
 from fl.bayes_utils import (
+    estimate_empirical_fisher_all_experts_microbatch_precision,
     estimate_empirical_fisher_microbatch_precision,
     estimate_empirical_fisher_neff_microbatch_precision,
     run_expert_sgld_fit,
@@ -102,6 +103,9 @@ class Client:
             raise ValueError("bayes_precision_min must be <= bayes_precision_max")
         if self.bayes_fisher_model_mode not in {"eval", "train"}:
             raise ValueError("bayes_fisher_model_mode must be eval or train")
+        self.bayes_fisher_fast_all_experts = bool(
+            getattr(self.args, "bayes_fisher_fast_all_experts", True)
+        )
 
         self.bayes_laplace_map_steps = int(getattr(self.args, "bayes_laplace_map_steps", 5))
         self.bayes_laplace_map_lr = float(getattr(self.args, "bayes_laplace_map_lr", 1.0e-4))
@@ -176,6 +180,7 @@ class Client:
             f"--bayes_laplace_hutchinson_samples:{self.bayes_laplace_hutchinson_samples} "
             f"--bayes_fisher_microbatch_size:{self.bayes_fisher_microbatch_size} "
             f"--bayes_fisher_max_batches:{self.bayes_fisher_max_batches} "
+            f"--bayes_fisher_fast_all_experts:{self.bayes_fisher_fast_all_experts} "
             f"--bayes_precision_gamma:{self.bayes_precision_gamma} "
             f"--bayes_fisher_model_mode:{self.bayes_fisher_model_mode}"
         )
@@ -508,6 +513,8 @@ class Client:
         usage,
         batch_cache,
         fisher_train_loader=None,
+        fisher_result=None,
+        fisher_fallback_reason=None,
     ):
         expert_backup = self.backup_expert_params(evidence_model, layer_id, expert_id)
         try:
@@ -538,7 +545,10 @@ class Client:
                 )
                 self.restore_expert_params(evidence_model, expert_backup)
                 evidence_model.zero_grad(set_to_none=True)
-                if self.bayes_precision_source == "empirical_fisher_neff_microbatch":
+                if fisher_result is not None:
+                    precision_state = fisher_result["precision_state"]
+                    fisher_diag = dict(fisher_result.get("fisher_stats", {}))
+                elif self.bayes_precision_source == "empirical_fisher_neff_microbatch":
                     cached_samples = self.count_cached_samples(batch_cache)
                     evidence_stats = {
                         "usage": usage,
@@ -566,6 +576,8 @@ class Client:
                         layer_id=layer_id,
                         expert_id=expert_id,
                     )
+                if fisher_fallback_reason and not fisher_diag.get("bayes_fisher_fast_all_experts"):
+                    fisher_diag["bayes_fisher_fallback_reason"] = fisher_fallback_reason
                 sgld_diag.update(fisher_diag)
                 sgld_diag["precision_mean"] = fisher_diag.get("fisher_precision_mean")
                 sgld_diag["precision_min"] = fisher_diag.get("fisher_precision_min")
@@ -654,7 +666,21 @@ class Client:
             "fisher_raw_max",
             "fisher_zero_frac",
             "fisher_num_microbatches",
+            "fisher_active_microbatches",
+            "fisher_forward_backward_calls",
+            "fisher_prepare_cache_time_sec",
+            "fisher_forward_backward_time_sec",
+            "fisher_cache_device",
             "fisher_compute_time_sec",
+            "bayes_fisher_fast_all_experts",
+            "bayes_fisher_forward_backward_calls",
+            "bayes_fisher_num_microbatches",
+            "bayes_fisher_num_expert_groups",
+            "bayes_fisher_cache_device",
+            "bayes_fisher_fallback_reason",
+            "bayes_fisher_time_sec",
+            "bayes_fisher_forward_backward_time_sec",
+            "bayes_evidence_cache_time_sec",
         ]
         for key in diagnostic_keys:
             if key in sgld_diag:
@@ -662,7 +688,12 @@ class Client:
 
         return payload
 
-    def extract_bayesian_evidence(self, layer_stats, batch_cache_by_expert):
+    def extract_bayesian_evidence(
+        self,
+        layer_stats,
+        batch_cache_by_expert,
+        cache_update_time_sec=0.0,
+    ):
         if not self.should_collect_bayes_evidence():
             return {}
 
@@ -686,27 +717,105 @@ class Client:
             f"--cached_experts:{cached_expert_count} "
             f"--estimated_cache_memory_mb:{self.estimate_bayes_cache_memory_mb(batch_cache_by_expert):.4f}"
         )
+
+        evidence_entries = []
+        for layer_id, expert_id, usage in active_experts:
+            batch_cache = self.get_expert_batch_cache(
+                batch_cache_by_expert=batch_cache_by_expert,
+                layer_id=layer_id,
+                expert_id=expert_id,
+            )
+            if len(batch_cache) == 0:
+                continue
+            cached_samples = self.count_cached_samples(batch_cache)
+            evidence_entries.append({
+                "layer_id": str(layer_id),
+                "expert_id": str(expert_id),
+                "usage": int(usage),
+                "batch_cache": batch_cache,
+                "cached_samples": int(cached_samples),
+            })
+
         evidence_by_layer = {}
         build_model_sec = 0.0
         sgld_times = []
+        sgld_prepare_cache_times = []
+        slow_fisher_times = []
+        slow_fisher_microbatches = 0
+        slow_fisher_forward_backward_calls = 0
         total_start_time = time.perf_counter()
         evidence_model = None
+        fast_fisher_results = {}
+        fast_fisher_stats = {}
+        fast_fisher_used = False
+        fisher_fallback_reason = None
+        fisher_fast_config = (
+            self.bayes_fisher_fast_all_experts
+            and self.bayes_precision_source in {
+                "empirical_fisher_microbatch",
+                "empirical_fisher_neff_microbatch",
+            }
+        )
+
         try:
-            if active_experts:
+            if evidence_entries:
                 build_start_time = time.perf_counter()
                 evidence_model = self.build_evidence_model()
                 evidence_model.to(self.device)
                 build_model_sec = time.perf_counter() - build_start_time
 
-            for layer_id, expert_id, usage in active_experts:
-                batch_cache = self.get_expert_batch_cache(
-                    batch_cache_by_expert=batch_cache_by_expert,
-                    layer_id=layer_id,
-                    expert_id=expert_id,
-                )
-                if len(batch_cache) == 0:
-                    continue
+            if fisher_fast_config and evidence_entries:
+                evidence_stats_by_expert = {}
+                expert_refs = []
+                for entry in evidence_entries:
+                    ref = (entry["layer_id"], entry["expert_id"])
+                    expert_refs.append(ref)
+                    evidence_stats_by_expert[ref] = {
+                        "usage": entry["usage"],
+                        "routed_tokens": entry["usage"],
+                        "cached_samples": entry["cached_samples"],
+                        "num_samples": entry["cached_samples"],
+                    }
+                try:
+                    fast_fisher_results, fast_fisher_stats = estimate_empirical_fisher_all_experts_microbatch_precision(
+                        model=evidence_model,
+                        train_loader=self.train_loader,
+                        criterion=self.criterion,
+                        device=self.device,
+                        args=self.args,
+                        expert_refs=expert_refs,
+                        evidence_stats_by_expert=evidence_stats_by_expert,
+                        precision_source=self.bayes_precision_source,
+                    )
+                    fast_fisher_used = True
+                except Exception as exc:
+                    fisher_fallback_reason = f"{type(exc).__name__}: {exc}"
+                    fast_fisher_results = {}
+                    fast_fisher_stats = {
+                        "bayes_fisher_fast_all_experts": False,
+                        "bayes_fisher_fallback_reason": fisher_fallback_reason,
+                    }
+                    self.logger.warning(
+                        f"--client: {self.client_id} --bayes_fisher_fast_fallback "
+                        f"--precision_source:{self.bayes_precision_source} "
+                        f"--reason:{fisher_fallback_reason}"
+                    )
+
+            for entry in evidence_entries:
+                layer_id = entry["layer_id"]
+                expert_id = entry["expert_id"]
+                usage = entry["usage"]
+                batch_cache = entry["batch_cache"]
                 layer_evidence = evidence_by_layer.setdefault(layer_id, {})
+                ref = (layer_id, expert_id)
+                fisher_result = fast_fisher_results.get(ref) if fast_fisher_used else None
+                if fast_fisher_used and fisher_result is None:
+                    fisher_fallback_reason = "missing_fast_fisher_result"
+                    self.logger.warning(
+                        f"--client: {self.client_id} --bayes_fisher_fast_fallback "
+                        f"--layer:{layer_id} --expert:{expert_id} --reason:{fisher_fallback_reason}"
+                    )
+
                 sgld_start_time = time.perf_counter()
                 expert_evidence = self.fit_local_expert_evidence(
                     evidence_model=evidence_model,
@@ -715,6 +824,8 @@ class Client:
                     usage=usage,
                     batch_cache=batch_cache,
                     fisher_train_loader=self.train_loader,
+                    fisher_result=fisher_result,
+                    fisher_fallback_reason=fisher_fallback_reason,
                 )
                 sgld_elapsed = time.perf_counter() - sgld_start_time
                 sgld_diag = expert_evidence.get("sgld_diag", {})
@@ -723,6 +834,20 @@ class Client:
                     sgld_times.append(float(sgld_time_value))
                 else:
                     sgld_times.append(sgld_elapsed)
+
+                sgld_prepare_time = sgld_diag.get("sgld_prepare_cache_time_sec")
+                if isinstance(sgld_prepare_time, (int, float)):
+                    sgld_prepare_cache_times.append(float(sgld_prepare_time))
+
+                if not sgld_diag.get("bayes_fisher_fast_all_experts"):
+                    fisher_time_value = sgld_diag.get("fisher_compute_time_sec")
+                    if isinstance(fisher_time_value, (int, float)):
+                        slow_fisher_times.append(float(fisher_time_value))
+                    slow_fisher_microbatches += int(sgld_diag.get("bayes_fisher_num_microbatches") or 0)
+                    slow_fisher_forward_backward_calls += int(
+                        sgld_diag.get("bayes_fisher_forward_backward_calls") or 0
+                    )
+
                 layer_evidence[expert_id] = expert_evidence
                 if self.bayes_evidence_log_detail:
                     precision_summary = self.summarize_named_tensor_state(
@@ -734,7 +859,7 @@ class Client:
                         f"--client: {self.client_id} --bayes_evidence_diag "
                         f"--detail:true "
                         f"--layer:{layer_id} --expert:{expert_id} --usage:{int(usage)} "
-                        f"--batches:{len(batch_cache)} --cached_samples:{self.count_cached_samples(batch_cache)} "
+                        f"--batches:{len(batch_cache)} --cached_samples:{entry['cached_samples']} "
                         f"--precision_source:{sgld_diag.get('precision_source')} "
                         f"--mean_state_source:{sgld_diag.get('mean_state_source')} "
                         f"--precision_state_source:{sgld_diag.get('precision_state_source')} "
@@ -771,11 +896,15 @@ class Client:
                         f"--fisher_precision_std:{sgld_diag.get('fisher_precision_std')} "
                         f"--fisher_precision_min:{sgld_diag.get('fisher_precision_min')} "
                         f"--fisher_precision_max:{sgld_diag.get('fisher_precision_max')} "
+                        f"--fisher_active_microbatches:{sgld_diag.get('fisher_active_microbatches')} "
+                        f"--fisher_forward_backward_calls:{sgld_diag.get('fisher_forward_backward_calls')} "
                         f"--fisher_neff_precision_clip_min_frac:{sgld_diag.get('fisher_neff_precision_clip_min_frac')} "
                         f"--fisher_neff_precision_clip_max_frac:{sgld_diag.get('fisher_neff_precision_clip_max_frac')} "
                         f"--fisher_zero_frac:{sgld_diag.get('fisher_zero_frac')} "
                         f"--fisher_num_microbatches:{sgld_diag.get('fisher_num_microbatches')} "
                         f"--fisher_compute_time_sec:{sgld_diag.get('fisher_compute_time_sec')} "
+                        f"--bayes_fisher_fast_all_experts:{sgld_diag.get('bayes_fisher_fast_all_experts')} "
+                        f"--bayes_fisher_fallback_reason:{sgld_diag.get('bayes_fisher_fallback_reason')} "
                         f"--mean_numel:{mean_summary['numel']} "
                         f"--precision_mean:{precision_summary['mean']} "
                         f"--precision_min:{precision_summary['min']} "
@@ -813,6 +942,42 @@ class Client:
                 torch.cuda.empty_cache()
 
         total_evidence_sec = time.perf_counter() - total_start_time
+        sgld_total_sec = sum(sgld_times)
+        sgld_prepare_cache_sec = sum(sgld_prepare_cache_times)
+        if fast_fisher_used:
+            fisher_total_sec = float(fast_fisher_stats.get("bayes_fisher_time_sec", 0.0) or 0.0)
+            fisher_prepare_cache_sec = float(
+                fast_fisher_stats.get("bayes_evidence_cache_time_sec", 0.0) or 0.0
+            )
+            fisher_forward_backward_calls = int(
+                fast_fisher_stats.get("bayes_fisher_forward_backward_calls", 0) or 0
+            )
+            fisher_num_microbatches = int(
+                fast_fisher_stats.get("bayes_fisher_num_microbatches", 0) or 0
+            )
+            fisher_num_expert_groups = int(
+                fast_fisher_stats.get("bayes_fisher_num_expert_groups", 0) or 0
+            )
+            fisher_cache_device = fast_fisher_stats.get(
+                "bayes_fisher_cache_device",
+                str(self.resolve_bayes_cache_device()),
+            )
+        else:
+            fisher_total_sec = sum(slow_fisher_times)
+            fisher_prepare_cache_sec = 0.0
+            fisher_forward_backward_calls = int(slow_fisher_forward_backward_calls)
+            fisher_num_microbatches = int(slow_fisher_microbatches)
+            fisher_num_expert_groups = len(evidence_entries) if self.bayes_precision_source in {
+                "empirical_fisher_microbatch",
+                "empirical_fisher_neff_microbatch",
+            } else 0
+            fisher_cache_device = str(self.resolve_bayes_cache_device())
+
+        evidence_cache_time_sec = (
+            float(cache_update_time_sec)
+            + float(sgld_prepare_cache_sec)
+            + float(fisher_prepare_cache_sec)
+        )
         per_expert_mean_sec = sum(sgld_times) / max(len(sgld_times), 1)
         per_expert_max_sec = max(sgld_times) if sgld_times else 0.0
         per_expert_min_sec = min(sgld_times) if sgld_times else 0.0
@@ -820,6 +985,18 @@ class Client:
             f"--client: {self.client_id} --bayes_evidence_time "
             f"--bayes_total_evidence_time_sec:{total_evidence_sec:.4f} "
             f"--bayes_build_model_sec:{build_model_sec:.4f} "
+            f"--bayes_evidence_cache_time_sec:{evidence_cache_time_sec:.4f} "
+            f"--bayes_cache_update_time_sec:{float(cache_update_time_sec):.4f} "
+            f"--bayes_prepare_cache_time_sec:{(sgld_prepare_cache_sec + fisher_prepare_cache_sec):.4f} "
+            f"--bayes_sgld_time_sec:{sgld_total_sec:.4f} "
+            f"--bayes_fisher_time_sec:{fisher_total_sec:.4f} "
+            f"--bayes_fisher_fast_all_experts:{fast_fisher_used} "
+            f"--bayes_fisher_fast_all_experts_config:{self.bayes_fisher_fast_all_experts} "
+            f"--bayes_fisher_forward_backward_calls:{fisher_forward_backward_calls} "
+            f"--bayes_fisher_num_microbatches:{fisher_num_microbatches} "
+            f"--bayes_fisher_num_expert_groups:{fisher_num_expert_groups} "
+            f"--bayes_fisher_cache_device:{fisher_cache_device} "
+            f"--bayes_fisher_fallback_reason:{fisher_fallback_reason} "
             f"--bayes_per_expert_mean_sec:{per_expert_mean_sec:.4f} "
             f"--bayes_per_expert_max_sec:{per_expert_max_sec:.4f} "
             f"--bayes_per_expert_min_sec:{per_expert_min_sec:.4f} "
@@ -850,6 +1027,7 @@ class Client:
         local_usage_total = torch.zeros(self.args.num_experts, device=self.device)
         local_layer_usage_total = {}
         bayes_batch_cache_by_expert = {}
+        bayes_cache_update_time_sec = 0.0
 
         for epoch in range(self.client_epochs):
             self.model.train()
@@ -887,12 +1065,14 @@ class Client:
                 usage_total += self.get_expert_activations(result)
                 batch_layer_stats = self.get_layer_expert_stats(result)
                 self.add_layer_stats(layer_usage_total, batch_layer_stats)
+                bayes_cache_update_start = time.perf_counter()
                 self.update_bayes_batch_cache(
                     batch_cache_by_expert=bayes_batch_cache_by_expert,
                     inputs=inputs,
                     labels=labels,
                     layer_stats=batch_layer_stats,
                 )
+                bayes_cache_update_time_sec += time.perf_counter() - bayes_cache_update_start
                 router_prob_sum += self.get_avg_router_probs(result) * batch_size
 
             denom = max(total_samples, 1)
@@ -950,7 +1130,11 @@ class Client:
             for layer_id, stats in local_layer_usage_total.items()
         }
         bayes_evidence_start = time.perf_counter()
-        bayes_evidence = self.extract_bayesian_evidence(layer_stats_cpu, bayes_batch_cache_by_expert)
+        bayes_evidence = self.extract_bayesian_evidence(
+            layer_stats_cpu,
+            bayes_batch_cache_by_expert,
+            cache_update_time_sec=bayes_cache_update_time_sec,
+        )
         bayes_evidence_time = time.perf_counter() - bayes_evidence_start
         return {
             "local_state_dict": local_state_dict,

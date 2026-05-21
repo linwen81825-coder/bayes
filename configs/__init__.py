@@ -85,6 +85,7 @@ _DEFAULT_CONFIG_VALUES = {
     "bayes_fisher_max_batches": None,
     "bayes_fisher_eps": 1.0e-12,
     "bayes_fisher_model_mode": "eval",
+    "bayes_fisher_fast_all_experts": True,
     "bayes_laplace_map_steps": 5,
     "bayes_laplace_map_lr": 1.0e-4,
     "bayes_laplace_map_optimizer": "adam",
