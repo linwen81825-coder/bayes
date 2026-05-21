@@ -496,6 +496,59 @@ def _extract_logits(model_result):
     return model_result
 
 
+
+def _safe_float(value, default=1.0):
+    if value is None:
+        return default
+    if torch.is_tensor(value):
+        if value.numel() == 0:
+            return default
+        value = value.detach().float().mean().item()
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    return value
+
+
+def _get_effective_evidence_size(meta_or_stats, default=1.0):
+    count_keys = [
+        "usage",
+        "token_count",
+        "routed_tokens",
+        "num_tokens",
+        "cached_tokens",
+    ]
+    sample_keys = [
+        "cached_samples",
+        "num_samples",
+    ]
+
+    def _build_info(value, source, transform):
+        raw_value = max(_safe_float(value, default=default), 1.0)
+        if transform == "sqrt":
+            neff_value = math.sqrt(raw_value)
+        else:
+            neff_value = raw_value
+        return {
+            "neff_raw": raw_value,
+            "neff": max(float(neff_value), 1.0),
+            "neff_source": source,
+            "neff_transform": transform,
+        }
+
+    if isinstance(meta_or_stats, dict):
+        for key in count_keys:
+            if key in meta_or_stats:
+                return _build_info(meta_or_stats.get(key), key, "sqrt")
+        for key in sample_keys:
+            if key in meta_or_stats:
+                return _build_info(meta_or_stats.get(key), key, "identity")
+    return _build_info(default, "default", "identity")
+
+
 def _optional_positive_int(value):
     if value is None:
         return None
@@ -676,6 +729,198 @@ def estimate_empirical_fisher_microbatch_precision(
         "fisher_compute_time_sec": round(float(time.perf_counter() - start_time), 6),
     }
     return precision_state, fisher_diag
+
+
+def estimate_empirical_fisher_neff_microbatch_precision(
+    model,
+    train_loader,
+    criterion,
+    device,
+    args,
+    layer_id,
+    expert_id,
+    evidence_stats=None,
+):
+    """Estimate empirical Fisher shape and scale it by routed effective evidence size."""
+
+    if train_loader is None:
+        raise ValueError("empirical_fisher_neff_microbatch requires a train_loader")
+
+    target_ref = (str(layer_id), str(expert_id))
+    expert_groups = group_expert_keys(model.state_dict())
+    expert_state_keys = expert_groups.get(target_ref, [])
+    named_params = collections.OrderedDict(model.named_parameters())
+    target_names = [key for key in expert_state_keys if key in named_params]
+    target_params = [named_params[key] for key in target_names]
+    if len(target_params) == 0:
+        raise ValueError(f"Missing target expert parameters for layer {layer_id}, expert {expert_id}")
+
+    microbatch_size = max(int(getattr(args, "bayes_fisher_microbatch_size", 8)), 1)
+    max_batches = _optional_positive_int(getattr(args, "bayes_fisher_max_batches", None))
+    eps = max(float(getattr(args, "bayes_fisher_eps", 1.0e-12)), 1.0e-12)
+    gamma = max(float(getattr(args, "bayes_precision_gamma", 0.5)), 0.0)
+    min_precision = max(float(getattr(args, "bayes_precision_min", 20.0)), eps)
+    max_precision = max(float(getattr(args, "bayes_precision_max", 300.0)), min_precision)
+    model_mode = str(getattr(args, "bayes_fisher_model_mode", "eval") or "eval").lower()
+    if model_mode not in {"eval", "train"}:
+        raise ValueError("bayes_fisher_model_mode must be eval or train")
+
+    neff_info = _get_effective_evidence_size(evidence_stats, default=1.0)
+    neff = neff_info["neff"]
+    target_device = _normalize_torch_device(device)
+    current_device = _first_param_device(model)
+    if current_device != target_device:
+        model.to(target_device)
+
+    original_training = bool(model.training)
+    original_requires_grad = {
+        name: param.requires_grad
+        for name, param in named_params.items()
+    }
+    target_name_set = set(target_names)
+    fisher_accum = collections.OrderedDict(
+        (name, torch.zeros_like(param.detach(), dtype=torch.float32, device=target_device))
+        for name, param in zip(target_names, target_params)
+    )
+
+    num_microbatches = 0
+    start_time = time.perf_counter()
+    try:
+        for name, param in named_params.items():
+            param.requires_grad_(name in target_name_set)
+
+        if model_mode == "eval":
+            model.eval()
+        else:
+            model.train()
+
+        for batch_idx, batch in enumerate(train_loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
+            inputs, labels = _unpack_supervised_batch(batch)
+            batch_size = int(labels.size(0))
+            if batch_size <= 0:
+                continue
+
+            for start in range(0, batch_size, microbatch_size):
+                end = min(start + microbatch_size, batch_size)
+                if end <= start:
+                    continue
+
+                inputs_micro = inputs[start:end].to(target_device, non_blocking=True)
+                labels_micro = labels[start:end].to(target_device, non_blocking=True)
+                model.zero_grad(set_to_none=True)
+                result = model(inputs_micro)
+                logits = _extract_logits(result)
+                loss = criterion(logits, labels_micro)
+                num_microbatches += 1
+                if not loss.requires_grad:
+                    continue
+
+                loss.backward()
+                for name, param in zip(target_names, target_params):
+                    grad = param.grad
+                    if grad is None:
+                        continue
+                    fisher_accum[name].add_(grad.detach().to(dtype=torch.float32).pow(2))
+    finally:
+        model.zero_grad(set_to_none=True)
+        for name, param in named_params.items():
+            param.requires_grad_(original_requires_grad[name])
+        if original_training:
+            model.train()
+        else:
+            model.eval()
+
+    raw_state = collections.OrderedDict()
+    for name in target_names:
+        raw_value = fisher_accum[name]
+        if num_microbatches > 0:
+            raw_value = raw_value / float(num_microbatches)
+        raw_value = torch.nan_to_num(
+            raw_value.detach().cpu().float(),
+            nan=0.0,
+            posinf=1.0e6,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        raw_state[name] = raw_value
+
+    raw_vector = torch.cat([value.reshape(-1) for value in raw_state.values()])
+    raw_clamped = raw_vector.clamp_min(eps)
+    raw_mean = raw_clamped.mean().clamp_min(eps)
+    shape_vector = raw_clamped / raw_mean
+    shape_vector = shape_vector.clamp_min(eps).pow(gamma)
+    shape_vector = shape_vector / shape_vector.mean().clamp_min(eps)
+    shape_vector = torch.nan_to_num(
+        shape_vector,
+        nan=1.0,
+        posinf=1.0,
+        neginf=1.0,
+    ).clamp_min(eps)
+    shape_vector = shape_vector / shape_vector.mean().clamp_min(eps)
+
+    if num_microbatches <= 0 or not torch.isfinite(shape_vector).all().item():
+        shape_vector = torch.ones_like(raw_vector)
+
+    precision_before_clip = neff * shape_vector
+    precision = precision_before_clip.clamp(min=min_precision, max=max_precision)
+
+    precision_state = collections.OrderedDict()
+    offset = 0
+    for name in target_names:
+        reference_tensor = raw_state[name]
+        numel = reference_tensor.numel()
+        precision_state[name] = (
+            precision[offset: offset + numel]
+            .view_as(reference_tensor)
+            .detach()
+            .cpu()
+            .clone()
+        )
+        offset += numel
+
+    precision_vector = precision.detach().float()
+    raw_stat_vector = raw_vector.detach().float()
+    shape_stat_vector = shape_vector.detach().float()
+    clip_min_frac = float((precision_before_clip < min_precision).float().mean().item())
+    clip_max_frac = float((precision_before_clip > max_precision).float().mean().item())
+    fisher_diag = {
+        "precision_source": "empirical_fisher_neff_microbatch",
+        "precision_state_source": "microbatch_empirical_fisher_diag_neff",
+        "raw_var_used_for_precision": False,
+        "neff_raw": round(float(neff_info["neff_raw"]), 6),
+        "neff": round(float(neff), 6),
+        "neff_source": neff_info["neff_source"],
+        "neff_transform": neff_info["neff_transform"],
+        "fisher_neff": round(float(neff), 6),
+        "fisher_microbatch_size": int(microbatch_size),
+        "fisher_max_batches": None if max_batches is None else int(max_batches),
+        "fisher_model_mode": model_mode,
+        "fisher_precision_gamma": float(gamma),
+        "fisher_precision_min_clip": float(min_precision),
+        "fisher_precision_max_clip": float(max_precision),
+        "fisher_shape_mean": round(float(shape_stat_vector.mean().item()), 6),
+        "fisher_shape_std": round(float(shape_stat_vector.std(unbiased=False).item()), 6),
+        "fisher_shape_min": round(float(shape_stat_vector.min().item()), 6),
+        "fisher_shape_max": round(float(shape_stat_vector.max().item()), 6),
+        "fisher_precision_mean": round(float(precision_vector.mean().item()), 6),
+        "fisher_precision_std": round(float(precision_vector.std(unbiased=False).item()), 6),
+        "fisher_precision_min": round(float(precision_vector.min().item()), 6),
+        "fisher_precision_max": round(float(precision_vector.max().item()), 6),
+        "fisher_precision_before_clip_mean": round(float(precision_before_clip.mean().item()), 6),
+        "fisher_raw_mean": round(float(raw_stat_vector.mean().item()), 12),
+        "fisher_raw_std": round(float(raw_stat_vector.std(unbiased=False).item()), 12),
+        "fisher_raw_min": round(float(raw_stat_vector.min().item()), 12),
+        "fisher_raw_max": round(float(raw_stat_vector.max().item()), 12),
+        "fisher_zero_frac": round(float((raw_stat_vector <= eps).float().mean().item()), 6),
+        "fisher_neff_precision_clip_min_frac": round(clip_min_frac, 6),
+        "fisher_neff_precision_clip_max_frac": round(clip_max_frac, 6),
+        "fisher_num_microbatches": int(num_microbatches),
+        "fisher_compute_time_sec": round(float(time.perf_counter() - start_time), 6),
+    }
+    return precision_state, fisher_diag
+
 
 def _run_expert_laplace_fit(
     model,

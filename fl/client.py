@@ -8,6 +8,7 @@ from torch import nn
 from data.loader import build_client_train_loader
 from fl.bayes_utils import (
     estimate_empirical_fisher_microbatch_precision,
+    estimate_empirical_fisher_neff_microbatch_precision,
     run_expert_sgld_fit,
 )
 from model import build_model_from_args
@@ -90,10 +91,12 @@ class Client:
             "sgld_variance",
             "laplace_diag",
             "empirical_fisher_microbatch",
+            "empirical_fisher_neff_microbatch",
         }:
             raise ValueError(
                 "bayes_precision_source must be one of: "
-                "sgld_variance, laplace_diag, empirical_fisher_microbatch"
+                "sgld_variance, laplace_diag, empirical_fisher_microbatch, "
+                "empirical_fisher_neff_microbatch"
             )
         if self.bayes_precision_min > self.bayes_precision_max:
             raise ValueError("bayes_precision_min must be <= bayes_precision_max")
@@ -508,7 +511,10 @@ class Client:
     ):
         expert_backup = self.backup_expert_params(evidence_model, layer_id, expert_id)
         try:
-            if self.bayes_precision_source == "empirical_fisher_microbatch":
+            if self.bayes_precision_source in {
+                "empirical_fisher_microbatch",
+                "empirical_fisher_neff_microbatch",
+            }:
                 mean_state, _, sgld_diag = run_expert_sgld_fit(
                     model=evidence_model,
                     batch_cache=batch_cache,
@@ -532,15 +538,34 @@ class Client:
                 )
                 self.restore_expert_params(evidence_model, expert_backup)
                 evidence_model.zero_grad(set_to_none=True)
-                precision_state, fisher_diag = estimate_empirical_fisher_microbatch_precision(
-                    model=evidence_model,
-                    train_loader=fisher_train_loader,
-                    criterion=self.criterion,
-                    device=self.device,
-                    args=self.args,
-                    layer_id=layer_id,
-                    expert_id=expert_id,
-                )
+                if self.bayes_precision_source == "empirical_fisher_neff_microbatch":
+                    cached_samples = self.count_cached_samples(batch_cache)
+                    evidence_stats = {
+                        "usage": usage,
+                        "routed_tokens": usage,
+                        "cached_samples": cached_samples,
+                        "num_samples": cached_samples,
+                    }
+                    precision_state, fisher_diag = estimate_empirical_fisher_neff_microbatch_precision(
+                        model=evidence_model,
+                        train_loader=fisher_train_loader,
+                        criterion=self.criterion,
+                        device=self.device,
+                        args=self.args,
+                        layer_id=layer_id,
+                        expert_id=expert_id,
+                        evidence_stats=evidence_stats,
+                    )
+                else:
+                    precision_state, fisher_diag = estimate_empirical_fisher_microbatch_precision(
+                        model=evidence_model,
+                        train_loader=fisher_train_loader,
+                        criterion=self.criterion,
+                        device=self.device,
+                        args=self.args,
+                        layer_id=layer_id,
+                        expert_id=expert_id,
+                    )
                 sgld_diag.update(fisher_diag)
                 sgld_diag["precision_mean"] = fisher_diag.get("fisher_precision_mean")
                 sgld_diag["precision_min"] = fisher_diag.get("fisher_precision_min")
@@ -607,10 +632,22 @@ class Client:
             "laplace_precision_at_min_clip_frac",
             "laplace_precision_at_max_clip_frac",
             "laplace_compute_time_sec",
+            "neff_raw",
+            "neff",
+            "neff_source",
+            "neff_transform",
+            "fisher_neff",
+            "fisher_shape_mean",
+            "fisher_shape_std",
+            "fisher_shape_min",
+            "fisher_shape_max",
             "fisher_precision_mean",
             "fisher_precision_std",
             "fisher_precision_min",
             "fisher_precision_max",
+            "fisher_precision_before_clip_mean",
+            "fisher_neff_precision_clip_min_frac",
+            "fisher_neff_precision_clip_max_frac",
             "fisher_raw_mean",
             "fisher_raw_std",
             "fisher_raw_min",
@@ -717,14 +754,25 @@ class Client:
                         f"--laplace_precision_at_min_clip_frac:{sgld_diag.get('laplace_precision_at_min_clip_frac')} "
                         f"--laplace_precision_at_max_clip_frac:{sgld_diag.get('laplace_precision_at_max_clip_frac')} "
                         f"--laplace_compute_time_sec:{sgld_diag.get('laplace_compute_time_sec')} "
-                        f"--fisher_precision_mean:{sgld_diag.get('fisher_precision_mean')} "
-                        f"--fisher_precision_std:{sgld_diag.get('fisher_precision_std')} "
-                        f"--fisher_precision_min:{sgld_diag.get('fisher_precision_min')} "
-                        f"--fisher_precision_max:{sgld_diag.get('fisher_precision_max')} "
+                        f"--neff_raw:{sgld_diag.get('neff_raw')} "
+                        f"--neff:{sgld_diag.get('neff')} "
+                        f"--neff_source:{sgld_diag.get('neff_source')} "
+                        f"--neff_transform:{sgld_diag.get('neff_transform')} "
+                        f"--fisher_neff:{sgld_diag.get('fisher_neff')} "
                         f"--fisher_raw_mean:{sgld_diag.get('fisher_raw_mean')} "
                         f"--fisher_raw_std:{sgld_diag.get('fisher_raw_std')} "
                         f"--fisher_raw_min:{sgld_diag.get('fisher_raw_min')} "
                         f"--fisher_raw_max:{sgld_diag.get('fisher_raw_max')} "
+                        f"--fisher_shape_mean:{sgld_diag.get('fisher_shape_mean')} "
+                        f"--fisher_shape_std:{sgld_diag.get('fisher_shape_std')} "
+                        f"--fisher_shape_min:{sgld_diag.get('fisher_shape_min')} "
+                        f"--fisher_shape_max:{sgld_diag.get('fisher_shape_max')} "
+                        f"--fisher_precision_mean:{sgld_diag.get('fisher_precision_mean')} "
+                        f"--fisher_precision_std:{sgld_diag.get('fisher_precision_std')} "
+                        f"--fisher_precision_min:{sgld_diag.get('fisher_precision_min')} "
+                        f"--fisher_precision_max:{sgld_diag.get('fisher_precision_max')} "
+                        f"--fisher_neff_precision_clip_min_frac:{sgld_diag.get('fisher_neff_precision_clip_min_frac')} "
+                        f"--fisher_neff_precision_clip_max_frac:{sgld_diag.get('fisher_neff_precision_clip_max_frac')} "
                         f"--fisher_zero_frac:{sgld_diag.get('fisher_zero_frac')} "
                         f"--fisher_num_microbatches:{sgld_diag.get('fisher_num_microbatches')} "
                         f"--fisher_compute_time_sec:{sgld_diag.get('fisher_compute_time_sec')} "

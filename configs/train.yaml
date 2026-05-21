@@ -196,25 +196,38 @@ bayes_precision_mode: floor_inverse
 # normalized_power / scalar_normalized_power / relative_normalized_power 的 power 温度
 bayes_precision_temperature: 0.25
 
-# normalized_power / relative_normalized_power / empirical_fisher_microbatch 的目标 precision 均值
+# normalized_power / relative_normalized_power / empirical_fisher_microbatch 的目标 precision 均值。
+# 注意：empirical_fisher_neff_microbatch 不用它做 mean normalization。
 bayes_precision_target: 100.0
 
-# empirical_fisher_microbatch 对归一化 Fisher precision 的 power tempering 指数
+# empirical_fisher_microbatch / empirical_fisher_neff_microbatch 对 Fisher shape 的 power tempering 指数
 bayes_precision_gamma: 0.5
 
-# normalized_power / relative_normalized_power / empirical_fisher_microbatch 的 precision 下限
+# normalized_power / relative_normalized_power / empirical_fisher_* 的 precision 下限
 bayes_precision_min: 20.0
 
-# normalized_power / relative_normalized_power / empirical_fisher_microbatch 的 precision 上限
+# normalized_power / relative_normalized_power / empirical_fisher_* 的 precision 上限
 bayes_precision_max: 300.0
 
 # precision 计算时的数值稳定 eps
 bayes_precision_eps: 1.0e-12
 
-# 客户端上传 precision 的来源：
-# - sgld_variance：旧默认逻辑，使用 SGLD 参数样本方差估计 precision。
-# - laplace_diag：先做 MAP adaptation，再用 Hutchinson HVP 估计 Hessian diagonal。
-# - empirical_fisher_microbatch：mean_state 仍来自 SGLD/local mean，precision_state 使用 microbatch empirical Fisher diagonal。
+# bayes_precision_source:
+# - sgld_variance:
+#     使用 SGLD 参数样本方差估计 precision_state。
+# - laplace_diag:
+#     MAP adaptation 后用 Hessian diagonal / HVP 估计 precision_state。
+# - empirical_fisher_microbatch:
+#     mean_state 仍来自 SGLD/local evidence；
+#     precision_state 使用 microbatch empirical Fisher；
+#     每个 client-expert 的 precision mean 会归一到 bayes_precision_target 附近。
+# - empirical_fisher_neff_microbatch:
+#     mean_state 仍来自 SGLD/local evidence；
+#     precision_state 使用 likelihood-scaled microbatch empirical Fisher：
+#         A_i,k = N_eff_i,k * shape(Fbar_i,k)
+#     Fisher shape 表示参数内部相对重要性；
+#     N_eff 表示 routed expert evidence size；
+#     不再把每个 client-expert 的 precision mean 强行归一到 bayes_precision_target。
 bayes_precision_source: empirical_fisher_microbatch
 
 # --- empirical_fisher_microbatch 专用参数 ---
@@ -222,6 +235,21 @@ bayes_fisher_microbatch_size: 8
 bayes_fisher_max_batches: null
 bayes_fisher_eps: 1.0e-12
 bayes_fisher_model_mode: eval
+
+# empirical_fisher_neff_microbatch smoke 建议：
+# run_name: bayes_fisher_neff_microbatch_smoke_2r
+# server_epochs: 2
+# agg_method: expert_bayes_meta
+# bayes_precision_source: empirical_fisher_neff_microbatch
+# bayes_fisher_microbatch_size: 8
+# bayes_fisher_max_batches: 4
+# bayes_precision_gamma: 0.5
+# bayes_precision_min: 20.0
+# bayes_precision_max: 300.0
+# bayes_client_weight_mode: uniform
+# bayes_direction_diag: true
+# bayes_direction_diag_detail: false
+# bayes_evidence_log_detail: true
 
 # --- laplace_diag 专用参数 ---
 # 第一版建议先和 post_train evidence 搭配验证，不要同时打开 prior-start。

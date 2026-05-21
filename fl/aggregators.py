@@ -512,6 +512,15 @@ class ExpertBayesMetaAggregator(Aggregator):
             return {
                 "bayes_client_weight_mode": self.client_weight_mode,
                 "precision_source_counts": {},
+                "source_counts": {},
+                "neff_source_counts": {},
+                "neff_transform_counts": {},
+                "neff_raw_mean": None,
+                "neff_raw_min": None,
+                "neff_raw_max": None,
+                "neff_mean": None,
+                "neff_min": None,
+                "neff_max": None,
                 "usage_total": 0.0,
                 "usage_max": 0.0,
                 "usage_weight_sum": 0.0,
@@ -539,6 +548,8 @@ class ExpertBayesMetaAggregator(Aggregator):
                 "fisher_raw_mean_avg": None,
                 "fisher_raw_std_avg": None,
                 "fisher_zero_frac_avg": None,
+                "fisher_neff_precision_clip_min_frac_avg": None,
+                "fisher_neff_precision_clip_max_frac_avg": None,
                 "fisher_num_microbatches_total": 0,
                 "fisher_compute_time_sec_avg": None,
             }
@@ -554,6 +565,14 @@ class ExpertBayesMetaAggregator(Aggregator):
             str(payload.get("precision_source") or "unknown")
             for payload in client_payloads
         )
+        neff_source_counts = collections.Counter(
+            str(payload.get("neff_source") or "unknown")
+            for payload in client_payloads
+        )
+        neff_transform_counts = collections.Counter(
+            str(payload.get("neff_transform") or "unknown")
+            for payload in client_payloads
+        )
         precision_values = []
         for payload in client_payloads:
             precision_state = payload.get("precision_state", {})
@@ -565,6 +584,15 @@ class ExpertBayesMetaAggregator(Aggregator):
         summary = {
             "bayes_client_weight_mode": self.client_weight_mode,
             "precision_source_counts": dict(precision_source_counts),
+            "source_counts": dict(precision_source_counts),
+            "neff_source_counts": dict(neff_source_counts),
+            "neff_transform_counts": dict(neff_transform_counts),
+            "neff_raw_mean": self._mean_payload_field(client_payloads, "neff_raw"),
+            "neff_raw_min": self._min_payload_field(client_payloads, "neff_raw"),
+            "neff_raw_max": self._max_payload_field(client_payloads, "neff_raw"),
+            "neff_mean": self._mean_payload_field(client_payloads, "neff"),
+            "neff_min": self._min_payload_field(client_payloads, "neff"),
+            "neff_max": self._max_payload_field(client_payloads, "neff"),
             "usage_total": round(float(sum(usage_values)), 6),
             "usage_max": round(float(max(usage_values)), 6),
             "usage_weight_sum": round(usage_weight_sum, 6),
@@ -631,6 +659,14 @@ class ExpertBayesMetaAggregator(Aggregator):
                     client_payloads,
                     "fisher_zero_frac",
                 ),
+                "fisher_neff_precision_clip_min_frac_avg": self._mean_payload_field(
+                    client_payloads,
+                    "fisher_neff_precision_clip_min_frac",
+                ),
+                "fisher_neff_precision_clip_max_frac_avg": self._mean_payload_field(
+                    client_payloads,
+                    "fisher_neff_precision_clip_max_frac",
+                ),
                 "fisher_num_microbatches_total": self._sum_payload_field(
                     client_payloads,
                     "fisher_num_microbatches",
@@ -694,6 +730,36 @@ class ExpertBayesMetaAggregator(Aggregator):
         if not values:
             return None
         return round(float(sum(values) / len(values)), 6)
+
+    def _min_payload_field(self, client_payloads, field_name):
+        values = self._payload_field_values(client_payloads, field_name)
+        if not values:
+            return None
+        return round(float(min(values)), 6)
+
+    def _max_payload_field(self, client_payloads, field_name):
+        values = self._payload_field_values(client_payloads, field_name)
+        if not values:
+            return None
+        return round(float(max(values)), 6)
+
+    def _payload_field_values(self, client_payloads, field_name):
+        values = []
+        for payload in client_payloads:
+            value = payload.get(field_name)
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    continue
+                value = value.detach().cpu().float().item()
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                values.append(value)
+        return values
 
     def _sum_payload_field(self, client_payloads, field_name):
         total = 0.0
@@ -929,10 +995,22 @@ class ExpertBayesMetaAggregator(Aggregator):
             "laplace_precision_at_min_clip_frac",
             "laplace_precision_at_max_clip_frac",
             "laplace_compute_time_sec",
+            "neff_raw",
+            "neff",
+            "neff_source",
+            "neff_transform",
+            "fisher_neff",
+            "fisher_shape_mean",
+            "fisher_shape_std",
+            "fisher_shape_min",
+            "fisher_shape_max",
             "fisher_precision_mean",
             "fisher_precision_std",
             "fisher_precision_min",
             "fisher_precision_max",
+            "fisher_precision_before_clip_mean",
+            "fisher_neff_precision_clip_min_frac",
+            "fisher_neff_precision_clip_max_frac",
             "fisher_raw_mean",
             "fisher_raw_std",
             "fisher_raw_min",

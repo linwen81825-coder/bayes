@@ -80,16 +80,17 @@ python train.py --data_cfg configs/exp/cifar10.yaml --train_cfg configs/exp/trai
 
 - `sgld_variance`：使用 SGLD 参数样本方差估计 `precision_state`
 - `laplace_diag`：MAP adaptation 后用 Hutchinson HVP 估计 Hessian diagonal
-- `empirical_fisher_microbatch`：`mean_state` 仍使用现有 SGLD/local mean 逻辑，`precision_state` 改为本地 train loader 上的 microbatch empirical Fisher diagonal
+- `empirical_fisher_microbatch`：`mean_state` 仍使用现有 SGLD/local mean 逻辑，`precision_state` 改为本地 train loader 上的 microbatch empirical Fisher diagonal，并把每个 client-expert precision mean 归一到固定 target 附近
+- `empirical_fisher_neff_microbatch`：mean_state still follows the existing SGLD/local evidence path. Microbatch empirical Fisher estimates the diagonal Fisher shape Fbar_i,k. The uploaded local precision is A_i,k = N_eff_i,k * shape(Fbar_i,k), with safety clipping. Unlike empirical_fisher_microbatch, it does not normalize every client-expert precision to a fixed target mean. N_eff is taken from routed expert usage/token count when available.
 
 `empirical_fisher_microbatch` 相关配置在 `configs/train.yaml`：
 
 ```yaml
-bayes_precision_source: empirical_fisher_microbatch
+bayes_precision_source: empirical_fisher_microbatch  # or empirical_fisher_neff_microbatch
 bayes_fisher_microbatch_size: 8
 bayes_fisher_max_batches: null
 bayes_fisher_eps: 1.0e-12
-bayes_precision_target: 100.0
+bayes_precision_target: 100.0  # not used for mean normalization by empirical_fisher_neff_microbatch
 bayes_precision_gamma: 0.5
 bayes_precision_min: 20.0
 bayes_precision_max: 300.0

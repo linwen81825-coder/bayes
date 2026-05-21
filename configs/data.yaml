@@ -5,7 +5,7 @@ data_name: cifar10
 data_path: ./data
 
 # DataLoader 的 batch size
-batch_size: 128
+batch_size: 32
 
 # Dirichlet 划分后，每个客户端至少要有多少条训练样本
 min_datasize: 32
