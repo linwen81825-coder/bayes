@@ -246,6 +246,58 @@ class ExpertBayesMetaAggregator(Aggregator):
         self.effective_weight_diag_detail = bool(
             getattr(args, "bayes_effective_weight_diag_detail", False)
         )
+        self.evidence_quality_diag = bool(
+            getattr(args, "bayes_evidence_quality_diag", False)
+        )
+        self.evidence_quality_diag_detail = bool(
+            getattr(args, "bayes_evidence_quality_diag_detail", False)
+        )
+        self.evidence_quality_eps = max(
+            float(getattr(args, "bayes_evidence_quality_eps", 1.0e-12)),
+            1.0e-12,
+        )
+        self.precision_quality_calibration = bool(
+            getattr(args, "bayes_precision_quality_calibration", False)
+        )
+        self.precision_quality_metric = str(
+            getattr(args, "bayes_precision_quality_metric", "loss_improvement")
+        ).lower()
+        self.precision_quality_center = str(
+            getattr(args, "bayes_precision_quality_center", "median")
+        ).lower()
+        self.precision_quality_scale = str(
+            getattr(args, "bayes_precision_quality_scale", "mad")
+        ).lower()
+        self.precision_quality_temperature = max(
+            float(getattr(args, "bayes_precision_quality_temperature", 1.0)),
+            1.0e-12,
+        )
+        self.precision_quality_score_min = float(
+            getattr(args, "bayes_precision_quality_score_min", 0.5)
+        )
+        self.precision_quality_score_max = max(
+            float(getattr(args, "bayes_precision_quality_score_max", 2.0)),
+            self.precision_quality_score_min,
+        )
+        self.precision_quality_missing_score = float(
+            getattr(args, "bayes_precision_quality_missing_score", 1.0)
+        )
+        self.precision_quality_eps = max(
+            float(getattr(args, "bayes_precision_quality_eps", 1.0e-12)),
+            1.0e-12,
+        )
+        self.precision_quality_diag = bool(
+            getattr(args, "bayes_precision_quality_diag", True)
+        )
+        self.precision_quality_min = max(
+            float(getattr(args, "bayes_precision_min", self.min_precision)),
+            self.min_precision,
+        )
+        self.precision_quality_max = max(
+            float(getattr(args, "bayes_precision_max", self.max_precision)),
+            self.precision_quality_min,
+        )
+        self._precision_quality_missing_warned = False
         print(
             "[ExpertBayesMetaAggregator] "
             f"bayes_meta_device={self.meta_device} "
@@ -423,6 +475,16 @@ class ExpertBayesMetaAggregator(Aggregator):
             if self.client_weight_mode == "reliability_robust"
             else None
         )
+        precision_quality_summary = self._empty_precision_quality_summary(
+            enabled=self.precision_quality_calibration
+        )
+        if self.precision_quality_calibration:
+            precision_quality_summary = self._apply_precision_quality_calibration(
+                client_payloads=client_payloads,
+                expert_keys=expert_keys,
+                layer_id=layer_id,
+                expert_id=expert_id,
+            )
         optimized_mean_state, optimized_log_precision_state, optimized_log_n0, local_posterior_count, meta_loss = (
             self._optimize_expert_prior(
                 expert_keys=expert_keys,
@@ -461,6 +523,7 @@ class ExpertBayesMetaAggregator(Aggregator):
             global_state=global_state,
             optimized_mean_state=optimized_mean_state,
             reliability_summary=reliability_summary,
+            precision_quality_summary=precision_quality_summary,
         )
         expert_metric["expert_meta_time_sec"] = round(
             time.perf_counter() - expert_start_time,
@@ -933,6 +996,489 @@ class ExpertBayesMetaAggregator(Aggregator):
         if not found:
             return 0
         return int(round(total))
+
+    def _optional_quality_float(self, value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return None
+            value = value.detach().cpu().float().mean().item()
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    def _quality_mean(self, values):
+        finite_values = [
+            float(value)
+            for value in values
+            if value is not None and math.isfinite(float(value))
+        ]
+        if not finite_values:
+            return None
+        return round(sum(finite_values) / float(len(finite_values)), 6)
+
+    def _safe_pearson_corr(self, left_values, right_values, eps=None):
+        eps = self.evidence_quality_eps if eps is None else max(float(eps), 1.0e-12)
+        pairs = []
+        for left, right in zip(left_values, right_values):
+            left = self._optional_quality_float(left)
+            right = self._optional_quality_float(right)
+            if left is None or right is None:
+                continue
+            pairs.append((left, right))
+        if len(pairs) < 2:
+            return None
+
+        left_mean = sum(left for left, _ in pairs) / float(len(pairs))
+        right_mean = sum(right for _, right in pairs) / float(len(pairs))
+        left_var = sum((left - left_mean) ** 2 for left, _ in pairs)
+        right_var = sum((right - right_mean) ** 2 for _, right in pairs)
+        left_std = math.sqrt(max(left_var / float(len(pairs)), 0.0))
+        right_std = math.sqrt(max(right_var / float(len(pairs)), 0.0))
+        if left_std < eps or right_std < eps:
+            return None
+
+        cov = sum((left - left_mean) * (right - right_mean) for left, right in pairs)
+        denom = math.sqrt(max(left_var * right_var, 0.0))
+        if denom < eps:
+            return None
+        corr = cov / denom
+        if not math.isfinite(corr):
+            return None
+        return round(float(corr), 6)
+
+    def _empty_evidence_quality_summary(self):
+        return {
+            "bayes_evidence_global_loss_mean": None,
+            "bayes_evidence_local_loss_mean": None,
+            "bayes_evidence_loss_improvement_mean": None,
+            "bayes_evidence_global_acc_mean": None,
+            "bayes_evidence_local_acc_mean": None,
+            "bayes_evidence_acc_improvement_mean": None,
+            "bayes_evidence_precision_loss_corr": None,
+            "bayes_evidence_precision_improvement_corr": None,
+            "bayes_evidence_precision_usage_corr": None,
+            "bayes_evidence_precision_delta_norm_corr": None,
+            "bayes_evidence_bad_fraction": None,
+            "bayes_evidence_quality_count": 0,
+        }
+
+    def _get_quality_precision_scalar(self, payload, expert_keys):
+        for field_name in ["local_precision_mean", "precision_mean"]:
+            value = self._optional_quality_float(payload.get(field_name))
+            if value is not None:
+                return value
+
+        precision_state = payload.get("precision_state", {})
+        if not isinstance(precision_state, dict):
+            return None
+
+        precision_sum = 0.0
+        precision_numel = 0
+        with torch.no_grad():
+            for key in expert_keys:
+                value = precision_state.get(key)
+                if not torch.is_tensor(value) or not torch.is_floating_point(value):
+                    continue
+                precision_value = torch.nan_to_num(
+                    value.detach().cpu().float(),
+                    nan=0.0,
+                    posinf=self.max_precision,
+                    neginf=0.0,
+                )
+                precision_sum += float(precision_value.sum().item())
+                precision_numel += int(precision_value.numel())
+
+        if precision_numel <= 0:
+            return None
+        precision_mean = precision_sum / float(precision_numel)
+        return precision_mean if math.isfinite(precision_mean) else None
+
+    def _get_quality_usage_scalar(self, payload):
+        for field_name in ["usage", "routed_tokens", "usage_weight"]:
+            value = self._optional_quality_float(payload.get(field_name))
+            if value is not None:
+                return value
+        return None
+
+    def _get_quality_delta_norm_scalar(self, payload):
+        for field_name in ["param_delta_norm", "delta_norm"]:
+            value = self._optional_quality_float(payload.get(field_name))
+            if value is not None:
+                return value
+        return None
+
+    def _summarize_evidence_quality(self, client_payloads, expert_keys):
+        summary = self._empty_evidence_quality_summary()
+        records = []
+        for payload in client_payloads:
+            global_loss = self._optional_quality_float(payload.get("evidence_global_loss"))
+            local_loss = self._optional_quality_float(payload.get("evidence_local_loss"))
+            global_acc = self._optional_quality_float(payload.get("evidence_global_acc"))
+            local_acc = self._optional_quality_float(payload.get("evidence_local_acc"))
+            if any(value is None for value in [global_loss, local_loss, global_acc, local_acc]):
+                continue
+
+            loss_improvement = self._optional_quality_float(
+                payload.get("evidence_loss_improvement")
+            )
+            if loss_improvement is None:
+                loss_improvement = global_loss - local_loss
+            acc_improvement = self._optional_quality_float(
+                payload.get("evidence_acc_improvement")
+            )
+            if acc_improvement is None:
+                acc_improvement = local_acc - global_acc
+
+            evidence_bad = payload.get("evidence_bad")
+            if isinstance(evidence_bad, bool):
+                bad_value = 1.0 if evidence_bad else 0.0
+            else:
+                bad_value = self._optional_quality_float(evidence_bad)
+                if bad_value is None:
+                    bad_value = 1.0 if local_loss > global_loss else 0.0
+
+            records.append(
+                {
+                    "global_loss": global_loss,
+                    "local_loss": local_loss,
+                    "loss_improvement": loss_improvement,
+                    "global_acc": global_acc,
+                    "local_acc": local_acc,
+                    "acc_improvement": acc_improvement,
+                    "bad": bad_value,
+                    "precision": self._get_quality_precision_scalar(payload, expert_keys),
+                    "usage": self._get_quality_usage_scalar(payload),
+                    "delta_norm": self._get_quality_delta_norm_scalar(payload),
+                }
+            )
+
+        if not records:
+            return summary
+
+        summary.update(
+            {
+                "bayes_evidence_global_loss_mean": self._quality_mean(
+                    record["global_loss"] for record in records
+                ),
+                "bayes_evidence_local_loss_mean": self._quality_mean(
+                    record["local_loss"] for record in records
+                ),
+                "bayes_evidence_loss_improvement_mean": self._quality_mean(
+                    record["loss_improvement"] for record in records
+                ),
+                "bayes_evidence_global_acc_mean": self._quality_mean(
+                    record["global_acc"] for record in records
+                ),
+                "bayes_evidence_local_acc_mean": self._quality_mean(
+                    record["local_acc"] for record in records
+                ),
+                "bayes_evidence_acc_improvement_mean": self._quality_mean(
+                    record["acc_improvement"] for record in records
+                ),
+                "bayes_evidence_bad_fraction": self._quality_mean(
+                    record["bad"] for record in records
+                ),
+                "bayes_evidence_quality_count": int(len(records)),
+            }
+        )
+        summary["bayes_evidence_precision_loss_corr"] = self._safe_pearson_corr(
+            [record["precision"] for record in records],
+            [record["local_loss"] for record in records],
+        )
+        summary["bayes_evidence_precision_improvement_corr"] = self._safe_pearson_corr(
+            [record["precision"] for record in records],
+            [record["loss_improvement"] for record in records],
+        )
+        summary["bayes_evidence_precision_usage_corr"] = self._safe_pearson_corr(
+            [record["precision"] for record in records],
+            [record["usage"] for record in records],
+        )
+        summary["bayes_evidence_precision_delta_norm_corr"] = self._safe_pearson_corr(
+            [record["precision"] for record in records],
+            [record["delta_norm"] for record in records],
+        )
+        return summary
+
+    def _empty_precision_quality_summary(self, enabled=None):
+        return {
+            "bayes_qcal_enabled": bool(self.precision_quality_calibration if enabled is None else enabled),
+            "bayes_qcal_count": 0,
+            "bayes_qcal_missing_quality_count": 0,
+            "bayes_qcal_score_mean": None,
+            "bayes_qcal_score_std": None,
+            "bayes_qcal_score_min": None,
+            "bayes_qcal_score_max": None,
+            "bayes_qcal_loss_improvement_mean": None,
+            "bayes_qcal_loss_improvement_median": None,
+            "bayes_qcal_loss_improvement_scale": None,
+            "bayes_qcal_precision_mean_before": None,
+            "bayes_qcal_precision_mean_after": None,
+            "bayes_qcal_precision_ratio_mean": None,
+            "bayes_qcal_score_improvement_corr": None,
+            "bayes_qcal_score_loss_corr": None,
+            "bayes_qcal_score_usage_corr": None,
+            "bayes_qcal_precision_improvement_corr_before": None,
+            "bayes_qcal_precision_improvement_corr_after": None,
+            "bayes_qcal_precision_loss_corr_before": None,
+            "bayes_qcal_precision_loss_corr_after": None,
+            "bayes_qcal_precision_usage_corr_before": None,
+            "bayes_qcal_precision_usage_corr_after": None,
+        }
+
+    def _quality_std(self, values):
+        finite_values = [
+            float(value)
+            for value in values
+            if value is not None and math.isfinite(float(value))
+        ]
+        if not finite_values:
+            return None
+        mean_value = sum(finite_values) / float(len(finite_values))
+        variance = sum((value - mean_value) ** 2 for value in finite_values) / float(len(finite_values))
+        return round(math.sqrt(max(variance, 0.0)), 6)
+
+    def _quality_median(self, values):
+        finite_values = sorted(
+            float(value)
+            for value in values
+            if value is not None and math.isfinite(float(value))
+        )
+        if not finite_values:
+            return None
+        mid = len(finite_values) // 2
+        if len(finite_values) % 2:
+            return finite_values[mid]
+        return 0.5 * (finite_values[mid - 1] + finite_values[mid])
+
+    def _precision_state_tensor_mean(self, payload, expert_keys):
+        precision_state = payload.get("precision_state", {})
+        if not isinstance(precision_state, dict):
+            return None
+        precision_sum = 0.0
+        precision_numel = 0
+        with torch.no_grad():
+            for key in expert_keys:
+                value = precision_state.get(key)
+                if not torch.is_tensor(value) or not torch.is_floating_point(value):
+                    continue
+                precision_value = torch.nan_to_num(
+                    value.detach().cpu().float(),
+                    nan=0.0,
+                    posinf=self.precision_quality_max,
+                    neginf=0.0,
+                )
+                precision_sum += float(precision_value.sum().item())
+                precision_numel += int(precision_value.numel())
+        if precision_numel <= 0:
+            return None
+        precision_mean = precision_sum / float(precision_numel)
+        return precision_mean if math.isfinite(precision_mean) else None
+
+    def _get_precision_quality_metric(self, payload):
+        if self.precision_quality_metric in {"loss_improvement", "evidence_loss_improvement"}:
+            return self._optional_quality_float(payload.get("evidence_loss_improvement"))
+        return None
+
+    def _compute_precision_quality_center_scale(self, metric_values):
+        eps = self.precision_quality_eps
+        if not metric_values:
+            return None, None, True
+        if self.precision_quality_center == "mean":
+            center = sum(metric_values) / float(len(metric_values))
+        else:
+            center = self._quality_median(metric_values)
+        if center is None or not math.isfinite(float(center)):
+            return None, None, True
+
+        metric_mean = sum(metric_values) / float(len(metric_values))
+        std_raw = math.sqrt(
+            max(
+                sum((float(value) - metric_mean) ** 2 for value in metric_values)
+                / float(len(metric_values)),
+                0.0,
+            )
+        )
+        if self.precision_quality_scale == "std":
+            if std_raw <= eps:
+                return float(center), std_raw, True
+            return float(center), std_raw + eps, False
+
+        deviations = [abs(float(value) - float(center)) for value in metric_values]
+        mad_value = self._quality_median(deviations)
+        mad_raw = 0.0 if mad_value is None else float(mad_value)
+        if mad_raw > eps:
+            return float(center), mad_raw + eps, False
+        if std_raw > eps:
+            return float(center), std_raw + eps, False
+        return float(center), std_raw, True
+
+    def _precision_quality_score(self, metric_value, center, scale, neutral_scores):
+        if neutral_scores:
+            return 1.0
+        if metric_value is None:
+            score = self.precision_quality_missing_score
+        else:
+            z_value = (float(metric_value) - float(center)) / max(float(scale), self.precision_quality_eps)
+            exponent = max(min(z_value / self.precision_quality_temperature, 60.0), -60.0)
+            score = math.exp(exponent)
+        if not math.isfinite(score):
+            score = 1.0
+        return max(
+            min(float(score), self.precision_quality_score_max),
+            self.precision_quality_score_min,
+        )
+
+    def _apply_precision_quality_calibration(self, client_payloads, expert_keys, layer_id, expert_id):
+        summary = self._empty_precision_quality_summary(enabled=True)
+        records = []
+        metric_values = []
+
+        for payload in client_payloads:
+            tensor_precision = self._precision_state_tensor_mean(payload, expert_keys)
+            if tensor_precision is None:
+                continue
+            before_precision = self._get_quality_precision_scalar(payload, expert_keys)
+            if before_precision is None:
+                before_precision = tensor_precision
+            metric_value = self._get_precision_quality_metric(payload)
+            if metric_value is not None:
+                metric_values.append(float(metric_value))
+            records.append(
+                {
+                    "payload": payload,
+                    "precision_before": before_precision,
+                    "metric": metric_value,
+                    "local_loss": self._optional_quality_float(payload.get("evidence_local_loss")),
+                    "usage": self._get_quality_usage_scalar(payload),
+                }
+            )
+
+        if not records:
+            return summary
+
+        if not metric_values and not self._precision_quality_missing_warned:
+            logging.warning(
+                "[BayesQualityCalibratedPrecision] enabled but no finite "
+                "evidence_loss_improvement was found; using quality_score=1.0"
+            )
+            self._precision_quality_missing_warned = True
+
+        center, scale, neutral_scores = self._compute_precision_quality_center_scale(metric_values)
+        if not metric_values:
+            neutral_scores = True
+
+        missing_quality_count = 0
+        for record in records:
+            metric_value = record["metric"]
+            if metric_value is None:
+                missing_quality_count += 1
+            score = self._precision_quality_score(metric_value, center, scale, neutral_scores)
+            payload = record["payload"]
+            precision_state = payload.get("precision_state", {})
+            calibrated_state = dict(precision_state) if isinstance(precision_state, dict) else {}
+            for key in expert_keys:
+                value = precision_state.get(key) if isinstance(precision_state, dict) else None
+                if not torch.is_tensor(value) or not torch.is_floating_point(value):
+                    continue
+                calibrated_state[key] = (
+                    value.detach().clone().mul(float(score)).clamp(
+                        min=self.precision_quality_min,
+                        max=self.precision_quality_max,
+                    )
+                )
+            payload["precision_state"] = calibrated_state
+            payload["precision_state_original_mean"] = round(float(record["precision_before"]), 6)
+            payload["precision_quality_score"] = round(float(score), 6)
+            record["score"] = score
+            record["precision_after"] = self._precision_state_tensor_mean(payload, expert_keys)
+
+        scores = [record.get("score") for record in records]
+        precision_before = [record.get("precision_before") for record in records]
+        precision_after = [record.get("precision_after") for record in records]
+        ratios = []
+        for before_value, after_value in zip(precision_before, precision_after):
+            before_value = self._optional_quality_float(before_value)
+            after_value = self._optional_quality_float(after_value)
+            if before_value is not None and after_value is not None and abs(before_value) > self.precision_quality_eps:
+                ratios.append(after_value / before_value)
+
+        summary.update(
+            {
+                "bayes_qcal_count": int(len(records)),
+                "bayes_qcal_missing_quality_count": int(missing_quality_count),
+                "bayes_qcal_score_mean": self._quality_mean(scores),
+                "bayes_qcal_score_std": self._quality_std(scores),
+                "bayes_qcal_score_min": self._quality_mean([min(scores)] if scores else []),
+                "bayes_qcal_score_max": self._quality_mean([max(scores)] if scores else []),
+                "bayes_qcal_loss_improvement_mean": self._quality_mean(metric_values),
+                "bayes_qcal_loss_improvement_median": (
+                    None if self._quality_median(metric_values) is None
+                    else round(float(self._quality_median(metric_values)), 6)
+                ),
+                "bayes_qcal_loss_improvement_scale": (
+                    None if scale is None or not math.isfinite(float(scale))
+                    else round(float(scale), 6)
+                ),
+                "bayes_qcal_precision_mean_before": self._quality_mean(precision_before),
+                "bayes_qcal_precision_mean_after": self._quality_mean(precision_after),
+                "bayes_qcal_precision_ratio_mean": self._quality_mean(ratios),
+            }
+        )
+        improvements = [record.get("metric") for record in records]
+        losses = [record.get("local_loss") for record in records]
+        usages = [record.get("usage") for record in records]
+        summary["bayes_qcal_score_improvement_corr"] = self._safe_pearson_corr(
+            scores,
+            improvements,
+            eps=self.precision_quality_eps,
+        )
+        summary["bayes_qcal_score_loss_corr"] = self._safe_pearson_corr(
+            scores,
+            losses,
+            eps=self.precision_quality_eps,
+        )
+        summary["bayes_qcal_score_usage_corr"] = self._safe_pearson_corr(
+            scores,
+            usages,
+            eps=self.precision_quality_eps,
+        )
+        summary["bayes_qcal_precision_improvement_corr_before"] = self._safe_pearson_corr(
+            precision_before,
+            improvements,
+            eps=self.precision_quality_eps,
+        )
+        summary["bayes_qcal_precision_improvement_corr_after"] = self._safe_pearson_corr(
+            precision_after,
+            improvements,
+            eps=self.precision_quality_eps,
+        )
+        summary["bayes_qcal_precision_loss_corr_before"] = self._safe_pearson_corr(
+            precision_before,
+            losses,
+            eps=self.precision_quality_eps,
+        )
+        summary["bayes_qcal_precision_loss_corr_after"] = self._safe_pearson_corr(
+            precision_after,
+            losses,
+            eps=self.precision_quality_eps,
+        )
+        summary["bayes_qcal_precision_usage_corr_before"] = self._safe_pearson_corr(
+            precision_before,
+            usages,
+            eps=self.precision_quality_eps,
+        )
+        summary["bayes_qcal_precision_usage_corr_after"] = self._safe_pearson_corr(
+            precision_after,
+            usages,
+            eps=self.precision_quality_eps,
+        )
+        return summary
 
     def _summarize_mean_update(self, global_state, optimized_mean_state, expert_keys):
         if global_state is None or optimized_mean_state is None:
@@ -1699,6 +2245,7 @@ class ExpertBayesMetaAggregator(Aggregator):
         global_state=None,
         optimized_mean_state=None,
         reliability_summary=None,
+        precision_quality_summary=None,
     ):
         if optimized_log_precision_state is None:
             log_precision_state = prior_state.get("log_precision_state", {})
@@ -1760,6 +2307,63 @@ class ExpertBayesMetaAggregator(Aggregator):
             metric["log_n0_device"] = str(optimized_log_n0.device)
         metric.update(payload_summary)
         metric.update(update_summary)
+        if self.evidence_quality_diag:
+            evidence_quality_summary = self._summarize_evidence_quality(
+                client_payloads=client_payloads,
+                expert_keys=expert_keys,
+            )
+            metric.update(evidence_quality_summary)
+            if self.evidence_quality_diag_detail:
+                print(
+                    "[BayesEvidenceQualityDiag] "
+                    f"expert={layer_id}.{expert_id} "
+                    f"quality_count={metric.get('bayes_evidence_quality_count')} "
+                    f"global_loss_mean={metric.get('bayes_evidence_global_loss_mean')} "
+                    f"local_loss_mean={metric.get('bayes_evidence_local_loss_mean')} "
+                    f"loss_improvement_mean={metric.get('bayes_evidence_loss_improvement_mean')} "
+                    f"global_acc_mean={metric.get('bayes_evidence_global_acc_mean')} "
+                    f"local_acc_mean={metric.get('bayes_evidence_local_acc_mean')} "
+                    f"acc_improvement_mean={metric.get('bayes_evidence_acc_improvement_mean')} "
+                    f"bad_fraction={metric.get('bayes_evidence_bad_fraction')} "
+                    f"precision_loss_corr={metric.get('bayes_evidence_precision_loss_corr')} "
+                    f"precision_improvement_corr="
+                    f"{metric.get('bayes_evidence_precision_improvement_corr')} "
+                    f"precision_usage_corr={metric.get('bayes_evidence_precision_usage_corr')} "
+                    f"precision_delta_norm_corr="
+                    f"{metric.get('bayes_evidence_precision_delta_norm_corr')}"
+                )
+        if self.precision_quality_diag or self.precision_quality_calibration:
+            if precision_quality_summary is None:
+                precision_quality_summary = self._empty_precision_quality_summary(
+                    enabled=self.precision_quality_calibration
+                )
+            metric.update(precision_quality_summary)
+            if (
+                self.precision_quality_calibration
+                and self.precision_quality_diag
+                and self.evidence_quality_diag_detail
+            ):
+                print(
+                    "[BayesQualityCalibratedPrecision] "
+                    f"expert_key={layer_id}.{expert_id} "
+                    f"qcal_count={metric.get('bayes_qcal_count')} "
+                    f"missing_quality_count={metric.get('bayes_qcal_missing_quality_count')} "
+                    f"score_mean={metric.get('bayes_qcal_score_mean')} "
+                    f"score_std={metric.get('bayes_qcal_score_std')} "
+                    f"score_min={metric.get('bayes_qcal_score_min')} "
+                    f"score_max={metric.get('bayes_qcal_score_max')} "
+                    f"precision_mean_before={metric.get('bayes_qcal_precision_mean_before')} "
+                    f"precision_mean_after={metric.get('bayes_qcal_precision_mean_after')} "
+                    f"score_improvement_corr={metric.get('bayes_qcal_score_improvement_corr')} "
+                    f"precision_improvement_corr_before="
+                    f"{metric.get('bayes_qcal_precision_improvement_corr_before')} "
+                    f"precision_improvement_corr_after="
+                    f"{metric.get('bayes_qcal_precision_improvement_corr_after')} "
+                    f"precision_loss_corr_before="
+                    f"{metric.get('bayes_qcal_precision_loss_corr_before')} "
+                    f"precision_loss_corr_after="
+                    f"{metric.get('bayes_qcal_precision_loss_corr_after')}"
+                )
         if self.effective_weight_diag:
             effective_weight_summary = self._summarize_effective_bayes_weights(
                 client_payloads=client_payloads,
@@ -1852,6 +2456,19 @@ class ExpertBayesMetaAggregator(Aggregator):
             "bayes_fisher_time_sec",
             "bayes_fisher_forward_backward_time_sec",
             "bayes_evidence_cache_time_sec",
+            "evidence_global_loss",
+            "evidence_local_loss",
+            "evidence_loss_improvement",
+            "evidence_global_acc",
+            "evidence_local_acc",
+            "evidence_acc_improvement",
+            "evidence_bad",
+            "local_precision_mean",
+            "precision_mean",
+            "routed_tokens",
+            "usage_weight",
+            "param_delta_norm",
+            "delta_norm",
         ]
         payloads = []
         for client_evidence in expert_evidence:

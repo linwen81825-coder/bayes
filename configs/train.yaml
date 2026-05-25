@@ -323,6 +323,23 @@ bayes_effective_weight_diag: false
 # 开启后每个 expert 打印一条 [BayesEffWeightDiag] detail；默认关闭避免日志过长。
 bayes_effective_weight_diag_detail: false
 
+# Evidence quality 诊断，默认关闭；只复用已有 evidence cache 做额外 global/local eval。
+bayes_evidence_quality_diag: false
+bayes_evidence_quality_diag_detail: false
+bayes_evidence_quality_eps: 1.0e-12
+
+# Quality-calibrated precision，默认关闭；仅在 server 聚合阶段按 evidence quality 缩放 local precision。
+bayes_precision_quality_calibration: false
+bayes_precision_quality_metric: loss_improvement
+bayes_precision_quality_center: median
+bayes_precision_quality_scale: mad
+bayes_precision_quality_temperature: 1.0
+bayes_precision_quality_score_min: 0.5
+bayes_precision_quality_score_max: 2.0
+bayes_precision_quality_missing_score: 1.0
+bayes_precision_quality_eps: 1.0e-12
+bayes_precision_quality_diag: true
+
 # reliability_robust client weight mode 参数；仅当 bayes_client_weight_mode=reliability_robust 时影响 meta loss。
 # 权重按 expert-level usage、local precision 和 update delta robust score 预计算，不改变 posterior 公式。
 bayes_reliability_usage_power: 0.5

@@ -165,6 +165,9 @@ class Client:
             raise ValueError("bayes_laplace_map_steps must be >= 1")
         self.bayes_evidence_batches = max(int(getattr(self.args, "bayes_evidence_batches", 8)), 1)
         self.bayes_evidence_log_detail = bool(getattr(self.args, "bayes_evidence_log_detail", False))
+        self.bayes_evidence_quality_diag = bool(
+            getattr(self.args, "bayes_evidence_quality_diag", False)
+        )
         self.bayes_sgld_concat_cache = bool(getattr(self.args, "bayes_sgld_concat_cache", False))
         self.bayes_empty_cache_after_client_evidence = bool(
             getattr(self.args, "bayes_empty_cache_after_client_evidence", False)
@@ -448,6 +451,118 @@ class Client:
         }
         evidence_model.load_state_dict(cpu_state_dict)
         return evidence_model
+
+    def build_global_evidence_model(self):
+        evidence_model = build_model_from_args(self.args)
+        if self.server_state_dict is not None:
+            server_state_dict = self.server_state_dict
+        else:
+            server_state_dict = torch.load(
+                self.args.model_save_path + "/server.pth",
+                map_location="cpu",
+            )
+        cpu_state_dict = {
+            key: value.detach().cpu().clone()
+            for key, value in server_state_dict.items()
+        }
+        evidence_model.load_state_dict(cpu_state_dict)
+        return evidence_model
+
+    def should_run_bayes_evidence_quality_diag(self):
+        return (
+            getattr(self.args, "agg_method", "") == "expert_bayes_meta"
+            and self.bayes_evidence_quality_diag
+        )
+
+    def empty_evidence_quality_diag(self):
+        return {
+            "evidence_global_loss": None,
+            "evidence_local_loss": None,
+            "evidence_loss_improvement": None,
+            "evidence_global_acc": None,
+            "evidence_local_acc": None,
+            "evidence_acc_improvement": None,
+            "evidence_bad": None,
+        }
+
+    def extract_logits(self, model_result):
+        if isinstance(model_result, dict):
+            return model_result["logits"]
+        return model_result
+
+    def evaluate_cached_evidence_batches(self, model, batch_cache):
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+        for cached_inputs, cached_labels in batch_cache:
+            if cached_labels.numel() == 0:
+                continue
+            inputs = cached_inputs.to(self.device, non_blocking=True)
+            labels = cached_labels.to(self.device, non_blocking=True)
+            logits = self.extract_logits(model(inputs))
+            batch_size = int(labels.size(0))
+            loss = self.criterion(logits, labels)
+            total_loss += float(loss.detach().item()) * batch_size
+            total_correct += int((logits.argmax(dim=1) == labels).sum().item())
+            total_samples += batch_size
+
+        if total_samples <= 0:
+            return None
+        return {
+            "loss": total_loss / float(total_samples),
+            "acc": total_correct / float(total_samples),
+        }
+
+    def compute_evidence_quality_diag(self, global_model, local_model, batch_cache):
+        quality = self.empty_evidence_quality_diag()
+        if (
+            not self.should_run_bayes_evidence_quality_diag()
+            or global_model is None
+            or local_model is None
+            or not batch_cache
+        ):
+            return quality
+
+        global_was_training = bool(global_model.training)
+        local_was_training = bool(local_model.training)
+        try:
+            global_model.eval()
+            local_model.eval()
+            with torch.no_grad():
+                global_stats = self.evaluate_cached_evidence_batches(global_model, batch_cache)
+                local_stats = self.evaluate_cached_evidence_batches(local_model, batch_cache)
+            if global_stats is None or local_stats is None:
+                return quality
+
+            global_loss = float(global_stats["loss"])
+            local_loss = float(local_stats["loss"])
+            global_acc = float(global_stats["acc"])
+            local_acc = float(local_stats["acc"])
+            if not all(math.isfinite(value) for value in [global_loss, local_loss, global_acc, local_acc]):
+                return quality
+            quality.update(
+                {
+                    "evidence_global_loss": round(global_loss, 6),
+                    "evidence_local_loss": round(local_loss, 6),
+                    "evidence_loss_improvement": round(global_loss - local_loss, 6),
+                    "evidence_global_acc": round(global_acc, 6),
+                    "evidence_local_acc": round(local_acc, 6),
+                    "evidence_acc_improvement": round(local_acc - global_acc, 6),
+                    "evidence_bad": bool(local_loss > global_loss),
+                }
+            )
+        except Exception:
+            return quality
+        finally:
+            if global_was_training:
+                global_model.train()
+            else:
+                global_model.eval()
+            if local_was_training:
+                local_model.train()
+            else:
+                local_model.eval()
+        return quality
 
     def get_expert_param_prefix(self, layer_id, expert_id):
         return f"blocks.{layer_id}.ffn.experts.{expert_id}."
@@ -745,6 +860,8 @@ class Client:
         slow_fisher_forward_backward_calls = 0
         total_start_time = time.perf_counter()
         evidence_model = None
+        global_evidence_model = None
+        quality_diag_enabled = self.should_run_bayes_evidence_quality_diag()
         fast_fisher_results = {}
         fast_fisher_stats = {}
         fast_fisher_used = False
@@ -763,6 +880,12 @@ class Client:
                 evidence_model = self.build_evidence_model()
                 evidence_model.to(self.device)
                 build_model_sec = time.perf_counter() - build_start_time
+                if quality_diag_enabled:
+                    try:
+                        global_evidence_model = self.build_global_evidence_model()
+                        global_evidence_model.to(self.device)
+                    except Exception:
+                        global_evidence_model = None
 
             if fisher_fast_config and evidence_entries:
                 evidence_stats_by_expert = {}
@@ -828,6 +951,14 @@ class Client:
                     fisher_fallback_reason=fisher_fallback_reason,
                 )
                 sgld_elapsed = time.perf_counter() - sgld_start_time
+                if quality_diag_enabled:
+                    expert_evidence.update(
+                        self.compute_evidence_quality_diag(
+                            global_model=global_evidence_model,
+                            local_model=evidence_model,
+                            batch_cache=batch_cache,
+                        )
+                    )
                 sgld_diag = expert_evidence.get("sgld_diag", {})
                 sgld_time_value = sgld_diag.get("sgld_fit_time_sec")
                 if isinstance(sgld_time_value, (int, float)):
@@ -934,6 +1065,8 @@ class Client:
         finally:
             if evidence_model is not None:
                 del evidence_model
+            if global_evidence_model is not None:
+                del global_evidence_model
             if (
                 str(self.device).startswith("cuda")
                 and torch.cuda.is_available()
