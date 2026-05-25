@@ -260,6 +260,7 @@ bayes_fisher_model_mode: eval
 # bayes_precision_gamma: 0.5
 # bayes_precision_min: 20.0
 # bayes_precision_max: 300.0
+# bayes_client_weight_mode 可选: uniform / sqrt_usage / usage / reliability_robust
 # bayes_client_weight_mode: uniform
 # bayes_direction_diag: true
 # bayes_direction_diag_detail: false
@@ -313,3 +314,36 @@ bayes_direction_diag: false
 
 # 开启后每个 expert 额外输出一条 detail；默认关闭避免日志过长
 bayes_direction_diag_detail: false
+
+# Bayes effective weight 诊断，默认关闭，不影响 meta loss / posterior / 聚合结果。
+# 用 base client weight 与 local_precision shrinkage fraction 估计每个 client-expert 的有效权重，
+# 用于观察 Bayes 聚合是否退化为 usage / ExpertFedAvg 类似权重。
+bayes_effective_weight_diag: false
+
+# 开启后每个 expert 打印一条 [BayesEffWeightDiag] detail；默认关闭避免日志过长。
+bayes_effective_weight_diag_detail: false
+
+# reliability_robust client weight mode 参数；仅当 bayes_client_weight_mode=reliability_robust 时影响 meta loss。
+# 权重按 expert-level usage、local precision 和 update delta robust score 预计算，不改变 posterior 公式。
+bayes_reliability_usage_power: 0.5
+bayes_reliability_precision_power: 0.5
+bayes_reliability_usage_score_min: 0.5
+bayes_reliability_usage_score_max: 2.0
+bayes_reliability_precision_score_min: 0.5
+bayes_reliability_precision_score_max: 2.0
+bayes_reliability_robust_temperature: 1.0
+bayes_reliability_norm_usage_correction: true
+bayes_reliability_norm_usage_correction_power: 0.5
+bayes_reliability_norm_penalty_z0: 1.0
+bayes_reliability_norm_temperature: 1.0
+bayes_reliability_direction_score: true
+bayes_reliability_direction_temperature: 1.0
+bayes_reliability_direction_min_score: 0.05
+bayes_reliability_normalize_weights: true
+bayes_reliability_min_weight: 0.05
+bayes_reliability_max_weight: 20.0
+bayes_reliability_eps: 1.0e-12
+
+# reliability_robust 诊断；detail=true 时每个 expert 打印 [BayesReliabilityDiag]。
+bayes_reliability_diag: false
+bayes_reliability_diag_detail: false

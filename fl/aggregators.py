@@ -159,13 +159,93 @@ class ExpertBayesMetaAggregator(Aggregator):
         self.client_weight_mode = str(
             getattr(args, "bayes_client_weight_mode", "uniform")
         ).lower()
-        if self.client_weight_mode not in {"uniform", "sqrt_usage", "usage"}:
+        if self.client_weight_mode not in {"uniform", "sqrt_usage", "usage", "reliability_robust"}:
             raise ValueError(
                 "bayes_client_weight_mode must be one of: "
-                "uniform, sqrt_usage, usage"
+                "uniform, sqrt_usage, usage, reliability_robust"
             )
+        self.reliability_usage_power = float(
+            getattr(args, "bayes_reliability_usage_power", 0.5)
+        )
+        self.reliability_precision_power = float(
+            getattr(args, "bayes_reliability_precision_power", 0.5)
+        )
+        self.reliability_eps = max(
+            float(getattr(args, "bayes_reliability_eps", 1.0e-12)),
+            1.0e-12,
+        )
+        self.reliability_robust_temperature = max(
+            float(getattr(args, "bayes_reliability_robust_temperature", 1.0)),
+            self.reliability_eps,
+        )
+        self.reliability_min_weight = max(
+            float(getattr(args, "bayes_reliability_min_weight", 0.05)),
+            self.reliability_eps,
+        )
+        self.reliability_max_weight = max(
+            float(getattr(args, "bayes_reliability_max_weight", 20.0)),
+            self.reliability_min_weight,
+        )
+        self.reliability_usage_score_min = max(
+            float(getattr(args, "bayes_reliability_usage_score_min", 0.5)),
+            self.reliability_eps,
+        )
+        self.reliability_usage_score_max = max(
+            float(getattr(args, "bayes_reliability_usage_score_max", 2.0)),
+            self.reliability_usage_score_min,
+        )
+        self.reliability_precision_score_min = max(
+            float(getattr(args, "bayes_reliability_precision_score_min", 0.5)),
+            self.reliability_eps,
+        )
+        self.reliability_precision_score_max = max(
+            float(getattr(args, "bayes_reliability_precision_score_max", 2.0)),
+            self.reliability_precision_score_min,
+        )
+        self.reliability_norm_usage_correction = bool(
+            getattr(args, "bayes_reliability_norm_usage_correction", True)
+        )
+        self.reliability_norm_usage_correction_power = float(
+            getattr(args, "bayes_reliability_norm_usage_correction_power", 0.5)
+        )
+        self.reliability_norm_penalty_z0 = max(
+            float(getattr(args, "bayes_reliability_norm_penalty_z0", 1.0)),
+            0.0,
+        )
+        self.reliability_norm_temperature = max(
+            float(
+                getattr(
+                    args,
+                    "bayes_reliability_norm_temperature",
+                    getattr(args, "bayes_reliability_robust_temperature", 1.0),
+                )
+            ),
+            self.reliability_eps,
+        )
+        self.reliability_direction_score = bool(
+            getattr(args, "bayes_reliability_direction_score", True)
+        )
+        self.reliability_direction_temperature = max(
+            float(getattr(args, "bayes_reliability_direction_temperature", 1.0)),
+            self.reliability_eps,
+        )
+        self.reliability_direction_min_score = min(
+            max(float(getattr(args, "bayes_reliability_direction_min_score", 0.05)), 0.0),
+            1.0,
+        )
+        self.reliability_normalize_weights = bool(
+            getattr(args, "bayes_reliability_normalize_weights", True)
+        )
+        self.reliability_diag = bool(getattr(args, "bayes_reliability_diag", False))
+        self.reliability_diag_detail = bool(
+            getattr(args, "bayes_reliability_diag_detail", False)
+        )
         self.direction_diag = bool(getattr(args, "bayes_direction_diag", False))
         self.direction_diag_detail = bool(getattr(args, "bayes_direction_diag_detail", False))
+        self.effective_weight_diag = bool(getattr(args, "bayes_effective_weight_diag", False))
+        self.effective_weight_diag_detail = bool(
+            getattr(args, "bayes_effective_weight_diag_detail", False)
+        )
         print(
             "[ExpertBayesMetaAggregator] "
             f"bayes_meta_device={self.meta_device} "
@@ -328,6 +408,21 @@ class ExpertBayesMetaAggregator(Aggregator):
 
         total_usage = sum(payload["usage"] for payload in client_payloads)
         prior_n0 = self._get_prior_n0(prior_state)
+        reliability_weights = None
+        reliability_summary = None
+        if self.client_weight_mode == "reliability_robust" or self.reliability_diag or self.reliability_diag_detail:
+            reliability_weights, reliability_summary = self._compute_reliability_weights(
+                client_payloads=client_payloads,
+                expert_keys=expert_keys,
+                global_state=global_state,
+            )
+            for payload, reliability_weight in zip(client_payloads, reliability_weights):
+                payload["bayes_reliability_weight"] = reliability_weight
+        client_weight_values = (
+            reliability_weights
+            if self.client_weight_mode == "reliability_robust"
+            else None
+        )
         optimized_mean_state, optimized_log_precision_state, optimized_log_n0, local_posterior_count, meta_loss = (
             self._optimize_expert_prior(
                 expert_keys=expert_keys,
@@ -335,6 +430,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                 prior_state=prior_state,
                 prior_n0=prior_n0,
                 client_payloads=client_payloads,
+                client_weight_values=client_weight_values,
                 layer_id=layer_id,
                 expert_id=expert_id,
             )
@@ -364,6 +460,7 @@ class ExpertBayesMetaAggregator(Aggregator):
             client_payloads=client_payloads,
             global_state=global_state,
             optimized_mean_state=optimized_mean_state,
+            reliability_summary=reliability_summary,
         )
         expert_metric["expert_meta_time_sec"] = round(
             time.perf_counter() - expert_start_time,
@@ -378,6 +475,7 @@ class ExpertBayesMetaAggregator(Aggregator):
         prior_state,
         prior_n0,
         client_payloads,
+        client_weight_values=None,
         layer_id=None,
         expert_id=None,
     ):
@@ -458,6 +556,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                 log_precision_params=log_precision_params,
                 log_n0_param=log_n0_param,
                 client_payloads=client_payloads,
+                client_weight_values=client_weight_values,
             )
             if not torch.isfinite(meta_loss).item():
                 encountered_nonfinite = True
@@ -486,6 +585,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                     log_precision_params=log_precision_params,
                     log_n0_param=log_n0_param,
                     client_payloads=client_payloads,
+                    client_weight_values=client_weight_values,
                 )
             if torch.isfinite(final_meta_loss).item():
                 final_meta_loss_value = float(final_meta_loss.detach().cpu().item())
@@ -859,14 +959,634 @@ class ExpertBayesMetaAggregator(Aggregator):
             "param_delta_rel": round(delta_rel, 6),
         }
 
+    def _safe_diag_float(self, value, default=float("nan")):
+        if value is None:
+            return default
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return default
+            value = value.detach().cpu().float().mean().item()
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return default
+        return value if math.isfinite(value) else default
+
+    def _diag_mean(self, values):
+        finite_values = [float(value) for value in values if math.isfinite(float(value))]
+        if not finite_values:
+            return float("nan")
+        return sum(finite_values) / float(len(finite_values))
+
+    def _diag_std(self, values):
+        finite_values = [float(value) for value in values if math.isfinite(float(value))]
+        if not finite_values:
+            return float("nan")
+        mean_value = sum(finite_values) / float(len(finite_values))
+        variance = sum((value - mean_value) ** 2 for value in finite_values) / float(len(finite_values))
+        return math.sqrt(max(variance, 0.0))
+
+    def _diag_min(self, values):
+        finite_values = [float(value) for value in values if math.isfinite(float(value))]
+        return min(finite_values) if finite_values else float("nan")
+
+    def _diag_max(self, values):
+        finite_values = [float(value) for value in values if math.isfinite(float(value))]
+        return max(finite_values) if finite_values else float("nan")
+
+    def _diag_corr(self, left_values, right_values):
+        pairs = [
+            (float(left), float(right))
+            for left, right in zip(left_values, right_values)
+            if math.isfinite(float(left)) and math.isfinite(float(right))
+        ]
+        if len(pairs) < 2:
+            return float("nan")
+        left_mean = sum(left for left, _ in pairs) / float(len(pairs))
+        right_mean = sum(right for _, right in pairs) / float(len(pairs))
+        cov = sum((left - left_mean) * (right - right_mean) for left, right in pairs)
+        left_var = sum((left - left_mean) ** 2 for left, _ in pairs)
+        right_var = sum((right - right_mean) ** 2 for _, right in pairs)
+        denom = math.sqrt(max(left_var * right_var, 0.0))
+        if denom <= 1e-12:
+            return float("nan")
+        return cov / denom
+
+    def _diag_round(self, value, digits=6):
+        value = float(value)
+        if not math.isfinite(value):
+            return float("nan")
+        return round(value, digits)
+
+    def _empty_effective_weight_summary(self):
+        return {
+            "bayes_eff_weight_mean": float("nan"),
+            "bayes_eff_weight_std": float("nan"),
+            "bayes_eff_weight_min": float("nan"),
+            "bayes_eff_weight_max": float("nan"),
+            "bayes_eff_weight_max_ratio": float("nan"),
+            "bayes_eff_weight_entropy": float("nan"),
+            "bayes_eff_local_fraction_mean": float("nan"),
+            "bayes_eff_local_fraction_std": float("nan"),
+            "bayes_eff_base_weight_mean": float("nan"),
+            "bayes_eff_base_weight_std": float("nan"),
+            "bayes_eff_precision_mean": float("nan"),
+            "bayes_eff_precision_std": float("nan"),
+            "bayes_eff_usage_mean": float("nan"),
+            "bayes_eff_usage_std": float("nan"),
+            "bayes_eff_corr_weight_usage": float("nan"),
+            "bayes_eff_corr_weight_precision": float("nan"),
+        }
+
+    def _diag_median(self, values):
+        finite_values = sorted(
+            float(value)
+            for value in values
+            if math.isfinite(float(value))
+        )
+        if not finite_values:
+            return float("nan")
+        mid = len(finite_values) // 2
+        if len(finite_values) % 2:
+            return finite_values[mid]
+        return 0.5 * (finite_values[mid - 1] + finite_values[mid])
+
+    def _empty_reliability_summary(self):
+        return {
+            "bayes_rel_weight_mean": float("nan"),
+            "bayes_rel_weight_std": float("nan"),
+            "bayes_rel_weight_min": float("nan"),
+            "bayes_rel_weight_max": float("nan"),
+            "bayes_rel_weight_max_ratio": float("nan"),
+            "bayes_rel_weight_entropy": float("nan"),
+            "bayes_rel_usage_mean": float("nan"),
+            "bayes_rel_usage_std": float("nan"),
+            "bayes_rel_usage_score_mean": float("nan"),
+            "bayes_rel_usage_score_std": float("nan"),
+            "bayes_rel_precision_mean": float("nan"),
+            "bayes_rel_precision_std": float("nan"),
+            "bayes_rel_precision_score_mean": float("nan"),
+            "bayes_rel_precision_score_std": float("nan"),
+            "bayes_rel_delta_norm_mean": float("nan"),
+            "bayes_rel_delta_norm_std": float("nan"),
+            "bayes_rel_corrected_delta_norm_mean": float("nan"),
+            "bayes_rel_corrected_delta_norm_std": float("nan"),
+            "bayes_rel_norm_score_mean": float("nan"),
+            "bayes_rel_norm_score_std": float("nan"),
+            "bayes_rel_direction_score_mean": float("nan"),
+            "bayes_rel_direction_score_std": float("nan"),
+            "bayes_rel_robust_score_mean": float("nan"),
+            "bayes_rel_robust_score_std": float("nan"),
+            "bayes_rel_corr_weight_usage": float("nan"),
+            "bayes_rel_corr_weight_precision": float("nan"),
+            "bayes_rel_corr_weight_delta_norm": float("nan"),
+            "bayes_rel_corr_weight_corrected_delta_norm": float("nan"),
+            "bayes_rel_corr_weight_direction_score": float("nan"),
+        }
+
+    def _summarize_reliability_weights(
+        self,
+        weights,
+        usage_values,
+        usage_scores,
+        precision_means,
+        precision_scores,
+        delta_norms,
+        corrected_delta_norms,
+        norm_scores,
+        direction_scores,
+    ):
+        if not weights:
+            return self._empty_reliability_summary()
+
+        eps = self.reliability_eps
+        weight_sum = sum(value for value in weights if math.isfinite(value))
+        if weight_sum > eps:
+            probabilities = [max(value, 0.0) / weight_sum for value in weights]
+            max_ratio = max(probabilities) if probabilities else float("nan")
+            entropy = -sum(
+                prob * math.log(max(prob, eps))
+                for prob in probabilities
+                if prob > 0.0
+            )
+        else:
+            max_ratio = float("nan")
+            entropy = float("nan")
+
+        # bayes_rel_robust_score reports the norm-only score. Direction has its own diagnostics.
+        robust_scores = norm_scores
+        return {
+            "bayes_rel_weight_mean": self._diag_round(self._diag_mean(weights)),
+            "bayes_rel_weight_std": self._diag_round(self._diag_std(weights)),
+            "bayes_rel_weight_min": self._diag_round(self._diag_min(weights)),
+            "bayes_rel_weight_max": self._diag_round(self._diag_max(weights)),
+            "bayes_rel_weight_max_ratio": self._diag_round(max_ratio),
+            "bayes_rel_weight_entropy": self._diag_round(entropy),
+            "bayes_rel_usage_mean": self._diag_round(self._diag_mean(usage_values)),
+            "bayes_rel_usage_std": self._diag_round(self._diag_std(usage_values)),
+            "bayes_rel_usage_score_mean": self._diag_round(self._diag_mean(usage_scores)),
+            "bayes_rel_usage_score_std": self._diag_round(self._diag_std(usage_scores)),
+            "bayes_rel_precision_mean": self._diag_round(self._diag_mean(precision_means)),
+            "bayes_rel_precision_std": self._diag_round(self._diag_std(precision_means)),
+            "bayes_rel_precision_score_mean": self._diag_round(self._diag_mean(precision_scores)),
+            "bayes_rel_precision_score_std": self._diag_round(self._diag_std(precision_scores)),
+            "bayes_rel_delta_norm_mean": self._diag_round(self._diag_mean(delta_norms)),
+            "bayes_rel_delta_norm_std": self._diag_round(self._diag_std(delta_norms)),
+            "bayes_rel_corrected_delta_norm_mean": self._diag_round(
+                self._diag_mean(corrected_delta_norms)
+            ),
+            "bayes_rel_corrected_delta_norm_std": self._diag_round(
+                self._diag_std(corrected_delta_norms)
+            ),
+            "bayes_rel_norm_score_mean": self._diag_round(self._diag_mean(norm_scores)),
+            "bayes_rel_norm_score_std": self._diag_round(self._diag_std(norm_scores)),
+            "bayes_rel_direction_score_mean": self._diag_round(
+                self._diag_mean(direction_scores)
+            ),
+            "bayes_rel_direction_score_std": self._diag_round(
+                self._diag_std(direction_scores)
+            ),
+            "bayes_rel_robust_score_mean": self._diag_round(self._diag_mean(robust_scores)),
+            "bayes_rel_robust_score_std": self._diag_round(self._diag_std(robust_scores)),
+            "bayes_rel_corr_weight_usage": self._diag_round(
+                self._diag_corr(weights, usage_values)
+            ),
+            "bayes_rel_corr_weight_precision": self._diag_round(
+                self._diag_corr(weights, precision_means)
+            ),
+            "bayes_rel_corr_weight_delta_norm": self._diag_round(
+                self._diag_corr(weights, delta_norms)
+            ),
+            "bayes_rel_corr_weight_corrected_delta_norm": self._diag_round(
+                self._diag_corr(weights, corrected_delta_norms)
+            ),
+            "bayes_rel_corr_weight_direction_score": self._diag_round(
+                self._diag_corr(weights, direction_scores)
+            ),
+        }
+
+    def _compute_reliability_weights(self, client_payloads, expert_keys, global_state):
+        if not client_payloads:
+            return [], self._empty_reliability_summary()
+
+        eps = self.reliability_eps
+
+        def _get_delta_cpu(payload, key):
+            mean_state = payload.get("mean_state", {})
+            if not isinstance(mean_state, dict):
+                return None
+            local_mean = mean_state.get(key)
+            prior_mean = None if global_state is None else global_state.get(key)
+            if not (
+                torch.is_tensor(local_mean)
+                and torch.is_floating_point(local_mean)
+                and torch.is_tensor(prior_mean)
+                and torch.is_floating_point(prior_mean)
+            ):
+                return None
+            local_mean_value = torch.nan_to_num(
+                local_mean.detach().cpu().float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            prior_mean_value = torch.nan_to_num(
+                prior_mean.detach().cpu().float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            if local_mean_value.shape != prior_mean_value.shape:
+                return None
+            return local_mean_value - prior_mean_value
+
+        records = []
+        with torch.no_grad():
+            for payload in client_payloads:
+                usage = max(self._safe_diag_float(payload.get("usage"), default=1.0), 1.0)
+                precision_state = payload.get("precision_state", {})
+                if not isinstance(precision_state, dict):
+                    precision_state = {}
+
+                delta_sq = 0.0
+                has_delta = False
+                precision_key_means = []
+                for key in expert_keys:
+                    delta_value = _get_delta_cpu(payload, key)
+                    if delta_value is not None:
+                        delta_sq += float(delta_value.square().sum().item())
+                        has_delta = True
+
+                    local_precision = precision_state.get(key)
+                    if torch.is_tensor(local_precision) and torch.is_floating_point(local_precision):
+                        local_precision_value = torch.nan_to_num(
+                            local_precision.detach().cpu().float(),
+                            nan=0.0,
+                            posinf=self.max_precision,
+                            neginf=0.0,
+                        ).clamp_min(eps)
+                        precision_mean = float(local_precision_value.mean().item())
+                        if math.isfinite(precision_mean):
+                            precision_key_means.append(precision_mean)
+
+                delta_norm = math.sqrt(max(delta_sq, 0.0)) if has_delta else float("nan")
+                precision_mean = (
+                    sum(precision_key_means) / float(len(precision_key_means))
+                    if precision_key_means
+                    else float("nan")
+                )
+                records.append(
+                    {
+                        "usage": usage,
+                        "precision_mean": precision_mean,
+                        "delta_norm": delta_norm,
+                    }
+                )
+
+        finite_usages = [
+            record["usage"]
+            for record in records
+            if math.isfinite(record["usage"])
+        ]
+        median_usage = self._diag_median(finite_usages)
+        if not math.isfinite(median_usage) or median_usage <= eps:
+            median_usage = 1.0
+        median_usage = median_usage + eps
+
+        finite_precisions = [
+            record["precision_mean"]
+            for record in records
+            if math.isfinite(record["precision_mean"])
+        ]
+        median_precision = self._diag_median(finite_precisions)
+        if not math.isfinite(median_precision) or median_precision <= eps:
+            median_precision = float("nan")
+
+        for record in records:
+            usage = max(record["usage"], 1.0)
+            usage_rel = usage / median_usage
+            usage_score = usage_rel ** self.reliability_usage_power
+            if not math.isfinite(usage_score):
+                usage_score = 1.0
+            usage_score = max(
+                min(usage_score, self.reliability_usage_score_max),
+                self.reliability_usage_score_min,
+            )
+
+            precision_mean = record["precision_mean"]
+            if math.isfinite(median_precision) and math.isfinite(precision_mean):
+                precision_rel = precision_mean / max(median_precision, eps)
+                precision_score = precision_rel ** self.reliability_precision_power
+            else:
+                precision_rel = float("nan")
+                precision_score = 1.0
+            if not math.isfinite(precision_score):
+                precision_score = 1.0
+            precision_score = max(
+                min(precision_score, self.reliability_precision_score_max),
+                self.reliability_precision_score_min,
+            )
+
+            delta_norm = record["delta_norm"]
+            if math.isfinite(delta_norm):
+                if self.reliability_norm_usage_correction:
+                    corrected_delta_norm = delta_norm / (
+                        (usage_rel + eps) ** self.reliability_norm_usage_correction_power
+                    )
+                else:
+                    corrected_delta_norm = delta_norm
+            else:
+                corrected_delta_norm = float("nan")
+
+            record["usage_rel"] = usage_rel
+            record["usage_score"] = usage_score
+            record["precision_rel"] = precision_rel
+            record["precision_score"] = precision_score
+            record["corrected_delta_norm"] = corrected_delta_norm
+
+        finite_corrected_norms = [
+            record["corrected_delta_norm"]
+            for record in records
+            if math.isfinite(record["corrected_delta_norm"])
+        ]
+        if len(finite_corrected_norms) <= 1:
+            for record in records:
+                record["norm_score"] = 1.0
+        else:
+            median_norm = self._diag_median(finite_corrected_norms)
+            mad_norm = self._diag_median(
+                [abs(value - median_norm) for value in finite_corrected_norms]
+            )
+            mad_norm = mad_norm + eps if math.isfinite(mad_norm) else eps
+            for record in records:
+                corrected_delta_norm = record["corrected_delta_norm"]
+                if not math.isfinite(corrected_delta_norm) or not math.isfinite(median_norm):
+                    norm_score = 1.0
+                else:
+                    norm_z = abs(corrected_delta_norm - median_norm) / max(mad_norm, eps)
+                    norm_excess = max(norm_z - self.reliability_norm_penalty_z0, 0.0)
+                    norm_score = math.exp(-norm_excess / self.reliability_norm_temperature)
+                record["norm_score"] = norm_score if math.isfinite(norm_score) else 1.0
+
+        if self.reliability_direction_score:
+            center_sums = {}
+            center_weight_sums = {}
+            with torch.no_grad():
+                for payload, record in zip(client_payloads, records):
+                    # Include norm_score so an extreme update cannot define the direction center.
+                    center_weight = record["usage_score"] * record["precision_score"] * record["norm_score"]
+                    if not math.isfinite(center_weight) or center_weight <= 0.0:
+                        continue
+                    for key in expert_keys:
+                        delta_value = _get_delta_cpu(payload, key)
+                        if delta_value is None:
+                            continue
+                        if key not in center_sums:
+                            center_sums[key] = torch.zeros_like(delta_value)
+                            center_weight_sums[key] = 0.0
+                        center_sums[key].add_(delta_value, alpha=float(center_weight))
+                        center_weight_sums[key] += float(center_weight)
+
+                center_delta = {}
+                center_norm_sq = 0.0
+                for key, center_sum in center_sums.items():
+                    center_weight_sum = center_weight_sums.get(key, 0.0)
+                    if center_weight_sum <= eps:
+                        continue
+                    center_value = center_sum / float(center_weight_sum)
+                    center_delta[key] = center_value
+                    center_norm_sq += float(center_value.square().sum().item())
+                center_norm = math.sqrt(max(center_norm_sq, 0.0))
+
+                for payload, record in zip(client_payloads, records):
+                    if not center_delta or center_norm <= eps:
+                        direction_score = 1.0
+                    else:
+                        dot_value = 0.0
+                        delta_sq = 0.0
+                        for key, center_value in center_delta.items():
+                            delta_value = _get_delta_cpu(payload, key)
+                            if delta_value is None or delta_value.shape != center_value.shape:
+                                continue
+                            dot_value += float((delta_value * center_value).sum().item())
+                            delta_sq += float(delta_value.square().sum().item())
+                        delta_norm = math.sqrt(max(delta_sq, 0.0))
+                        if delta_norm <= eps:
+                            direction_score = 1.0
+                        else:
+                            cos_value = dot_value / (delta_norm * center_norm + eps)
+                            cos_value = max(min(cos_value, 1.0), -1.0)
+                            direction_score = (cos_value + 1.0) * 0.5
+                            direction_score = max(
+                                min(direction_score, 1.0),
+                                self.reliability_direction_min_score,
+                            )
+                            if self.reliability_direction_temperature != 1.0:
+                                direction_score = direction_score ** (
+                                    1.0 / self.reliability_direction_temperature
+                                )
+                                direction_score = max(
+                                    min(direction_score, 1.0),
+                                    self.reliability_direction_min_score,
+                                )
+                    record["direction_score"] = (
+                        direction_score if math.isfinite(direction_score) else 1.0
+                    )
+        else:
+            for record in records:
+                record["direction_score"] = 1.0
+
+        raw_weights = []
+        for record in records:
+            reliability = (
+                record["usage_score"]
+                * record["precision_score"]
+                * record["norm_score"]
+                * record["direction_score"]
+            )
+            if not math.isfinite(reliability):
+                reliability = 1.0
+            reliability = max(
+                min(reliability, self.reliability_max_weight),
+                self.reliability_min_weight,
+            )
+            raw_weights.append(float(reliability))
+
+        if self.reliability_normalize_weights and raw_weights:
+            mean_weight = self._diag_mean(raw_weights)
+            if not math.isfinite(mean_weight) or mean_weight <= eps:
+                mean_weight = 1.0
+            weights = [
+                max(
+                    min(float(weight) / mean_weight, self.reliability_max_weight),
+                    self.reliability_min_weight,
+                )
+                for weight in raw_weights
+            ]
+        else:
+            weights = raw_weights
+
+        usage_values = [float(record["usage"]) for record in records]
+        usage_scores = [float(record["usage_score"]) for record in records]
+        precision_means = [float(record["precision_mean"]) for record in records]
+        precision_scores = [float(record["precision_score"]) for record in records]
+        delta_norms = [float(record["delta_norm"]) for record in records]
+        corrected_delta_norms = [float(record["corrected_delta_norm"]) for record in records]
+        norm_scores = [float(record["norm_score"]) for record in records]
+        direction_scores = [float(record["direction_score"]) for record in records]
+
+        summary = self._summarize_reliability_weights(
+            weights=weights,
+            usage_values=usage_values,
+            usage_scores=usage_scores,
+            precision_means=precision_means,
+            precision_scores=precision_scores,
+            delta_norms=delta_norms,
+            corrected_delta_norms=corrected_delta_norms,
+            norm_scores=norm_scores,
+            direction_scores=direction_scores,
+        )
+        return weights, summary
+
+    def _summarize_effective_bayes_weights(
+        self,
+        client_payloads,
+        expert_keys,
+        log_precision_state,
+        prior_n0_value,
+    ):
+        if not client_payloads or not expert_keys:
+            return self._empty_effective_weight_summary()
+
+        effective_weights = []
+        local_fraction_means = []
+        base_weights = []
+        precision_means = []
+        usage_values = []
+        eps = 1e-12
+        prior_n0 = min(
+            max(self._safe_diag_float(prior_n0_value, default=self.n0_init), self.min_precision),
+            self.max_n0,
+        )
+
+        with torch.no_grad():
+            for payload in client_payloads:
+                precision_state = payload.get("precision_state", {})
+                if not isinstance(precision_state, dict):
+                    continue
+
+                fraction_sum = 0.0
+                precision_sum = 0.0
+                total_numel = 0
+                for key in expert_keys:
+                    local_precision = precision_state.get(key)
+                    if not torch.is_tensor(local_precision) or not torch.is_floating_point(local_precision):
+                        continue
+                    local_precision = torch.nan_to_num(
+                        local_precision.detach().cpu().float(),
+                        nan=0.0,
+                        posinf=self.max_precision,
+                        neginf=0.0,
+                    ).clamp(min=self.min_precision)
+                    prior_log_precision = log_precision_state.get(key)
+                    if torch.is_tensor(prior_log_precision) and torch.is_floating_point(prior_log_precision):
+                        prior_precision = torch.exp(
+                            prior_log_precision.detach().cpu().float()
+                        ).clamp(min=self.min_precision, max=self.max_precision)
+                        if prior_precision.shape != local_precision.shape:
+                            try:
+                                prior_precision = prior_precision.expand_as(local_precision)
+                            except RuntimeError:
+                                continue
+                    else:
+                        prior_precision = torch.full_like(
+                            local_precision,
+                            fill_value=self.gamma0_init,
+                        )
+
+                    denom = local_precision + prior_n0 * prior_precision + eps
+                    local_fraction = local_precision / denom
+                    total_numel += int(local_fraction.numel())
+                    fraction_sum += float(local_fraction.sum().item())
+                    precision_sum += float(local_precision.sum().item())
+
+                if total_numel <= 0:
+                    continue
+
+                local_fraction_mean = fraction_sum / float(total_numel)
+                precision_mean = precision_sum / float(total_numel)
+                try:
+                    base_weight = float(self._get_client_meta_weight(payload))
+                except Exception:
+                    base_weight = float("nan")
+                if not math.isfinite(base_weight):
+                    continue
+
+                effective_weight = base_weight * local_fraction_mean
+                effective_weights.append(effective_weight)
+                local_fraction_means.append(local_fraction_mean)
+                base_weights.append(base_weight)
+                precision_means.append(precision_mean)
+                usage_values.append(self._safe_diag_float(payload.get("usage"), default=float("nan")))
+
+        if not effective_weights:
+            return self._empty_effective_weight_summary()
+
+        weight_sum = sum(value for value in effective_weights if math.isfinite(value))
+        if weight_sum > eps:
+            probabilities = [max(value, 0.0) / weight_sum for value in effective_weights]
+            max_ratio = max(probabilities) if probabilities else float("nan")
+            entropy = -sum(
+                prob * math.log(max(prob, eps))
+                for prob in probabilities
+                if prob > 0.0
+            )
+        else:
+            max_ratio = float("nan")
+            entropy = float("nan")
+
+        return {
+            "bayes_eff_weight_mean": self._diag_round(self._diag_mean(effective_weights)),
+            "bayes_eff_weight_std": self._diag_round(self._diag_std(effective_weights)),
+            "bayes_eff_weight_min": self._diag_round(self._diag_min(effective_weights)),
+            "bayes_eff_weight_max": self._diag_round(self._diag_max(effective_weights)),
+            "bayes_eff_weight_max_ratio": self._diag_round(max_ratio),
+            "bayes_eff_weight_entropy": self._diag_round(entropy),
+            "bayes_eff_local_fraction_mean": self._diag_round(self._diag_mean(local_fraction_means)),
+            "bayes_eff_local_fraction_std": self._diag_round(self._diag_std(local_fraction_means)),
+            "bayes_eff_base_weight_mean": self._diag_round(self._diag_mean(base_weights)),
+            "bayes_eff_base_weight_std": self._diag_round(self._diag_std(base_weights)),
+            "bayes_eff_precision_mean": self._diag_round(self._diag_mean(precision_means)),
+            "bayes_eff_precision_std": self._diag_round(self._diag_std(precision_means)),
+            "bayes_eff_usage_mean": self._diag_round(self._diag_mean(usage_values)),
+            "bayes_eff_usage_std": self._diag_round(self._diag_std(usage_values)),
+            "bayes_eff_corr_weight_usage": self._diag_round(
+                self._diag_corr(effective_weights, usage_values)
+            ),
+            "bayes_eff_corr_weight_precision": self._diag_round(
+                self._diag_corr(effective_weights, precision_means)
+            ),
+        }
+
     def _get_client_meta_weight(self, payload):
-        usage = max(float(payload.get("usage", 0.0)), 1.0)
+        usage = max(self._safe_diag_float(payload.get("usage"), default=1.0), 1.0)
         if self.client_weight_mode == "uniform":
             return 1.0
         if self.client_weight_mode == "sqrt_usage":
             return math.sqrt(usage)
         if self.client_weight_mode == "usage":
             return usage
+        if self.client_weight_mode == "reliability_robust":
+            reliability_weight = self._safe_diag_float(
+                payload.get("bayes_reliability_weight"),
+                default=1.0,
+            )
+            if not math.isfinite(reliability_weight):
+                reliability_weight = 1.0
+            return max(
+                min(float(reliability_weight), self.reliability_max_weight),
+                self.reliability_min_weight,
+            )
         raise ValueError(f"Unknown bayes_client_weight_mode: {self.client_weight_mode}")
 
     def _compute_expert_meta_loss(
@@ -876,6 +1596,7 @@ class ExpertBayesMetaAggregator(Aggregator):
         log_precision_params,
         log_n0_param,
         client_payloads,
+        client_weight_values=None,
     ):
         zero = next(iter(prior_mean_params.values())).new_tensor(0.0)
         weighted_losses = []
@@ -883,7 +1604,7 @@ class ExpertBayesMetaAggregator(Aggregator):
         local_posterior_count = 0
         prior_n0 = torch.exp(log_n0_param).clamp(min=self.min_precision, max=self.max_n0)
 
-        for payload in client_payloads:
+        for payload_index, payload in enumerate(client_payloads):
             client_loss = zero
             has_local_terms = False
             for key in expert_keys:
@@ -930,11 +1651,19 @@ class ExpertBayesMetaAggregator(Aggregator):
                 local_posterior_count += 1
 
             # uniform 对应算法文档里的 |S_k|^{-1} sum_i；
-            # sqrt_usage / usage 只替换 client evidence 的聚合权重，
+            # sqrt_usage / usage / reliability_robust 只替换 client evidence 的聚合权重，
             # 不改变每个客户端局部 posterior 与二次项的计算公式。
             if has_local_terms:
-                weight = self._get_client_meta_weight(payload)
-                weight_tensor = client_loss.new_tensor(weight)
+                if client_weight_values is not None and payload_index < len(client_weight_values):
+                    weight = self._safe_diag_float(
+                        client_weight_values[payload_index],
+                        default=1.0,
+                    )
+                else:
+                    weight = self._get_client_meta_weight(payload)
+                if not math.isfinite(weight) or weight <= 0.0:
+                    weight = 1.0
+                weight_tensor = client_loss.new_tensor(float(weight))
                 weighted_losses.append(client_loss * weight_tensor)
                 weight_values.append(weight_tensor)
 
@@ -969,6 +1698,7 @@ class ExpertBayesMetaAggregator(Aggregator):
         client_payloads=None,
         global_state=None,
         optimized_mean_state=None,
+        reliability_summary=None,
     ):
         if optimized_log_precision_state is None:
             log_precision_state = prior_state.get("log_precision_state", {})
@@ -1030,6 +1760,45 @@ class ExpertBayesMetaAggregator(Aggregator):
             metric["log_n0_device"] = str(optimized_log_n0.device)
         metric.update(payload_summary)
         metric.update(update_summary)
+        if self.effective_weight_diag:
+            effective_weight_summary = self._summarize_effective_bayes_weights(
+                client_payloads=client_payloads,
+                expert_keys=expert_keys,
+                log_precision_state=log_precision_state,
+                prior_n0_value=n0,
+            )
+            metric.update(effective_weight_summary)
+            if self.effective_weight_diag_detail and client_payloads:
+                print(
+                    "[BayesEffWeightDiag] "
+                    f"layer={layer_id} expert={expert_id} "
+                    f"clients={len(client_payloads)} "
+                    f"eff_mean={metric.get('bayes_eff_weight_mean')} "
+                    f"eff_std={metric.get('bayes_eff_weight_std')} "
+                    f"eff_max_ratio={metric.get('bayes_eff_weight_max_ratio')} "
+                    f"entropy={metric.get('bayes_eff_weight_entropy')} "
+                    f"frac_mean={metric.get('bayes_eff_local_fraction_mean')} "
+                    f"corr_usage={metric.get('bayes_eff_corr_weight_usage')} "
+                    f"corr_precision={metric.get('bayes_eff_corr_weight_precision')}"
+                )
+        if reliability_summary is not None:
+            metric.update(reliability_summary)
+            if self.reliability_diag_detail and client_payloads:
+                print(
+                    "[BayesReliabilityDiag] "
+                    f"layer={layer_id} expert={expert_id} "
+                    f"clients={len(client_payloads)} "
+                    f"weight_mean={metric.get('bayes_rel_weight_mean')} "
+                    f"max_ratio={metric.get('bayes_rel_weight_max_ratio')} "
+                    f"entropy={metric.get('bayes_rel_weight_entropy')} "
+                    f"usage_mean={metric.get('bayes_rel_usage_mean')} "
+                    f"precision_mean={metric.get('bayes_rel_precision_mean')} "
+                    f"delta_norm_mean={metric.get('bayes_rel_delta_norm_mean')} "
+                    f"corrected_delta_norm_mean={metric.get('bayes_rel_corrected_delta_norm_mean')} "
+                    f"norm_mean={metric.get('bayes_rel_norm_score_mean')} "
+                    f"direction_mean={metric.get('bayes_rel_direction_score_mean')} "
+                    f"robust_mean={metric.get('bayes_rel_robust_score_mean')}"
+                )
         return metric
 
     def _collect_client_payloads(self, expert_evidence, layer_id, expert_id):
