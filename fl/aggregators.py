@@ -568,8 +568,9 @@ class ExpertBayesMetaAggregator(Aggregator):
                 expert_keys=expert_keys,
                 global_state=global_state,
             )
-            for payload, reliability_weight in zip(client_payloads, reliability_weights):
-                payload["bayes_reliability_weight"] = reliability_weight
+            if reliability_weights is not None:
+                for payload, reliability_weight in zip(client_payloads, reliability_weights):
+                    payload["bayes_reliability_weight"] = reliability_weight
         client_weight_values = egml_client_weight_values
         if self.client_weight_mode == "reliability_robust":
             client_weight_values = reliability_weights
@@ -1512,6 +1513,8 @@ class ExpertBayesMetaAggregator(Aggregator):
         if not metrics:
             return {}
 
+        total_experts = len(metrics)
+
         def finite_values(field_name):
             values = []
             for metric in metrics:
@@ -1532,6 +1535,14 @@ class ExpertBayesMetaAggregator(Aggregator):
             values = finite_values(field_name)
             return self._diag_round(max(values)) if values else float("nan")
 
+        def count_positive(field_name):
+            count = 0
+            for metric in metrics:
+                value = self._optional_quality_float(metric.get(field_name))
+                if value is not None and value > 0.0:
+                    count += 1
+            return count
+
         fallback_count = 0
         for metric in metrics:
             value = self._optional_quality_float(
@@ -1541,17 +1552,20 @@ class ExpertBayesMetaAggregator(Aggregator):
                 fallback_count += int(round(value))
 
         valid_values = finite_values("bayes_egml_valid_clients_mean")
+        denom = float(max(total_experts, 1))
         return {
             "bayes_egml_valid_clients_mean": self._diag_round(
                 self._diag_mean(valid_values)
             ) if valid_values else float("nan"),
             "bayes_egml_valid_clients_min": int(min(valid_values)) if valid_values else 0,
-            "bayes_egml_skip_expert_ratio": mean_value("bayes_egml_skip_expert_ratio"),
-            "bayes_egml_no_positive_skip_ratio": mean_value(
-                "bayes_egml_no_positive_skip_ratio"
+            "bayes_egml_skip_expert_ratio": self._diag_round(
+                count_positive("bayes_egml_skip_expert_ratio") / denom
             ),
-            "bayes_egml_low_valid_skip_ratio": mean_value(
-                "bayes_egml_low_valid_skip_ratio"
+            "bayes_egml_no_positive_skip_ratio": self._diag_round(
+                count_positive("bayes_egml_no_positive_skip_ratio") / denom
+            ),
+            "bayes_egml_low_valid_skip_ratio": self._diag_round(
+                count_positive("bayes_egml_low_valid_skip_ratio") / denom
             ),
             "bayes_egml_lambda_mean": mean_value("bayes_egml_lambda_mean"),
             "bayes_egml_lambda_max": max_value("bayes_egml_lambda_max"),
