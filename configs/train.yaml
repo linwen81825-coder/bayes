@@ -260,7 +260,7 @@ bayes_fisher_model_mode: eval
 # bayes_precision_gamma: 0.5
 # bayes_precision_min: 20.0
 # bayes_precision_max: 300.0
-# bayes_client_weight_mode 可选: uniform / sqrt_usage / usage / reliability_robust
+# bayes_client_weight_mode 可选: uniform / sqrt_usage / usage / reliability_robust / evidence_gated_mixture_lite_v2
 # bayes_client_weight_mode: uniform
 # bayes_direction_diag: true
 # bayes_direction_diag_detail: false
@@ -327,6 +327,19 @@ bayes_effective_weight_diag_detail: false
 bayes_evidence_quality_diag: false
 bayes_evidence_quality_diag_detail: false
 bayes_evidence_quality_eps: 1.0e-12
+
+# EGML-v2 client mixture；仅当 bayes_client_weight_mode=evidence_gated_mixture_lite_v2 时影响 meta loss。
+bayes_egml_min_routed_samples: 128
+bayes_egml_min_valid_clients: 2
+bayes_egml_quality_metric: relative_loss_improvement
+bayes_egml_q_floor: 0.0
+bayes_egml_lambda_max: 0.35
+bayes_egml_lambda_single_max: 0.12
+bayes_egml_q_ref: 0.30
+bayes_egml_pos_ess_threshold: 2.0
+bayes_egml_eps: 1.0e-12
+bayes_egml_diag: true
+bayes_egml_diag_detail: false
 
 # Quality-calibrated precision，默认关闭；仅在 server 聚合阶段按 evidence quality 缩放 local precision。
 bayes_precision_quality_calibration: false

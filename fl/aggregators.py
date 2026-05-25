@@ -159,11 +159,54 @@ class ExpertBayesMetaAggregator(Aggregator):
         self.client_weight_mode = str(
             getattr(args, "bayes_client_weight_mode", "uniform")
         ).lower()
-        if self.client_weight_mode not in {"uniform", "sqrt_usage", "usage", "reliability_robust"}:
+        if self.client_weight_mode not in {
+            "uniform",
+            "sqrt_usage",
+            "usage",
+            "reliability_robust",
+            "evidence_gated_mixture_lite_v2",
+        }:
             raise ValueError(
                 "bayes_client_weight_mode must be one of: "
-                "uniform, sqrt_usage, usage, reliability_robust"
+                "uniform, sqrt_usage, usage, reliability_robust, "
+                "evidence_gated_mixture_lite_v2"
             )
+        self.egml_min_routed_samples = max(
+            float(getattr(args, "bayes_egml_min_routed_samples", 128.0)),
+            0.0,
+        )
+        self.egml_min_valid_clients = max(
+            int(getattr(args, "bayes_egml_min_valid_clients", 2)),
+            1,
+        )
+        self.egml_quality_metric = str(
+            getattr(args, "bayes_egml_quality_metric", "relative_loss_improvement")
+        ).lower()
+        self.egml_q_floor = float(getattr(args, "bayes_egml_q_floor", 0.0))
+        self.egml_lambda_max = min(
+            max(float(getattr(args, "bayes_egml_lambda_max", 0.35)), 0.0),
+            1.0,
+        )
+        self.egml_lambda_single_max = min(
+            max(float(getattr(args, "bayes_egml_lambda_single_max", 0.12)), 0.0),
+            1.0,
+        )
+        self.egml_q_ref = max(
+            float(getattr(args, "bayes_egml_q_ref", 0.30)),
+            1.0e-12,
+        )
+        self.egml_pos_ess_threshold = max(
+            float(getattr(args, "bayes_egml_pos_ess_threshold", 2.0)),
+            0.0,
+        )
+        self.egml_eps = max(
+            float(getattr(args, "bayes_egml_eps", 1.0e-12)),
+            1.0e-12,
+        )
+        self.egml_diag = bool(getattr(args, "bayes_egml_diag", True))
+        self.egml_diag_detail = bool(getattr(args, "bayes_egml_diag_detail", False))
+        # Runtime-only diagnostic state; it is not restored from checkpoints.
+        self.egml_consecutive_skips = {}
         self.reliability_usage_power = float(
             getattr(args, "bayes_reliability_usage_power", 0.5)
         )
@@ -390,6 +433,13 @@ class ExpertBayesMetaAggregator(Aggregator):
             for key, value in expert_params.items():
                 aggregated_state[key] = value
 
+        if self.client_weight_mode == "evidence_gated_mixture_lite_v2" and self.egml_diag:
+            metrics.update(
+                self._summarize_egml_round_metrics(
+                    metrics["expert_meta_stats"].values()
+                )
+            )
+
         if self.direction_diag:
             direction_summary = self._log_direction_diagnostics(
                 old_expert_state=old_expert_state,
@@ -438,6 +488,14 @@ class ExpertBayesMetaAggregator(Aggregator):
             expert_id=expert_id,
         )
         if len(client_payloads) == 0:
+            egml_summary = None
+            if self.client_weight_mode == "evidence_gated_mixture_lite_v2":
+                egml_summary = self._empty_egml_summary()
+                egml_summary["bayes_egml_skip_expert_ratio"] = 1.0
+                egml_summary["bayes_egml_low_valid_skip_ratio"] = 1.0
+                egml_summary["bayes_egml_consecutive_skip_max"] = (
+                    self._update_egml_consecutive_skip(layer_id, expert_id, skipped=True)
+                )
             expert_metric = self._build_expert_metric(
                 layer_id=layer_id,
                 expert_id=expert_id,
@@ -448,6 +506,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                 status="skipped",
                 expert_keys=expert_keys,
                 client_payloads=client_payloads,
+                egml_summary=egml_summary,
             )
             expert_metric["expert_meta_time_sec"] = round(
                 time.perf_counter() - expert_start_time,
@@ -457,6 +516,47 @@ class ExpertBayesMetaAggregator(Aggregator):
                 key: global_state[key].detach().cpu().clone()
                 for key in expert_keys
             }, 0, 0, expert_metric
+
+        egml_summary = None
+        egml_client_weight_values = None
+        if self.client_weight_mode == "evidence_gated_mixture_lite_v2":
+            (
+                client_payloads,
+                egml_client_weight_values,
+                egml_summary,
+                egml_skip_reason,
+            ) = self._compute_egml_client_mixture(
+                client_payloads=client_payloads,
+                layer_id=layer_id,
+                expert_id=expert_id,
+            )
+            if egml_skip_reason is not None:
+                egml_summary["bayes_egml_consecutive_skip_max"] = (
+                    self._update_egml_consecutive_skip(layer_id, expert_id, skipped=True)
+                )
+                expert_metric = self._build_expert_metric(
+                    layer_id=layer_id,
+                    expert_id=expert_id,
+                    prior_state=prior_state,
+                    meta_loss=None,
+                    contributing_clients=0,
+                    local_posterior_count=0,
+                    status="skipped",
+                    expert_keys=expert_keys,
+                    client_payloads=client_payloads,
+                    egml_summary=egml_summary,
+                )
+                expert_metric["expert_meta_time_sec"] = round(
+                    time.perf_counter() - expert_start_time,
+                    4,
+                )
+                return {
+                    key: global_state[key].detach().cpu().clone()
+                    for key in expert_keys
+                }, 0, 0, expert_metric
+            egml_summary["bayes_egml_consecutive_skip_max"] = (
+                self._update_egml_consecutive_skip(layer_id, expert_id, skipped=False)
+            )
 
         total_usage = sum(payload["usage"] for payload in client_payloads)
         prior_n0 = self._get_prior_n0(prior_state)
@@ -470,11 +570,9 @@ class ExpertBayesMetaAggregator(Aggregator):
             )
             for payload, reliability_weight in zip(client_payloads, reliability_weights):
                 payload["bayes_reliability_weight"] = reliability_weight
-        client_weight_values = (
-            reliability_weights
-            if self.client_weight_mode == "reliability_robust"
-            else None
-        )
+        client_weight_values = egml_client_weight_values
+        if self.client_weight_mode == "reliability_robust":
+            client_weight_values = reliability_weights
         precision_quality_summary = self._empty_precision_quality_summary(
             enabled=self.precision_quality_calibration
         )
@@ -524,6 +622,7 @@ class ExpertBayesMetaAggregator(Aggregator):
             optimized_mean_state=optimized_mean_state,
             reliability_summary=reliability_summary,
             precision_quality_summary=precision_quality_summary,
+            egml_summary=egml_summary,
         )
         expert_metric["expert_meta_time_sec"] = round(
             time.perf_counter() - expert_start_time,
@@ -1204,6 +1303,281 @@ class ExpertBayesMetaAggregator(Aggregator):
             [record["delta_norm"] for record in records],
         )
         return summary
+
+    def _empty_egml_summary(self):
+        return {
+            "bayes_egml_valid_clients_mean": 0.0,
+            "bayes_egml_valid_clients_min": 0,
+            "bayes_egml_skip_expert_ratio": 0.0,
+            "bayes_egml_no_positive_skip_ratio": 0.0,
+            "bayes_egml_low_valid_skip_ratio": 0.0,
+            "bayes_egml_lambda_mean": float("nan"),
+            "bayes_egml_lambda_max": float("nan"),
+            "bayes_egml_pos_ess_mean": float("nan"),
+            "bayes_egml_pos_ess_min": float("nan"),
+            "bayes_egml_pi_max_mean": float("nan"),
+            "bayes_egml_pi_max_max": float("nan"),
+            "bayes_egml_positive_client_frac": float("nan"),
+            "bayes_egml_consecutive_skip_max": 0,
+            "bayes_egml_mixture_l1_from_uniform_mean": float("nan"),
+            "bayes_egml_mixture_l1_from_uniform_max": float("nan"),
+            "bayes_egml_corr_pi_q": float("nan"),
+            "bayes_egml_corr_pi_usage": float("nan"),
+            "bayes_egml_quality_fallback_count": 0,
+            "bayes_egml_invalid_low_routed_frac": 0.0,
+        }
+
+    def _get_egml_routed_samples(self, payload):
+        return self._get_quality_usage_scalar(payload)
+
+    def _get_egml_quality_value(self, payload):
+        global_loss = self._optional_quality_float(payload.get("evidence_global_loss"))
+        local_loss = self._optional_quality_float(payload.get("evidence_local_loss"))
+        loss_improvement = self._optional_quality_float(
+            payload.get("evidence_loss_improvement")
+        )
+
+        if self.egml_quality_metric == "relative_loss_improvement":
+            if global_loss is not None and local_loss is not None:
+                denom = global_loss + self.egml_eps
+                if denom == 0.0:
+                    return None, False
+                q_value = (global_loss - local_loss) / denom
+                return (q_value, False) if math.isfinite(q_value) else (None, False)
+            if loss_improvement is not None:
+                return loss_improvement, True
+            return None, False
+
+        if self.egml_quality_metric in {"loss_improvement", "evidence_loss_improvement"}:
+            if loss_improvement is not None:
+                return loss_improvement, False
+            if global_loss is not None and local_loss is not None:
+                q_value = global_loss - local_loss
+                return (q_value, False) if math.isfinite(q_value) else (None, False)
+            return None, False
+
+        return None, False
+
+    def _compute_egml_client_mixture(self, client_payloads, layer_id, expert_id):
+        summary = self._empty_egml_summary()
+        total_candidates = len(client_payloads)
+        if total_candidates <= 0:
+            summary["bayes_egml_skip_expert_ratio"] = 1.0
+            summary["bayes_egml_low_valid_skip_ratio"] = 1.0
+            return [], [], summary, "low_valid"
+
+        records = []
+        low_routed_count = 0
+        fallback_count = 0
+        for payload in client_payloads:
+            routed_samples = self._get_egml_routed_samples(payload)
+            q_value, used_fallback = self._get_egml_quality_value(payload)
+            if used_fallback and q_value is not None:
+                fallback_count += 1
+
+            low_routed = (
+                routed_samples is None
+                or routed_samples < self.egml_min_routed_samples
+            )
+            if low_routed:
+                low_routed_count += 1
+                continue
+            if q_value is None or not math.isfinite(q_value):
+                continue
+
+            records.append(
+                {
+                    "payload": payload,
+                    "q": float(q_value),
+                    "routed_samples": float(routed_samples),
+                }
+            )
+
+        valid_count = len(records)
+        summary["bayes_egml_valid_clients_mean"] = float(valid_count)
+        summary["bayes_egml_valid_clients_min"] = int(valid_count)
+        summary["bayes_egml_quality_fallback_count"] = int(fallback_count)
+        summary["bayes_egml_invalid_low_routed_frac"] = round(
+            float(low_routed_count) / float(max(total_candidates, 1)),
+            6,
+        )
+
+        if valid_count < self.egml_min_valid_clients:
+            summary["bayes_egml_skip_expert_ratio"] = 1.0
+            summary["bayes_egml_low_valid_skip_ratio"] = 1.0
+            return [record["payload"] for record in records], [], summary, "low_valid"
+
+        a_values = [max(0.0, record["q"] - self.egml_q_floor) for record in records]
+        positive_values = [value for value in a_values if value > 0.0]
+        positive_count = len(positive_values)
+        positive_frac = float(positive_count) / float(max(valid_count, 1))
+        summary["bayes_egml_positive_client_frac"] = self._diag_round(positive_frac)
+
+        sum_a = float(sum(a_values))
+        sum_a_sq = float(sum(value * value for value in a_values))
+        if (
+            not math.isfinite(sum_a)
+            or not math.isfinite(sum_a_sq)
+            or sum_a <= self.egml_eps
+        ):
+            summary["bayes_egml_skip_expert_ratio"] = 1.0
+            summary["bayes_egml_no_positive_skip_ratio"] = 1.0
+            summary["bayes_egml_pos_ess_mean"] = 0.0
+            summary["bayes_egml_pos_ess_min"] = 0.0
+            return [record["payload"] for record in records], [], summary, "no_positive"
+
+        pos_ess = (sum_a * sum_a) / (sum_a_sq + self.egml_eps)
+        mean_a_pos = sum(positive_values) / float(max(positive_count, 1))
+        lambda_value = self.egml_lambda_max * min(
+            max(mean_a_pos / self.egml_q_ref, 0.0),
+            1.0,
+        )
+        if pos_ess < self.egml_pos_ess_threshold:
+            lambda_value = min(lambda_value, self.egml_lambda_single_max)
+        lambda_value = min(max(lambda_value, 0.0), 1.0)
+
+        pi_base = 1.0 / float(valid_count)
+        pi_values = [
+            (1.0 - lambda_value) * pi_base + lambda_value * (value / sum_a)
+            for value in a_values
+        ]
+        pi_sum = float(sum(pi_values))
+        if not math.isfinite(pi_sum) or pi_sum <= self.egml_eps:
+            summary["bayes_egml_skip_expert_ratio"] = 1.0
+            summary["bayes_egml_no_positive_skip_ratio"] = 1.0
+            return [record["payload"] for record in records], [], summary, "no_positive"
+        pi_values = [max(float(value) / pi_sum, 0.0) for value in pi_values]
+        pi_sum = float(sum(pi_values))
+        if pi_sum > self.egml_eps:
+            pi_values = [float(value) / pi_sum for value in pi_values]
+
+        weight_values = [pi_value * float(valid_count) for pi_value in pi_values]
+        q_values = [record["q"] for record in records]
+        usage_values = [record["routed_samples"] for record in records]
+        mixture_l1 = sum(abs(pi_value - pi_base) for pi_value in pi_values)
+        pi_max = max(pi_values) if pi_values else float("nan")
+
+        summary.update(
+            {
+                "bayes_egml_lambda_mean": self._diag_round(lambda_value),
+                "bayes_egml_lambda_max": self._diag_round(lambda_value),
+                "bayes_egml_pos_ess_mean": self._diag_round(pos_ess),
+                "bayes_egml_pos_ess_min": self._diag_round(pos_ess),
+                "bayes_egml_pi_max_mean": self._diag_round(pi_max),
+                "bayes_egml_pi_max_max": self._diag_round(pi_max),
+                "bayes_egml_mixture_l1_from_uniform_mean": self._diag_round(mixture_l1),
+                "bayes_egml_mixture_l1_from_uniform_max": self._diag_round(mixture_l1),
+                "bayes_egml_corr_pi_q": self._diag_round(
+                    self._diag_corr(pi_values, q_values)
+                ),
+                "bayes_egml_corr_pi_usage": self._diag_round(
+                    self._diag_corr(pi_values, usage_values)
+                ),
+            }
+        )
+
+        for record, pi_value, weight_value, a_value in zip(
+            records,
+            pi_values,
+            weight_values,
+            a_values,
+        ):
+            payload = record["payload"]
+            payload["bayes_egml_q"] = record["q"]
+            payload["bayes_egml_positive_mass"] = a_value
+            payload["bayes_egml_pi"] = pi_value
+            payload["bayes_egml_weight"] = weight_value
+            payload["bayes_egml_routed_samples"] = record["routed_samples"]
+
+        return [record["payload"] for record in records], weight_values, summary, None
+
+    def _update_egml_consecutive_skip(self, layer_id, expert_id, skipped):
+        expert_key = f"{layer_id}.{expert_id}"
+        if skipped:
+            self.egml_consecutive_skips[expert_key] = (
+                int(self.egml_consecutive_skips.get(expert_key, 0)) + 1
+            )
+        else:
+            self.egml_consecutive_skips[expert_key] = 0
+        if not self.egml_consecutive_skips:
+            return 0
+        return int(max(self.egml_consecutive_skips.values()))
+
+    def _summarize_egml_round_metrics(self, expert_metrics):
+        metrics = [
+            metric
+            for metric in expert_metrics
+            if isinstance(metric, dict) and "bayes_egml_skip_expert_ratio" in metric
+        ]
+        if not metrics:
+            return {}
+
+        def finite_values(field_name):
+            values = []
+            for metric in metrics:
+                value = self._optional_quality_float(metric.get(field_name))
+                if value is not None:
+                    values.append(value)
+            return values
+
+        def mean_value(field_name):
+            values = finite_values(field_name)
+            return self._diag_round(self._diag_mean(values)) if values else float("nan")
+
+        def min_value(field_name):
+            values = finite_values(field_name)
+            return self._diag_round(min(values)) if values else float("nan")
+
+        def max_value(field_name):
+            values = finite_values(field_name)
+            return self._diag_round(max(values)) if values else float("nan")
+
+        fallback_count = 0
+        for metric in metrics:
+            value = self._optional_quality_float(
+                metric.get("bayes_egml_quality_fallback_count")
+            )
+            if value is not None:
+                fallback_count += int(round(value))
+
+        valid_values = finite_values("bayes_egml_valid_clients_mean")
+        return {
+            "bayes_egml_valid_clients_mean": self._diag_round(
+                self._diag_mean(valid_values)
+            ) if valid_values else float("nan"),
+            "bayes_egml_valid_clients_min": int(min(valid_values)) if valid_values else 0,
+            "bayes_egml_skip_expert_ratio": mean_value("bayes_egml_skip_expert_ratio"),
+            "bayes_egml_no_positive_skip_ratio": mean_value(
+                "bayes_egml_no_positive_skip_ratio"
+            ),
+            "bayes_egml_low_valid_skip_ratio": mean_value(
+                "bayes_egml_low_valid_skip_ratio"
+            ),
+            "bayes_egml_lambda_mean": mean_value("bayes_egml_lambda_mean"),
+            "bayes_egml_lambda_max": max_value("bayes_egml_lambda_max"),
+            "bayes_egml_pos_ess_mean": mean_value("bayes_egml_pos_ess_mean"),
+            "bayes_egml_pos_ess_min": min_value("bayes_egml_pos_ess_min"),
+            "bayes_egml_pi_max_mean": mean_value("bayes_egml_pi_max_mean"),
+            "bayes_egml_pi_max_max": max_value("bayes_egml_pi_max_max"),
+            "bayes_egml_positive_client_frac": mean_value(
+                "bayes_egml_positive_client_frac"
+            ),
+            "bayes_egml_consecutive_skip_max": int(
+                max(self.egml_consecutive_skips.values())
+            ) if self.egml_consecutive_skips else 0,
+            "bayes_egml_mixture_l1_from_uniform_mean": mean_value(
+                "bayes_egml_mixture_l1_from_uniform_mean"
+            ),
+            "bayes_egml_mixture_l1_from_uniform_max": max_value(
+                "bayes_egml_mixture_l1_from_uniform_max"
+            ),
+            "bayes_egml_corr_pi_q": mean_value("bayes_egml_corr_pi_q"),
+            "bayes_egml_corr_pi_usage": mean_value("bayes_egml_corr_pi_usage"),
+            "bayes_egml_quality_fallback_count": int(fallback_count),
+            "bayes_egml_invalid_low_routed_frac": mean_value(
+                "bayes_egml_invalid_low_routed_frac"
+            ),
+        }
 
     def _empty_precision_quality_summary(self, enabled=None):
         return {
@@ -2133,6 +2507,14 @@ class ExpertBayesMetaAggregator(Aggregator):
                 min(float(reliability_weight), self.reliability_max_weight),
                 self.reliability_min_weight,
             )
+        if self.client_weight_mode == "evidence_gated_mixture_lite_v2":
+            egml_weight = self._safe_diag_float(
+                payload.get("bayes_egml_weight"),
+                default=1.0,
+            )
+            if not math.isfinite(egml_weight) or egml_weight <= 0.0:
+                egml_weight = 1.0
+            return float(egml_weight)
         raise ValueError(f"Unknown bayes_client_weight_mode: {self.client_weight_mode}")
 
     def _compute_expert_meta_loss(
@@ -2197,7 +2579,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                 local_posterior_count += 1
 
             # uniform 对应算法文档里的 |S_k|^{-1} sum_i；
-            # sqrt_usage / usage / reliability_robust 只替换 client evidence 的聚合权重，
+            # sqrt_usage / usage / reliability_robust / evidence_gated_mixture_lite_v2 只替换 client evidence 的聚合权重，
             # 不改变每个客户端局部 posterior 与二次项的计算公式。
             if has_local_terms:
                 if client_weight_values is not None and payload_index < len(client_weight_values):
@@ -2246,6 +2628,7 @@ class ExpertBayesMetaAggregator(Aggregator):
         optimized_mean_state=None,
         reliability_summary=None,
         precision_quality_summary=None,
+        egml_summary=None,
     ):
         if optimized_log_precision_state is None:
             log_precision_state = prior_state.get("log_precision_state", {})
@@ -2307,6 +2690,24 @@ class ExpertBayesMetaAggregator(Aggregator):
             metric["log_n0_device"] = str(optimized_log_n0.device)
         metric.update(payload_summary)
         metric.update(update_summary)
+        if egml_summary is not None and self.egml_diag:
+            metric.update(egml_summary)
+            if self.egml_diag_detail:
+                print(
+                    "[BayesEGMLDiag] "
+                    f"layer={layer_id} expert={expert_id} status={status} "
+                    f"valid={metric.get('bayes_egml_valid_clients_mean')} "
+                    f"skip={metric.get('bayes_egml_skip_expert_ratio')} "
+                    f"no_positive={metric.get('bayes_egml_no_positive_skip_ratio')} "
+                    f"low_valid={metric.get('bayes_egml_low_valid_skip_ratio')} "
+                    f"lambda={metric.get('bayes_egml_lambda_mean')} "
+                    f"pos_ess={metric.get('bayes_egml_pos_ess_mean')} "
+                    f"pi_max={metric.get('bayes_egml_pi_max_mean')} "
+                    f"l1_uniform={metric.get('bayes_egml_mixture_l1_from_uniform_mean')} "
+                    f"fallbacks={metric.get('bayes_egml_quality_fallback_count')} "
+                    f"low_routed_frac={metric.get('bayes_egml_invalid_low_routed_frac')} "
+                    f"consecutive_skip_max={metric.get('bayes_egml_consecutive_skip_max')}"
+                )
         if self.evidence_quality_diag:
             evidence_quality_summary = self._summarize_evidence_quality(
                 client_payloads=client_payloads,
