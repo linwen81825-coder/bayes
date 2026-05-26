@@ -213,6 +213,10 @@ class ExpertBayesMetaAggregator(Aggregator):
             float(getattr(args, "bayes_egml_cross_eps", 1.0e-12)),
             1.0e-12,
         )
+        self.egml_cross_baseline_floor = max(
+            float(getattr(args, "bayes_egml_cross_baseline_floor", 1.0e-6)),
+            self.egml_cross_eps,
+        )
         egml_cross_max_param_tensors = getattr(
             args,
             "bayes_egml_cross_max_param_tensors",
@@ -1360,6 +1364,12 @@ class ExpertBayesMetaAggregator(Aggregator):
             "bayes_egml_cross_valid_q_count": 0,
             "bayes_egml_cross_invalid_q_count": 0,
             "bayes_egml_cross_leave_one_out_enabled": False,
+            "bayes_egml_cross_candidate_source_counts": {},
+            "bayes_egml_cross_candidate_source_posterior_frac": float("nan"),
+            "bayes_egml_cross_candidate_source_mean_state_frac": float("nan"),
+            "bayes_egml_cross_empty_candidate_count": 0,
+            "bayes_egml_cross_baseline_near_zero_count": 0,
+            "bayes_egml_cross_q_abs_max": float("nan"),
         }
 
     def _get_egml_routed_samples(self, payload):
@@ -1513,11 +1523,20 @@ class ExpertBayesMetaAggregator(Aggregator):
             "bayes_egml_cross_leave_one_out_enabled": bool(
                 self.egml_cross_leave_one_out
             ),
+            "bayes_egml_cross_candidate_source_counts": {},
+            "bayes_egml_cross_candidate_source_posterior_frac": float("nan"),
+            "bayes_egml_cross_candidate_source_mean_state_frac": float("nan"),
+            "bayes_egml_cross_empty_candidate_count": 0,
+            "bayes_egml_cross_baseline_near_zero_count": 0,
+            "bayes_egml_cross_q_abs_max": float("nan"),
         }
         q_values = []
         baselines = []
         candidate_losses = []
         valid_q_values = []
+        source_counts = collections.Counter()
+        empty_candidate_count = 0
+        baseline_near_zero_count = 0
         expert_keys = self._egml_cross_expert_keys(expert_keys)
         if not valid_payloads or not expert_keys or global_state is None:
             summary["bayes_egml_cross_invalid_q_count"] = len(valid_payloads or [])
@@ -1540,12 +1559,14 @@ class ExpertBayesMetaAggregator(Aggregator):
             else:
                 eval_payloads = valid_payloads
 
-            candidate_state, _ = self._build_egml_cross_candidate_state(
+            candidate_state, source_name = self._build_egml_cross_candidate_state(
                 payload=payload,
                 expert_keys=expert_keys,
                 global_state=global_state,
             )
+            source_counts[str(source_name)] += 1
             if not candidate_state:
+                empty_candidate_count += 1
                 q_values.append(float("nan"))
                 continue
 
@@ -1561,10 +1582,15 @@ class ExpertBayesMetaAggregator(Aggregator):
             )
             if math.isfinite(baseline):
                 baselines.append(baseline)
+                if abs(baseline) < self.egml_cross_baseline_floor:
+                    baseline_near_zero_count += 1
             if math.isfinite(candidate_loss):
                 candidate_losses.append(candidate_loss)
+            if not math.isfinite(baseline) or not math.isfinite(candidate_loss):
+                q_values.append(float("nan"))
+                continue
 
-            denom = abs(baseline) + self.egml_cross_eps
+            denom = max(abs(baseline), self.egml_cross_baseline_floor) + self.egml_cross_eps
             q_value = (baseline - candidate_loss) / denom
             if math.isfinite(q_value):
                 q_values.append(float(q_value))
@@ -1573,8 +1599,36 @@ class ExpertBayesMetaAggregator(Aggregator):
                 q_values.append(float("nan"))
 
         invalid_count = len(q_values) - len(valid_q_values)
+        source_total = sum(source_counts.values())
+        posterior_like_count = sum(
+            count
+            for source_name, count in source_counts.items()
+            if any(
+                token in source_name
+                for token in [
+                    "posterior",
+                    "optimized",
+                    "mean_star",
+                    "local_posterior",
+                    "posterior_state",
+                ]
+            )
+        )
+        mean_state_count = source_counts.get("mean_state", 0)
         summary["bayes_egml_cross_valid_q_count"] = int(len(valid_q_values))
         summary["bayes_egml_cross_invalid_q_count"] = int(max(invalid_count, 0))
+        summary["bayes_egml_cross_candidate_source_counts"] = dict(source_counts)
+        summary["bayes_egml_cross_empty_candidate_count"] = int(empty_candidate_count)
+        summary["bayes_egml_cross_baseline_near_zero_count"] = int(
+            baseline_near_zero_count
+        )
+        if source_total > 0:
+            summary["bayes_egml_cross_candidate_source_posterior_frac"] = self._diag_round(
+                float(posterior_like_count) / float(source_total)
+            )
+            summary["bayes_egml_cross_candidate_source_mean_state_frac"] = self._diag_round(
+                float(mean_state_count) / float(source_total)
+            )
         if valid_q_values:
             summary.update(
                 {
@@ -1586,6 +1640,9 @@ class ExpertBayesMetaAggregator(Aggregator):
                     "bayes_egml_cross_q_positive_frac": self._diag_round(
                         sum(1 for value in valid_q_values if value > 0.0)
                         / float(len(valid_q_values))
+                    ),
+                    "bayes_egml_cross_q_abs_max": self._diag_round(
+                        max(abs(value) for value in valid_q_values)
                     ),
                 }
             )
@@ -1833,6 +1890,26 @@ class ExpertBayesMetaAggregator(Aggregator):
             if value is not None:
                 fallback_count += int(round(value))
 
+        def sum_int_field(field_name):
+            total = 0
+            for metric in metrics:
+                value = self._optional_quality_float(metric.get(field_name))
+                if value is not None:
+                    total += int(round(value))
+            return total
+
+        source_counts = collections.Counter()
+        for metric in metrics:
+            counts = metric.get("bayes_egml_cross_candidate_source_counts")
+            if isinstance(counts, dict):
+                for source_name, count in counts.items():
+                    try:
+                        count_value = int(round(float(count)))
+                    except (TypeError, ValueError):
+                        continue
+                    if count_value > 0:
+                        source_counts[str(source_name)] += count_value
+
         valid_values = finite_values("bayes_egml_valid_clients_mean")
         denom = float(max(total_experts, 1))
         return {
@@ -1894,6 +1971,20 @@ class ExpertBayesMetaAggregator(Aggregator):
             "bayes_egml_cross_leave_one_out_enabled": bool(
                 count_positive("bayes_egml_cross_leave_one_out_enabled")
             ),
+            "bayes_egml_cross_candidate_source_counts": dict(source_counts),
+            "bayes_egml_cross_candidate_source_posterior_frac": mean_value(
+                "bayes_egml_cross_candidate_source_posterior_frac"
+            ),
+            "bayes_egml_cross_candidate_source_mean_state_frac": mean_value(
+                "bayes_egml_cross_candidate_source_mean_state_frac"
+            ),
+            "bayes_egml_cross_empty_candidate_count": sum_int_field(
+                "bayes_egml_cross_empty_candidate_count"
+            ),
+            "bayes_egml_cross_baseline_near_zero_count": sum_int_field(
+                "bayes_egml_cross_baseline_near_zero_count"
+            ),
+            "bayes_egml_cross_q_abs_max": max_value("bayes_egml_cross_q_abs_max"),
         }
 
     def _empty_precision_quality_summary(self, enabled=None):

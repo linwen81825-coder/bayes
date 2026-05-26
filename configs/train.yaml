@@ -341,6 +341,7 @@ bayes_egml_eps: 1.0e-12
 bayes_egml_cross_eta_probe: 0.5
 bayes_egml_cross_leave_one_out: true
 bayes_egml_cross_eps: 1.0e-12
+bayes_egml_cross_baseline_floor: 1.0e-6
 bayes_egml_cross_max_param_tensors: null
 bayes_egml_cross_diag: true
 bayes_egml_diag: true
