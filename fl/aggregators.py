@@ -203,6 +203,29 @@ class ExpertBayesMetaAggregator(Aggregator):
             float(getattr(args, "bayes_egml_eps", 1.0e-12)),
             1.0e-12,
         )
+        self.egml_cross_eta_probe = float(
+            getattr(args, "bayes_egml_cross_eta_probe", 0.5)
+        )
+        self.egml_cross_leave_one_out = bool(
+            getattr(args, "bayes_egml_cross_leave_one_out", True)
+        )
+        self.egml_cross_eps = max(
+            float(getattr(args, "bayes_egml_cross_eps", 1.0e-12)),
+            1.0e-12,
+        )
+        egml_cross_max_param_tensors = getattr(
+            args,
+            "bayes_egml_cross_max_param_tensors",
+            None,
+        )
+        if egml_cross_max_param_tensors is None:
+            self.egml_cross_max_param_tensors = None
+        else:
+            self.egml_cross_max_param_tensors = max(
+                int(egml_cross_max_param_tensors),
+                0,
+            ) or None
+        self.egml_cross_diag = bool(getattr(args, "bayes_egml_cross_diag", True))
         self.egml_diag = bool(getattr(args, "bayes_egml_diag", True))
         self.egml_diag_detail = bool(getattr(args, "bayes_egml_diag_detail", False))
         # Runtime-only diagnostic state; it is not restored from checkpoints.
@@ -529,6 +552,8 @@ class ExpertBayesMetaAggregator(Aggregator):
                 client_payloads=client_payloads,
                 layer_id=layer_id,
                 expert_id=expert_id,
+                expert_keys=expert_keys,
+                global_state=global_state,
             )
             if egml_skip_reason is not None:
                 egml_summary["bayes_egml_consecutive_skip_max"] = (
@@ -1326,6 +1351,15 @@ class ExpertBayesMetaAggregator(Aggregator):
             "bayes_egml_corr_pi_usage": float("nan"),
             "bayes_egml_quality_fallback_count": 0,
             "bayes_egml_invalid_low_routed_frac": 0.0,
+            "bayes_egml_cross_q_mean": float("nan"),
+            "bayes_egml_cross_q_min": float("nan"),
+            "bayes_egml_cross_q_max": float("nan"),
+            "bayes_egml_cross_q_positive_frac": float("nan"),
+            "bayes_egml_cross_baseline_mean": float("nan"),
+            "bayes_egml_cross_candidate_loss_mean": float("nan"),
+            "bayes_egml_cross_valid_q_count": 0,
+            "bayes_egml_cross_invalid_q_count": 0,
+            "bayes_egml_cross_leave_one_out_enabled": False,
         }
 
     def _get_egml_routed_samples(self, payload):
@@ -1359,7 +1393,220 @@ class ExpertBayesMetaAggregator(Aggregator):
 
         return None, False
 
-    def _compute_egml_client_mixture(self, client_payloads, layer_id, expert_id):
+    def _egml_cross_expert_keys(self, expert_keys):
+        if self.egml_cross_max_param_tensors is None:
+            return list(expert_keys or [])
+        return list(expert_keys or [])[: self.egml_cross_max_param_tensors]
+
+    def _get_egml_candidate_source_state(self, payload):
+        for field_name in [
+            "posterior_mean_state",
+            "optimized_mean_state",
+            "mean_star_state",
+            "local_posterior_mean_state",
+            "posterior_state",
+            "mean_state",
+        ]:
+            state = payload.get(field_name)
+            if isinstance(state, dict):
+                return state, field_name
+        return {}, "none"
+
+    def _build_egml_cross_candidate_state(self, payload, expert_keys, global_state):
+        source_state, source_name = self._get_egml_candidate_source_state(payload)
+        candidate_state = {}
+        eta = float(self.egml_cross_eta_probe)
+        with torch.no_grad():
+            for key in self._egml_cross_expert_keys(expert_keys):
+                base_tensor = None if global_state is None else global_state.get(key)
+                source_tensor = source_state.get(key)
+                if not (
+                    torch.is_tensor(base_tensor)
+                    and torch.is_floating_point(base_tensor)
+                    and torch.is_tensor(source_tensor)
+                    and torch.is_floating_point(source_tensor)
+                ):
+                    continue
+                if base_tensor.shape != source_tensor.shape:
+                    continue
+                source_value = source_tensor.detach().float()
+                base_value = base_tensor.detach().to(
+                    device=source_value.device,
+                    dtype=source_value.dtype,
+                )
+                candidate_state[key] = base_value + eta * (source_value - base_value)
+        return candidate_state, source_name
+
+    def _quadratic_surrogate_loss(self, theta_state, evidence_payloads, expert_keys):
+        if not theta_state or not evidence_payloads:
+            return float("nan")
+
+        payload_losses = []
+        with torch.no_grad():
+            for payload in evidence_payloads:
+                mean_state = payload.get("mean_state", {})
+                precision_state = payload.get("precision_state", {})
+                if not isinstance(mean_state, dict) or not isinstance(precision_state, dict):
+                    continue
+
+                tensor_losses = []
+                for key in self._egml_cross_expert_keys(expert_keys):
+                    theta_tensor = theta_state.get(key)
+                    mean_tensor = mean_state.get(key)
+                    precision_tensor = precision_state.get(key)
+                    if not (
+                        torch.is_tensor(theta_tensor)
+                        and torch.is_floating_point(theta_tensor)
+                        and torch.is_tensor(mean_tensor)
+                        and torch.is_floating_point(mean_tensor)
+                        and torch.is_tensor(precision_tensor)
+                        and torch.is_floating_point(precision_tensor)
+                    ):
+                        continue
+                    if theta_tensor.shape != mean_tensor.shape:
+                        continue
+
+                    precision_value = torch.nan_to_num(
+                        precision_tensor.detach().float(),
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    ).clamp_min(0.0)
+                    target_device = precision_value.device
+                    target_dtype = precision_value.dtype
+                    theta_value = theta_tensor.detach().to(
+                        device=target_device,
+                        dtype=target_dtype,
+                    )
+                    mean_value = mean_tensor.detach().to(
+                        device=target_device,
+                        dtype=target_dtype,
+                    )
+                    if precision_value.shape != theta_value.shape:
+                        try:
+                            precision_value = precision_value.expand_as(theta_value)
+                        except RuntimeError:
+                            continue
+
+                    term = 0.5 * precision_value * (theta_value - mean_value).square()
+                    term_value = float(term.mean().detach().item())
+                    if math.isfinite(term_value):
+                        tensor_losses.append(term_value)
+
+                if tensor_losses:
+                    payload_losses.append(sum(tensor_losses) / float(len(tensor_losses)))
+
+        if not payload_losses:
+            return float("nan")
+        return sum(payload_losses) / float(len(payload_losses))
+
+    def _compute_egml_cross_evidence_q(self, expert_keys, valid_payloads, global_state):
+        summary = {
+            "bayes_egml_cross_q_mean": float("nan"),
+            "bayes_egml_cross_q_min": float("nan"),
+            "bayes_egml_cross_q_max": float("nan"),
+            "bayes_egml_cross_q_positive_frac": float("nan"),
+            "bayes_egml_cross_baseline_mean": float("nan"),
+            "bayes_egml_cross_candidate_loss_mean": float("nan"),
+            "bayes_egml_cross_valid_q_count": 0,
+            "bayes_egml_cross_invalid_q_count": 0,
+            "bayes_egml_cross_leave_one_out_enabled": bool(
+                self.egml_cross_leave_one_out
+            ),
+        }
+        q_values = []
+        baselines = []
+        candidate_losses = []
+        valid_q_values = []
+        expert_keys = self._egml_cross_expert_keys(expert_keys)
+        if not valid_payloads or not expert_keys or global_state is None:
+            summary["bayes_egml_cross_invalid_q_count"] = len(valid_payloads or [])
+            return [float("nan") for _ in valid_payloads], summary
+
+        global_theta = {
+            key: global_state.get(key)
+            for key in expert_keys
+            if torch.is_tensor(global_state.get(key))
+            and torch.is_floating_point(global_state.get(key))
+        }
+
+        for payload_index, payload in enumerate(valid_payloads):
+            if self.egml_cross_leave_one_out and len(valid_payloads) > 1:
+                eval_payloads = [
+                    other_payload
+                    for other_index, other_payload in enumerate(valid_payloads)
+                    if other_index != payload_index
+                ]
+            else:
+                eval_payloads = valid_payloads
+
+            candidate_state, _ = self._build_egml_cross_candidate_state(
+                payload=payload,
+                expert_keys=expert_keys,
+                global_state=global_state,
+            )
+            if not candidate_state:
+                q_values.append(float("nan"))
+                continue
+
+            baseline = self._quadratic_surrogate_loss(
+                theta_state=global_theta,
+                evidence_payloads=eval_payloads,
+                expert_keys=expert_keys,
+            )
+            candidate_loss = self._quadratic_surrogate_loss(
+                theta_state=candidate_state,
+                evidence_payloads=eval_payloads,
+                expert_keys=expert_keys,
+            )
+            if math.isfinite(baseline):
+                baselines.append(baseline)
+            if math.isfinite(candidate_loss):
+                candidate_losses.append(candidate_loss)
+
+            denom = abs(baseline) + self.egml_cross_eps
+            q_value = (baseline - candidate_loss) / denom
+            if math.isfinite(q_value):
+                q_values.append(float(q_value))
+                valid_q_values.append(float(q_value))
+            else:
+                q_values.append(float("nan"))
+
+        invalid_count = len(q_values) - len(valid_q_values)
+        summary["bayes_egml_cross_valid_q_count"] = int(len(valid_q_values))
+        summary["bayes_egml_cross_invalid_q_count"] = int(max(invalid_count, 0))
+        if valid_q_values:
+            summary.update(
+                {
+                    "bayes_egml_cross_q_mean": self._diag_round(
+                        self._diag_mean(valid_q_values)
+                    ),
+                    "bayes_egml_cross_q_min": self._diag_round(min(valid_q_values)),
+                    "bayes_egml_cross_q_max": self._diag_round(max(valid_q_values)),
+                    "bayes_egml_cross_q_positive_frac": self._diag_round(
+                        sum(1 for value in valid_q_values if value > 0.0)
+                        / float(len(valid_q_values))
+                    ),
+                }
+            )
+        if baselines:
+            summary["bayes_egml_cross_baseline_mean"] = self._diag_round(
+                self._diag_mean(baselines)
+            )
+        if candidate_losses:
+            summary["bayes_egml_cross_candidate_loss_mean"] = self._diag_round(
+                self._diag_mean(candidate_losses)
+            )
+        return q_values, summary
+
+    def _compute_egml_client_mixture(
+        self,
+        client_payloads,
+        layer_id,
+        expert_id,
+        expert_keys=None,
+        global_state=None,
+    ):
         summary = self._empty_egml_summary()
         total_candidates = len(client_payloads)
         if total_candidates <= 0:
@@ -1370,29 +1617,64 @@ class ExpertBayesMetaAggregator(Aggregator):
         records = []
         low_routed_count = 0
         fallback_count = 0
-        for payload in client_payloads:
-            routed_samples = self._get_egml_routed_samples(payload)
-            q_value, used_fallback = self._get_egml_quality_value(payload)
-            if used_fallback and q_value is not None:
-                fallback_count += 1
+        if self.egml_quality_metric == "cross_evidence_utility":
+            routed_records = []
+            for payload in client_payloads:
+                routed_samples = self._get_egml_routed_samples(payload)
+                low_routed = (
+                    routed_samples is None
+                    or routed_samples < self.egml_min_routed_samples
+                )
+                if low_routed:
+                    low_routed_count += 1
+                    continue
+                routed_records.append(
+                    {
+                        "payload": payload,
+                        "routed_samples": float(routed_samples),
+                    }
+                )
 
-            low_routed = (
-                routed_samples is None
-                or routed_samples < self.egml_min_routed_samples
+            q_values, cross_summary = self._compute_egml_cross_evidence_q(
+                expert_keys=expert_keys,
+                valid_payloads=[record["payload"] for record in routed_records],
+                global_state=global_state,
             )
-            if low_routed:
-                low_routed_count += 1
-                continue
-            if q_value is None or not math.isfinite(q_value):
-                continue
+            summary.update(cross_summary)
+            for record, q_value in zip(routed_records, q_values):
+                if q_value is None or not math.isfinite(q_value):
+                    continue
+                records.append(
+                    {
+                        "payload": record["payload"],
+                        "q": float(q_value),
+                        "routed_samples": record["routed_samples"],
+                    }
+                )
+        else:
+            for payload in client_payloads:
+                routed_samples = self._get_egml_routed_samples(payload)
+                q_value, used_fallback = self._get_egml_quality_value(payload)
+                if used_fallback and q_value is not None:
+                    fallback_count += 1
 
-            records.append(
-                {
-                    "payload": payload,
-                    "q": float(q_value),
-                    "routed_samples": float(routed_samples),
-                }
-            )
+                low_routed = (
+                    routed_samples is None
+                    or routed_samples < self.egml_min_routed_samples
+                )
+                if low_routed:
+                    low_routed_count += 1
+                    continue
+                if q_value is None or not math.isfinite(q_value):
+                    continue
+
+                records.append(
+                    {
+                        "payload": payload,
+                        "q": float(q_value),
+                        "routed_samples": float(routed_samples),
+                    }
+                )
 
         valid_count = len(records)
         summary["bayes_egml_valid_clients_mean"] = float(valid_count)
@@ -1590,6 +1872,27 @@ class ExpertBayesMetaAggregator(Aggregator):
             "bayes_egml_quality_fallback_count": int(fallback_count),
             "bayes_egml_invalid_low_routed_frac": mean_value(
                 "bayes_egml_invalid_low_routed_frac"
+            ),
+            "bayes_egml_cross_q_mean": mean_value("bayes_egml_cross_q_mean"),
+            "bayes_egml_cross_q_min": min_value("bayes_egml_cross_q_min"),
+            "bayes_egml_cross_q_max": max_value("bayes_egml_cross_q_max"),
+            "bayes_egml_cross_q_positive_frac": mean_value(
+                "bayes_egml_cross_q_positive_frac"
+            ),
+            "bayes_egml_cross_baseline_mean": mean_value(
+                "bayes_egml_cross_baseline_mean"
+            ),
+            "bayes_egml_cross_candidate_loss_mean": mean_value(
+                "bayes_egml_cross_candidate_loss_mean"
+            ),
+            "bayes_egml_cross_valid_q_count": int(
+                sum(finite_values("bayes_egml_cross_valid_q_count"))
+            ),
+            "bayes_egml_cross_invalid_q_count": int(
+                sum(finite_values("bayes_egml_cross_invalid_q_count"))
+            ),
+            "bayes_egml_cross_leave_one_out_enabled": bool(
+                count_positive("bayes_egml_cross_leave_one_out_enabled")
             ),
         }
 
@@ -2884,6 +3187,11 @@ class ExpertBayesMetaAggregator(Aggregator):
             "usage_weight",
             "param_delta_norm",
             "delta_norm",
+            "posterior_mean_state",
+            "optimized_mean_state",
+            "mean_star_state",
+            "local_posterior_mean_state",
+            "posterior_state",
         ]
         payloads = []
         for client_evidence in expert_evidence:
