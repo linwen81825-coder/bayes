@@ -558,6 +558,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                 expert_id=expert_id,
                 expert_keys=expert_keys,
                 global_state=global_state,
+                prior_state=prior_state,
             )
             if egml_skip_reason is not None:
                 egml_summary["bayes_egml_consecutive_skip_max"] = (
@@ -1408,28 +1409,96 @@ class ExpertBayesMetaAggregator(Aggregator):
             return list(expert_keys or [])
         return list(expert_keys or [])[: self.egml_cross_max_param_tensors]
 
-    def _get_egml_candidate_source_state(self, payload):
-        for field_name in [
-            "posterior_mean_state",
-            "optimized_mean_state",
-            "mean_star_state",
-            "local_posterior_mean_state",
-            "posterior_state",
-            "mean_state",
-        ]:
-            state = payload.get(field_name)
-            if isinstance(state, dict):
-                return state, field_name
-        return {}, "none"
+    def _is_finite_tensor(self, value):
+        return bool(torch.isfinite(value).all().item())
 
-    def _build_egml_cross_candidate_state(self, payload, expert_keys, global_state):
-        source_state, source_name = self._get_egml_candidate_source_state(payload)
+    def _build_egml_cross_candidate_state(self, payload, expert_keys, global_state, prior_state):
         candidate_state = {}
         eta = float(self.egml_cross_eta_probe)
+        mean_state = payload.get("mean_state", {})
+        precision_state = payload.get("precision_state", {})
+        if not isinstance(mean_state, dict):
+            mean_state = {}
+        if not isinstance(precision_state, dict):
+            precision_state = {}
+        if not isinstance(prior_state, dict):
+            prior_state = {}
+
+        prior_n0 = self._safe_diag_float(self._get_prior_n0(prior_state), default=self.n0_init)
+        if not math.isfinite(prior_n0) or prior_n0 <= 0.0:
+            prior_n0 = self.n0_init
+        prior_n0 = max(min(float(prior_n0), self.max_n0), self.min_precision)
+
         with torch.no_grad():
             for key in self._egml_cross_expert_keys(expert_keys):
                 base_tensor = None if global_state is None else global_state.get(key)
-                source_tensor = source_state.get(key)
+                mean_tensor = mean_state.get(key)
+                precision_tensor = precision_state.get(key)
+                if not (
+                    torch.is_tensor(base_tensor)
+                    and torch.is_floating_point(base_tensor)
+                    and torch.is_tensor(mean_tensor)
+                    and torch.is_floating_point(mean_tensor)
+                    and torch.is_tensor(precision_tensor)
+                    and torch.is_floating_point(precision_tensor)
+                ):
+                    continue
+                if base_tensor.shape != mean_tensor.shape:
+                    continue
+
+                target_device = mean_tensor.device
+                target_dtype = torch.float32
+                base_value = base_tensor.detach().to(device=target_device, dtype=target_dtype)
+                mean_value = mean_tensor.detach().to(device=target_device, dtype=target_dtype)
+                precision_value = precision_tensor.detach().to(
+                    device=target_device,
+                    dtype=target_dtype,
+                )
+                if precision_value.shape != mean_value.shape:
+                    try:
+                        precision_value = precision_value.expand_as(mean_value)
+                    except RuntimeError:
+                        continue
+
+                prior_precision = self._get_prior_precision(
+                    prior_state,
+                    key,
+                    mean_value,
+                ).detach().to(device=target_device, dtype=target_dtype)
+                if prior_precision.shape != mean_value.shape:
+                    try:
+                        prior_precision = prior_precision.expand_as(mean_value)
+                    except RuntimeError:
+                        continue
+
+                if not (
+                    self._is_finite_tensor(base_value)
+                    and self._is_finite_tensor(mean_value)
+                    and self._is_finite_tensor(precision_value)
+                    and self._is_finite_tensor(prior_precision)
+                ):
+                    continue
+
+                precision_value = precision_value.clamp_min(0.0)
+                prior_precision = prior_precision.clamp_min(self.min_precision)
+                denom = precision_value + float(prior_n0) * prior_precision
+                denom = denom.clamp_min(self.min_precision)
+                posterior_mean = (
+                    precision_value * mean_value
+                    + float(prior_n0) * prior_precision * base_value
+                ) / denom
+                if not self._is_finite_tensor(posterior_mean):
+                    continue
+                candidate_state[key] = base_value + eta * (posterior_mean - base_value)
+
+        if candidate_state:
+            return candidate_state, "posterior_closed_form"
+
+        fallback_state = {}
+        with torch.no_grad():
+            for key in self._egml_cross_expert_keys(expert_keys):
+                base_tensor = None if global_state is None else global_state.get(key)
+                source_tensor = mean_state.get(key)
                 if not (
                     torch.is_tensor(base_tensor)
                     and torch.is_floating_point(base_tensor)
@@ -1439,13 +1508,16 @@ class ExpertBayesMetaAggregator(Aggregator):
                     continue
                 if base_tensor.shape != source_tensor.shape:
                     continue
-                source_value = source_tensor.detach().float()
-                base_value = base_tensor.detach().to(
-                    device=source_value.device,
-                    dtype=source_value.dtype,
-                )
-                candidate_state[key] = base_value + eta * (source_value - base_value)
-        return candidate_state, source_name
+                target_device = source_tensor.device
+                source_value = source_tensor.detach().to(device=target_device, dtype=torch.float32)
+                base_value = base_tensor.detach().to(device=target_device, dtype=torch.float32)
+                if not self._is_finite_tensor(source_value) or not self._is_finite_tensor(base_value):
+                    continue
+                fallback_state[key] = base_value + eta * (source_value - base_value)
+
+        if fallback_state:
+            return fallback_state, "mean_state_fallback"
+        return {}, "missing"
 
     def _quadratic_surrogate_loss(self, theta_state, evidence_payloads, expert_keys):
         if not theta_state or not evidence_payloads:
@@ -1510,7 +1582,7 @@ class ExpertBayesMetaAggregator(Aggregator):
             return float("nan")
         return sum(payload_losses) / float(len(payload_losses))
 
-    def _compute_egml_cross_evidence_q(self, expert_keys, valid_payloads, global_state):
+    def _compute_egml_cross_evidence_q(self, expert_keys, valid_payloads, global_state, prior_state):
         summary = {
             "bayes_egml_cross_q_mean": float("nan"),
             "bayes_egml_cross_q_min": float("nan"),
@@ -1563,6 +1635,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                 payload=payload,
                 expert_keys=expert_keys,
                 global_state=global_state,
+                prior_state=prior_state,
             )
             source_counts[str(source_name)] += 1
             if not candidate_state:
@@ -1570,15 +1643,16 @@ class ExpertBayesMetaAggregator(Aggregator):
                 q_values.append(float("nan"))
                 continue
 
+            candidate_keys = list(candidate_state.keys())
             baseline = self._quadratic_surrogate_loss(
                 theta_state=global_theta,
                 evidence_payloads=eval_payloads,
-                expert_keys=expert_keys,
+                expert_keys=candidate_keys,
             )
             candidate_loss = self._quadratic_surrogate_loss(
                 theta_state=candidate_state,
                 evidence_payloads=eval_payloads,
-                expert_keys=expert_keys,
+                expert_keys=candidate_keys,
             )
             if math.isfinite(baseline):
                 baselines.append(baseline)
@@ -1606,15 +1680,11 @@ class ExpertBayesMetaAggregator(Aggregator):
             if any(
                 token in source_name
                 for token in [
-                    "posterior",
-                    "optimized",
-                    "mean_star",
-                    "local_posterior",
-                    "posterior_state",
+                    "posterior_closed_form",
                 ]
             )
         )
-        mean_state_count = source_counts.get("mean_state", 0)
+        mean_state_count = source_counts.get("mean_state_fallback", 0)
         summary["bayes_egml_cross_valid_q_count"] = int(len(valid_q_values))
         summary["bayes_egml_cross_invalid_q_count"] = int(max(invalid_count, 0))
         summary["bayes_egml_cross_candidate_source_counts"] = dict(source_counts)
@@ -1663,6 +1733,7 @@ class ExpertBayesMetaAggregator(Aggregator):
         expert_id,
         expert_keys=None,
         global_state=None,
+        prior_state=None,
     ):
         summary = self._empty_egml_summary()
         total_candidates = len(client_payloads)
@@ -1696,6 +1767,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                 expert_keys=expert_keys,
                 valid_payloads=[record["payload"] for record in routed_records],
                 global_state=global_state,
+                prior_state=prior_state,
             )
             summary.update(cross_summary)
             for record, q_value in zip(routed_records, q_values):
