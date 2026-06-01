@@ -100,6 +100,18 @@ class Client:
         self.bayes_sgld_timing = str(
             getattr(self.args, "bayes_sgld_timing", "after_train")
         ).lower()
+        self.bayes_sgld_movement_diag = bool(getattr(self.args, "bayes_sgld_movement_diag", False))
+        self.bayes_sgld_movement_diag_detail = bool(
+            getattr(self.args, "bayes_sgld_movement_diag_detail", False)
+        )
+        self.bayes_sgld_stuck_rel_threshold = max(
+            float(getattr(self.args, "bayes_sgld_stuck_rel_threshold", 1.0e-5)),
+            0.0,
+        )
+        self.bayes_sgld_stuck_abs_threshold = max(
+            float(getattr(self.args, "bayes_sgld_stuck_abs_threshold", 1.0e-7)),
+            0.0,
+        )
         self.bayes_precision_mode = str(
             getattr(self.args, "bayes_precision_mode", "floor_inverse")
         ).lower()
@@ -490,6 +502,9 @@ class Client:
                 precision_source=self.bayes_precision_source,
                 sgld_fit_mode=self.bayes_sgld_fit_mode,
                 precision_mode=self.bayes_precision_mode,
+                movement_diag=self.bayes_sgld_movement_diag,
+                stuck_rel_threshold=self.bayes_sgld_stuck_rel_threshold,
+                stuck_abs_threshold=self.bayes_sgld_stuck_abs_threshold,
             )
         finally:
             self.restore_expert_params(evidence_model, expert_backup)
@@ -501,6 +516,60 @@ class Client:
             "precision_state": precision_state,
             "sgld_diag": sgld_diag,
         }
+
+    def format_optional_movement_stat(self, value):
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
+            return "none"
+        return f"{float(value):.6e}"
+
+    def log_bayes_sgld_movement_diag(self, movement_stats_by_expert):
+        if not self.bayes_sgld_movement_diag:
+            return
+
+        valid_stats = [stats for _, _, stats in movement_stats_by_expert if stats.get("is_valid")]
+        invalid_stats = len(movement_stats_by_expert) - len(valid_stats)
+        stuck_experts = sum(1 for stats in valid_stats if stats.get("is_stuck_near_point"))
+        active_experts = len(movement_stats_by_expert)
+
+        def summarize(stat_key, reduce_fn):
+            values = [stats.get(stat_key) for stats in valid_stats]
+            values = [float(value) for value in values if isinstance(value, (int, float)) and math.isfinite(value)]
+            return reduce_fn(values) if values else None
+
+        self.logger.info(
+            f"--client: {self.client_id} --bayes_sgld_movement_diag "
+            f"--evidence_timing:{self.bayes_sgld_timing} "
+            f"--noise_mode:{self.bayes_sgld_fit_mode} "
+            f"--active_experts:{active_experts} "
+            f"--sample_radius_rel_mean:{self.format_optional_movement_stat(summarize('sample_radius_rel', lambda values: sum(values) / len(values)))} "
+            f"--sample_radius_rel_min:{self.format_optional_movement_stat(summarize('sample_radius_rel', min))} "
+            f"--sample_radius_rel_max:{self.format_optional_movement_stat(summarize('sample_radius_rel', max))} "
+            f"--trajectory_drift_rel_mean:{self.format_optional_movement_stat(summarize('trajectory_drift_rel', lambda values: sum(values) / len(values)))} "
+            f"--trajectory_drift_rel_min:{self.format_optional_movement_stat(summarize('trajectory_drift_rel', min))} "
+            f"--trajectory_drift_rel_max:{self.format_optional_movement_stat(summarize('trajectory_drift_rel', max))} "
+            f"--step_delta_rms_mean:{self.format_optional_movement_stat(summarize('step_delta_rms_mean', lambda values: sum(values) / len(values)))} "
+            f"--step_delta_rms_max:{self.format_optional_movement_stat(summarize('step_delta_rms_max', max))} "
+            f"--stuck_experts:{stuck_experts} "
+            f"--stuck_ratio:{stuck_experts / max(active_experts, 1):.6f} "
+            f"--invalid_movement_stats:{invalid_stats}"
+        )
+        if not self.bayes_sgld_movement_diag_detail:
+            return
+
+        for layer_id, expert_id, stats in movement_stats_by_expert:
+            self.logger.info(
+                f"--client: {self.client_id} --bayes_sgld_movement_diag_detail "
+                f"--layer_id:{layer_id} --expert_id:{expert_id} "
+                f"--num_samples:{stats.get('num_samples', 0)} "
+                f"--sample_radius_rms:{self.format_optional_movement_stat(stats.get('sample_radius_rms'))} "
+                f"--sample_radius_rel:{self.format_optional_movement_stat(stats.get('sample_radius_rel'))} "
+                f"--trajectory_drift_rms:{self.format_optional_movement_stat(stats.get('trajectory_drift_rms'))} "
+                f"--trajectory_drift_rel:{self.format_optional_movement_stat(stats.get('trajectory_drift_rel'))} "
+                f"--step_delta_rms_mean:{self.format_optional_movement_stat(stats.get('step_delta_rms_mean'))} "
+                f"--step_delta_rms_max:{self.format_optional_movement_stat(stats.get('step_delta_rms_max'))} "
+                f"--init_to_mean_rel:{self.format_optional_movement_stat(stats.get('init_to_mean_rel'))} "
+                f"--is_stuck_near_point:{str(stats.get('is_stuck_near_point')).lower()}"
+            )
 
     def extract_bayesian_evidence(self, layer_stats, batch_cache_by_expert):
         if not self.should_collect_bayes_evidence():
@@ -527,6 +596,7 @@ class Client:
         evidence_by_layer = {}
         build_model_sec = 0.0
         sgld_times = []
+        movement_stats_by_expert = []
         total_start_time = time.perf_counter()
         evidence_model = None
         try:
@@ -555,6 +625,9 @@ class Client:
                 sgld_elapsed = time.perf_counter() - sgld_start_time
                 sgld_time = expert_evidence["sgld_diag"].get("sgld_fit_time_sec")
                 sgld_times.append(float(sgld_time) if isinstance(sgld_time, (int, float)) else sgld_elapsed)
+                movement_stats = expert_evidence["sgld_diag"].get("movement_stats")
+                if movement_stats is not None:
+                    movement_stats_by_expert.append((layer_id, expert_id, movement_stats))
                 evidence_by_layer.setdefault(layer_id, {})[expert_id] = expert_evidence
         finally:
             if evidence_model is not None:
@@ -567,6 +640,7 @@ class Client:
                 torch.cuda.empty_cache()
 
         total_evidence_sec = time.perf_counter() - total_start_time
+        self.log_bayes_sgld_movement_diag(movement_stats_by_expert)
         per_expert_mean_sec = sum(sgld_times) / max(len(sgld_times), 1)
         self.logger.info(
             f"--client: {self.client_id} --bayes_evidence_time "

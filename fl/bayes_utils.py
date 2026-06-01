@@ -157,6 +157,74 @@ def _parameters_to_vector(params):
     return torch.nn.utils.parameters_to_vector([param.detach() for param in params]).detach()
 
 
+def _build_sgld_movement_stats(
+    *,
+    sample_count,
+    mean_vector,
+    moment2,
+    init_vector,
+    first_sample,
+    last_sample,
+    step_delta_sum,
+    step_delta_max,
+    step_delta_count,
+    eps,
+    stuck_rel_threshold,
+    stuck_abs_threshold,
+):
+    stats = {
+        "num_samples": int(sample_count),
+        "sample_radius_rms": None,
+        "sample_radius_rel": None,
+        "trajectory_drift_rms": None,
+        "trajectory_drift_rel": None,
+        "step_delta_rms_mean": None,
+        "step_delta_rms_max": None,
+        "init_to_mean_rms": None,
+        "init_to_mean_rel": None,
+        "is_stuck_near_point": None,
+        "is_valid": False,
+    }
+    if sample_count <= 0 or mean_vector is None or moment2 is None:
+        return stats
+
+    with torch.no_grad():
+        population_variance = (moment2 - mean_vector.square()).clamp(min=0.0)
+        sample_radius_rms = torch.sqrt(population_variance.mean()).item()
+        mean_param_rms = torch.sqrt(mean_vector.square().mean()).item()
+        trajectory_drift_rms = torch.sqrt((last_sample - first_sample).square().mean()).item()
+        init_to_mean_rms = torch.sqrt((mean_vector - init_vector).square().mean()).item()
+        init_param_rms = torch.sqrt(init_vector.square().mean()).item()
+
+    movement_eps = max(float(eps), 1.0e-12)
+    values = {
+        "sample_radius_rms": float(sample_radius_rms),
+        "sample_radius_rel": float(sample_radius_rms / (mean_param_rms + movement_eps)),
+        "trajectory_drift_rms": float(trajectory_drift_rms),
+        "trajectory_drift_rel": float(trajectory_drift_rms / (mean_param_rms + movement_eps)),
+        "init_to_mean_rms": float(init_to_mean_rms),
+        "init_to_mean_rel": float(init_to_mean_rms / (init_param_rms + movement_eps)),
+    }
+    if step_delta_count > 0:
+        values["step_delta_rms_mean"] = float(step_delta_sum / step_delta_count)
+        values["step_delta_rms_max"] = float(step_delta_max)
+
+    if not all(math.isfinite(value) for value in values.values()):
+        return stats
+
+    stats.update(values)
+    stats["is_stuck_near_point"] = bool(
+        values["sample_radius_rel"] < float(stuck_rel_threshold)
+        or values["sample_radius_rms"] < float(stuck_abs_threshold)
+        or (
+            values.get("step_delta_rms_mean") is not None
+            and values["step_delta_rms_mean"] < float(stuck_abs_threshold)
+        )
+    )
+    stats["is_valid"] = True
+    return stats
+
+
 def run_expert_sgld_fit(
     model,
     batch_cache,
@@ -173,6 +241,9 @@ def run_expert_sgld_fit(
     precision_source="sgld_variance",
     sgld_fit_mode="adam_noise",
     precision_mode="floor_inverse",
+    movement_diag=False,
+    stuck_rel_threshold=1.0e-5,
+    stuck_abs_threshold=1.0e-7,
 ):
     precision_source = str(precision_source or "sgld_variance").lower()
     if precision_source != "sgld_variance":
@@ -201,6 +272,9 @@ def run_expert_sgld_fit(
     burnin = min(max(int(burnin), 0), steps - 1)
     var_floor = max(float(var_floor), 0.0)
     precision_eps = max(float(precision_eps), 1.0e-12)
+    movement_diag = bool(movement_diag)
+    stuck_rel_threshold = max(float(stuck_rel_threshold), 0.0)
+    stuck_abs_threshold = max(float(stuck_abs_threshold), 0.0)
     target_device = _normalize_torch_device(device)
     model.to(target_device)
     model.train()
@@ -226,6 +300,12 @@ def run_expert_sgld_fit(
     sample_count = 0
     last_seen_samples = 0
     forward_backward_time_sec = 0.0
+    init_vector = _parameters_to_vector(target_params).clone() if movement_diag else None
+    first_sample = None
+    previous_sample = None
+    step_delta_sum = 0.0
+    step_delta_max = 0.0
+    step_delta_count = 0
 
     for step_idx in range(steps):
         if optimizer is None:
@@ -277,6 +357,15 @@ def run_expert_sgld_fit(
                 else:
                     moment1 = (param_vector + sample_count * moment1) / (sample_count + 1)
                     moment2 = (param_vector.square() + sample_count * moment2) / (sample_count + 1)
+                if movement_diag:
+                    if first_sample is None:
+                        first_sample = param_vector.clone()
+                    if previous_sample is not None:
+                        step_delta = torch.sqrt((param_vector - previous_sample).square().mean()).item()
+                        step_delta_sum += float(step_delta)
+                        step_delta_max = max(step_delta_max, float(step_delta))
+                        step_delta_count += 1
+                    previous_sample = param_vector.clone()
                 sample_count += 1
 
     with torch.no_grad():
@@ -317,6 +406,21 @@ def run_expert_sgld_fit(
         "sgld_forward_backward_time_sec": round(float(forward_backward_time_sec), 6),
         "sgld_fit_time_sec": round(float(prepare_cache_time_sec + forward_backward_time_sec), 6),
     }
+    if movement_diag:
+        diag["movement_stats"] = _build_sgld_movement_stats(
+            sample_count=sample_count,
+            mean_vector=mean_vector,
+            moment2=moment2,
+            init_vector=init_vector,
+            first_sample=first_sample,
+            last_sample=previous_sample,
+            step_delta_sum=step_delta_sum,
+            step_delta_max=step_delta_max,
+            step_delta_count=step_delta_count,
+            eps=precision_eps,
+            stuck_rel_threshold=stuck_rel_threshold,
+            stuck_abs_threshold=stuck_abs_threshold,
+        )
     mean_state = vector_to_named_state(reference_state, target_names, mean_vector.detach().cpu())
     precision_state = vector_to_named_state(reference_state, target_names, precision_vector.detach().cpu())
     return mean_state, precision_state, diag
