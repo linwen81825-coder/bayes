@@ -11,11 +11,25 @@ client_epochs: 1
 run_name: exp1
 
 # 聚合方法：
-# - fedavg：按客户端样本数加权平均
-# - client_avg：按客户端数量等权平均
-# - expert_fedavg：共享层样本数加权，expert 层 usage 加权
-# - expert_bayes_meta：Bayes expert 聚合
-agg_method: client_avg
+# - fedavg：全部参数按客户端样本数加权平均
+# - client_avg：全部参数按客户端数量等权平均
+# - expert_fedavg：非 expert 参数样本数加权，expert 参数 usage 加权
+# - expert_bayes_meta：非 expert 参数走 FedAvg，expert 参数走 Bayes
+# - decoupled_moe：非 expert 参数和 expert 参数分别由 non_expert_agg_method / expert_agg_method 控制
+agg_method: decoupled_moe
+
+# 非 expert 参数聚合方法：
+# - client_avg
+# - fedavg
+# - expert_fedavg，等价于 fedavg，仅为了语义统一
+non_expert_agg_method: client_avg
+
+# expert 参数聚合方法：
+# - client_avg
+# - fedavg
+# - expert_fedavg
+# - expert_bayes_meta
+expert_agg_method: expert_fedavg
 
 # Client local training optimizer:adam/sgd
 client_optimizer: sgd

@@ -1,5 +1,6 @@
 import collections
 import copy
+import logging
 import math
 import time
 from abc import ABC, abstractmethod
@@ -14,6 +15,7 @@ from fl.bayes_utils import (
     group_expert_keys,
     parse_expert_ref,
 )
+from utils.utils import get_experiment_stem
 
 
 class Aggregator(ABC):
@@ -595,7 +597,102 @@ class ExpertBayesMetaAggregator(Aggregator):
         return torch.exp(log_n0.detach().cpu().float()).clamp(min=self.min_precision)
 
 
+class DecoupledMoEAggregator(Aggregator):
+    def __init__(self, args):
+        self.args = args
+        self.non_expert_agg_method = str(getattr(args, "non_expert_agg_method", "fedavg")).lower()
+        self.expert_agg_method = str(getattr(args, "expert_agg_method", "expert_fedavg")).lower()
+        self._validate_methods()
+        self.non_expert_aggregator = self._build_full_aggregator(
+            self.non_expert_agg_method,
+            for_expert=False,
+        )
+        self.expert_aggregator = self._build_full_aggregator(
+            self.expert_agg_method,
+            for_expert=True,
+        )
+        self._logged_methods = False
+
+    def _validate_methods(self):
+        non_expert_methods = {"client_avg", "fedavg", "expert_fedavg"}
+        expert_methods = {"client_avg", "fedavg", "expert_fedavg", "expert_bayes_meta"}
+        if self.non_expert_agg_method not in non_expert_methods:
+            raise ValueError(
+                "Unsupported non_expert_agg_method: "
+                f"{self.non_expert_agg_method}. Supported options: "
+                "client_avg, fedavg, expert_fedavg"
+            )
+        if self.expert_agg_method not in expert_methods:
+            raise ValueError(
+                f"Unsupported expert_agg_method: {self.expert_agg_method}. Supported options: "
+                "client_avg, fedavg, expert_fedavg, expert_bayes_meta"
+            )
+
+    def _build_full_aggregator(self, method, for_expert):
+        if method == "client_avg":
+            return ClientAvgAggregator()
+        if method == "fedavg":
+            return FedAvgAggregator()
+        if method == "expert_fedavg":
+            return ExpertFedAvgAggregator() if for_expert else FedAvgAggregator()
+        if method == "expert_bayes_meta":
+            if not for_expert:
+                raise ValueError("expert_bayes_meta is only supported for expert parameters")
+            return ExpertBayesMetaAggregator(self.args)
+        raise ValueError(f"Unsupported aggregation method: {method}")
+
+    def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
+        if len(client_updates) == 0:
+            raise ValueError("DecoupledMoE requires at least one client update")
+        if len(client_updates) != len(client_weights):
+            raise ValueError("client_updates and client_weights must have the same length")
+
+        self._log_methods_once(kwargs.get("logger"))
+        non_expert_state = self.non_expert_aggregator.aggregate(
+            client_updates=client_updates,
+            client_weights=client_weights,
+            global_model=global_model,
+            **kwargs,
+        )
+        expert_output = self.expert_aggregator.aggregate(
+            client_updates=client_updates,
+            client_weights=client_weights,
+            global_model=global_model,
+            **kwargs,
+        )
+        expert_state = (
+            expert_output["model_state"]
+            if self.expert_agg_method == "expert_bayes_meta"
+            else expert_output
+        )
+
+        aggregated_state = collections.OrderedDict()
+        for key in client_updates[0].keys():
+            is_expert_key = parse_expert_ref(key) is not None
+            aggregated_state[key] = expert_state[key] if is_expert_key else non_expert_state[key]
+
+        if self.expert_agg_method == "expert_bayes_meta":
+            aggregation_output = dict(expert_output)
+            aggregation_output["model_state"] = aggregated_state
+            return aggregation_output
+        return aggregated_state
+
+    def _log_methods_once(self, logger):
+        if self._logged_methods:
+            return
+        if logger is None:
+            try:
+                logger = logging.getLogger(get_experiment_stem(self.args))
+            except AttributeError:
+                logger = logging.getLogger(__name__)
+        logger.info(f"--decoupled_moe_non_expert_agg_method : {self.non_expert_agg_method}")
+        logger.info(f"--decoupled_moe_expert_agg_method : {self.expert_agg_method}")
+        self._logged_methods = True
+
+
 def build_aggregator(args):
+    if args.agg_method == "decoupled_moe":
+        return DecoupledMoEAggregator(args)
     if args.agg_method == "expert_bayes_meta":
         return ExpertBayesMetaAggregator(args)
     if args.agg_method == "expert_fedavg":
