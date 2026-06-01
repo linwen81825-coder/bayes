@@ -14,7 +14,7 @@ _PROJECT_ROOT = _CONFIG_DIR.parent
 DEFAULT_DATA_CFG_PATH = "configs/data.yaml"
 DEFAULT_TRAIN_CFG_PATH = "configs/train.yaml"
 DEFAULT_MODEL_CFG_PATH = "configs/model.yaml"
-_REQUIRED_CONFIG_KEYS = (
+_BASE_REQUIRED_CONFIG_KEYS = (
     "data_name",
     "data_path",
     "batch_size",
@@ -30,17 +30,6 @@ _REQUIRED_CONFIG_KEYS = (
     "client_epochs",
     "device",
     "agg_method",
-    "bayes_sgld_steps",
-    "bayes_sgld_burnin",
-    "bayes_sgld_lr",
-    "bayes_evidence_batches",
-    "bayes_min_expert_tokens",
-    "bayes_meta_steps",
-    "bayes_meta_lr",
-    "bayes_gamma0_init",
-    "bayes_n0_init",
-    "bayes_update_precision",
-    "bayes_update_strength",
     "model_type",
     "num_experts",
     "dropout",
@@ -61,6 +50,19 @@ _REQUIRED_CONFIG_KEYS = (
     "stem_channels",
     "token_grid_size",
     "use_cls_token",
+)
+_BAYES_REQUIRED_CONFIG_KEYS = (
+    "bayes_sgld_steps",
+    "bayes_sgld_burnin",
+    "bayes_sgld_lr",
+    "bayes_evidence_batches",
+    "bayes_min_expert_tokens",
+    "bayes_meta_steps",
+    "bayes_meta_lr",
+    "bayes_gamma0_init",
+    "bayes_n0_init",
+    "bayes_update_precision",
+    "bayes_update_strength",
 )
 _DEFAULT_CONFIG_VALUES = {
     "save_root": "save",
@@ -196,12 +198,22 @@ def _raise_if_unsupported_bayes_config(config: dict) -> None:
 
 
 def _raise_if_missing_required_keys(merged_config: dict) -> None:
-    missing_keys = sorted(key for key in _REQUIRED_CONFIG_KEYS if key not in merged_config)
+    missing_keys = sorted(key for key in _BASE_REQUIRED_CONFIG_KEYS if key not in merged_config)
     if missing_keys:
         raise ValueError(
             f"Missing required config keys: {missing_keys}. "
             "Please check configs/data.yaml, configs/train.yaml, and configs/model.yaml."
         )
+
+    if merged_config.get("agg_method") == "expert_bayes_meta":
+        missing_bayes_keys = sorted(
+            key for key in _BAYES_REQUIRED_CONFIG_KEYS if key not in merged_config
+        )
+        if missing_bayes_keys:
+            raise ValueError(
+                "Missing required Bayes config keys for agg_method='expert_bayes_meta': "
+                f"{missing_bayes_keys}."
+            )
 
 
 def _sanitize_run_name(run_name: object) -> str:

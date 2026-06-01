@@ -23,6 +23,8 @@ learning_rate: 0.05
 client_momentum: 0.9
 client_weight_decay: 0.0005
 client_nesterov: false
+
+#梯度裁剪
 client_grad_clip: true
 client_grad_clip_norm: 1.0
 
@@ -30,7 +32,7 @@ client_grad_clip_norm: 1.0
 # - none / constant / off：保持固定 learning_rate，不做调度。
 # - cosine：从 base_lr 余弦退火到 lr_min。
 # - cosine_warmup：先 warmup，再余弦退火。
-lr_scheduler: cosine
+lr_scheduler: none
 
 # 余弦退火 / warmup 的最低学习率；为 null 时默认 base_lr * 0.1。
 lr_min: 0.005
