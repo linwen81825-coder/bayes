@@ -7,6 +7,13 @@ server_epochs: 50
 # 每轮中每个客户端本地训练的 epoch 数
 client_epochs: 1
 
+# Client local training optimizer
+client_optimizer: sgd
+learning_rate: 0.05
+client_momentum: 0.9
+client_weight_decay: 0.0005
+client_nesterov: false
+
 # 训练设备，例如 cpu 或 cuda
 device: cuda
 
@@ -17,7 +24,7 @@ device: cuda
 lr_scheduler: cosine
 
 # 余弦退火 / warmup 的最低学习率；为 null 时默认 base_lr * 0.1。
-lr_min: 0.00005
+lr_min: 0.005
 
 # warmup round 数；只在 lr_scheduler=cosine_warmup 时生效。
 lr_warmup_rounds: 0

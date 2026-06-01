@@ -40,7 +40,29 @@ class Client:
         # 分类任务常用交叉熵损失。
         self.criterion = nn.CrossEntropyLoss()
         self.current_learning_rate = self.get_current_learning_rate()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.current_learning_rate)
+        self.client_optimizer = str(getattr(self.args, "client_optimizer", "sgd")).lower()
+        self.client_momentum = float(getattr(self.args, "client_momentum", 0.9))
+        self.client_weight_decay = float(getattr(self.args, "client_weight_decay", 5e-4))
+        self.client_nesterov = bool(getattr(self.args, "client_nesterov", False))
+        if self.client_optimizer == "sgd":
+            self.optimizer = optim.SGD(
+                self.model.parameters(),
+                lr=self.current_learning_rate,
+                momentum=self.client_momentum,
+                weight_decay=self.client_weight_decay,
+                nesterov=self.client_nesterov,
+            )
+        elif self.client_optimizer == "adam":
+            self.optimizer = optim.Adam(
+                self.model.parameters(),
+                lr=self.current_learning_rate,
+                weight_decay=self.client_weight_decay,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported client_optimizer: {self.client_optimizer!r}. "
+                "Expected one of: sgd, adam."
+            )
 
         self.batch_size = self.args.batch_size
         self.partition_meta = partition_meta
@@ -50,6 +72,13 @@ class Client:
             self.get_dataloader()
 
         self.logger = logger
+        self.logger.info(
+            f"--client: {self.client_id} --client_optimizer:{self.client_optimizer} "
+            f"--client_lr:{self.current_learning_rate:.8f} "
+            f"--client_momentum:{self.client_momentum} "
+            f"--client_weight_decay:{self.client_weight_decay} "
+            f"--client_nesterov:{self.client_nesterov}"
+        )
         self.router_aux_loss_coef = self.args.router_aux_loss_coef
         self.router_z_loss_coef = self.args.router_z_loss_coef
         self.bayes_min_expert_tokens = getattr(self.args, "bayes_min_expert_tokens", 1)

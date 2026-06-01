@@ -14,9 +14,6 @@ num_experts: 8
 # Transformer / MLP 中使用的 dropout 比例
 dropout: 0.2
 
-# 优化器学习率
-learning_rate: 0.0005
-
 # token / hidden 的嵌入维度
 embed_dim: 128
 
