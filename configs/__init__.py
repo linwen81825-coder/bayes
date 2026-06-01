@@ -84,6 +84,17 @@ _DEFAULT_CONFIG_VALUES = {
     "bayes_precision_mode": "floor_inverse",
     "bayes_sgld_var_floor": 0.0,
     "bayes_precision_eps": 1.0e-12,
+    "bayes_meta_update_mode": "optimizer",
+    "bayes_weighted_score_tau": 0.5,
+    "bayes_weighted_score_clip": 3.0,
+    "bayes_weighted_var_rho": 0.05,
+    "bayes_weighted_eps": 1.0e-8,
+    "bayes_weighted_min_valid_clients": 2,
+    "bayes_weighted_precision_min": 1.0e-8,
+    "bayes_weighted_precision_max": 1.0e8,
+    "bayes_weighted_var_min": 1.0e-8,
+    "bayes_weighted_var_max": 1.0e8,
+    "bayes_weighted_diag": False,
     "use_tqdm": True,
     "progress_bar": True,
     "progress_bar_leave": False,
@@ -106,6 +117,17 @@ _ALLOWED_BAYES_CONFIG_KEYS = {
     "bayes_sgld_lr",
     "bayes_sgld_var_floor",
     "bayes_precision_eps",
+    "bayes_meta_update_mode",
+    "bayes_weighted_score_tau",
+    "bayes_weighted_score_clip",
+    "bayes_weighted_var_rho",
+    "bayes_weighted_eps",
+    "bayes_weighted_min_valid_clients",
+    "bayes_weighted_precision_min",
+    "bayes_weighted_precision_max",
+    "bayes_weighted_var_min",
+    "bayes_weighted_var_max",
+    "bayes_weighted_diag",
     "bayes_evidence_batches",
     "bayes_min_expert_tokens",
     "bayes_meta_steps",
@@ -196,6 +218,12 @@ def _raise_if_unsupported_bayes_config(config: dict) -> None:
         if str(value).lower() != expected:
             raise ValueError(f"{key} now only supports: {expected}")
 
+    meta_update_mode = str(config.get("bayes_meta_update_mode", "optimizer")).lower()
+    if meta_update_mode not in {"optimizer", "closed_form_weighted"}:
+        raise ValueError(
+            "bayes_meta_update_mode must be one of: optimizer, closed_form_weighted"
+        )
+
 
 def _raise_if_missing_required_keys(merged_config: dict) -> None:
     missing_keys = sorted(key for key in _BASE_REQUIRED_CONFIG_KEYS if key not in merged_config)
@@ -264,6 +292,7 @@ def _derive_output_paths(merged_config: dict, train_cfg_path: Path) -> None:
         "force_repartition",
         "resume",
         "resume_allow_legacy_checkpoint",
+        "bayes_weighted_diag",
     ]:
         merged_config[bool_key] = _as_bool(merged_config[bool_key], bool_key)
     merged_config["run_dir"] = str(run_dir)

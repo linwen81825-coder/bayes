@@ -95,6 +95,19 @@ bayes_evidence_batches: 4
 bayes_min_expert_tokens: 128
 
 # Server-side expert Bayes meta update.
+# - optimizer：保持现有 Adam meta update 行为。
+# - closed_form_weighted：预留闭式加权聚合模式，当前尚未接入聚合主逻辑。
+bayes_meta_update_mode: optimizer
+bayes_weighted_score_tau: 0.5
+bayes_weighted_score_clip: 3.0
+bayes_weighted_var_rho: 0.05
+bayes_weighted_eps: 1e-8
+bayes_weighted_min_valid_clients: 2
+bayes_weighted_precision_min: 1e-8
+bayes_weighted_precision_max: 1e8
+bayes_weighted_var_min: 1e-8
+bayes_weighted_var_max: 1e8
+bayes_weighted_diag: false
 bayes_meta_steps: 2
 bayes_meta_lr: 0.0005
 bayes_gamma0_init: 1.0

@@ -18,6 +18,191 @@ from fl.bayes_utils import (
 from utils.utils import get_experiment_stem
 
 
+# Helpers reserved for the closed_form_weighted Bayes expert aggregation mode.
+def _sanitize_precision_tensor(A, args):
+    if not torch.is_tensor(A):
+        return None
+    A = A.detach()
+    if not torch.isfinite(A).all().item():
+        return None
+    precision_min = float(getattr(args, "bayes_weighted_precision_min", 1.0e-8))
+    precision_max = float(getattr(args, "bayes_weighted_precision_max", 1.0e8))
+    return A.clamp(min=precision_min, max=precision_max)
+
+
+def _sanitize_var_tensor(V, args):
+    if not torch.is_tensor(V):
+        return None
+    V = V.detach()
+    if not torch.isfinite(V).all().item():
+        return None
+    var_min = float(getattr(args, "bayes_weighted_var_min", 1.0e-8))
+    var_max = float(getattr(args, "bayes_weighted_var_max", 1.0e8))
+    return V.clamp(min=var_min, max=var_max)
+
+
+def _compute_local_posterior_for_client(
+    local_mean_state,
+    local_precision_state,
+    prior_mean_state,
+    prior_var_state,
+    n0,
+    args,
+):
+    states = [local_mean_state, local_precision_state, prior_mean_state, prior_var_state]
+    if not all(isinstance(state, dict) for state in states):
+        return None
+
+    m_star_state = collections.OrderedDict()
+    v_star_state = collections.OrderedDict()
+    sanitized_precision_state = collections.OrderedDict()
+    with torch.no_grad():
+        for key, prior_mean in prior_mean_state.items():
+            local_mean = local_mean_state.get(key)
+            local_precision = local_precision_state.get(key)
+            prior_var = prior_var_state.get(key)
+            tensors = [local_mean, local_precision, prior_mean, prior_var]
+            if not all(torch.is_tensor(value) for value in tensors):
+                return None
+            if any(value.shape != prior_mean.shape for value in tensors):
+                return None
+
+            prior_mean = prior_mean.detach()
+            local_mean = local_mean.detach().to(device=prior_mean.device, dtype=prior_mean.dtype)
+            local_precision = local_precision.detach().to(device=prior_mean.device, dtype=prior_mean.dtype)
+            prior_var = prior_var.detach().to(device=prior_mean.device, dtype=prior_mean.dtype)
+            local_precision = _sanitize_precision_tensor(local_precision, args)
+            prior_var = _sanitize_var_tensor(prior_var, args)
+            n0_tensor = torch.as_tensor(n0, device=prior_mean.device, dtype=prior_mean.dtype).detach()
+            if (
+                local_precision is None
+                or prior_var is None
+                or not torch.isfinite(local_mean).all().item()
+                or not torch.isfinite(prior_mean).all().item()
+                or not torch.isfinite(n0_tensor).all().item()
+                or n0_tensor.numel() != 1
+                or n0_tensor.item() < 0
+            ):
+                return None
+
+            prior_eff_prec = n0_tensor / prior_var
+            v_star = 1.0 / (local_precision + prior_eff_prec)
+            m_star = v_star * (local_precision * local_mean + prior_eff_prec * prior_mean)
+            if not torch.isfinite(v_star).all().item() or not torch.isfinite(m_star).all().item():
+                return None
+            m_star_state[key] = m_star
+            v_star_state[key] = v_star
+            sanitized_precision_state[key] = local_precision
+    return m_star_state, v_star_state, sanitized_precision_state
+
+
+def _compute_evidence_score_scalar(
+    local_mean_state,
+    local_precision_state,
+    prior_mean_state,
+    prior_var_state,
+    m_star_state,
+    v_star_state,
+    n0,
+    args,
+):
+    states = [
+        local_mean_state,
+        local_precision_state,
+        prior_mean_state,
+        prior_var_state,
+        m_star_state,
+        v_star_state,
+    ]
+    if not all(isinstance(state, dict) for state in states):
+        return None
+
+    f_terms = []
+    g_terms = []
+    eps = float(getattr(args, "bayes_weighted_eps", 1.0e-8))
+    with torch.no_grad():
+        for key, prior_mean in prior_mean_state.items():
+            local_mean = local_mean_state.get(key)
+            local_precision = local_precision_state.get(key)
+            prior_var = prior_var_state.get(key)
+            m_star = m_star_state.get(key)
+            v_star = v_star_state.get(key)
+            tensors = [local_mean, local_precision, prior_mean, prior_var, m_star, v_star]
+            if not all(torch.is_tensor(value) for value in tensors):
+                return None
+            if any(value.shape != prior_mean.shape for value in tensors):
+                return None
+
+            prior_mean = prior_mean.detach()
+            local_mean = local_mean.detach().to(device=prior_mean.device, dtype=prior_mean.dtype)
+            local_precision = local_precision.detach().to(device=prior_mean.device, dtype=prior_mean.dtype)
+            prior_var = prior_var.detach().to(device=prior_mean.device, dtype=prior_mean.dtype)
+            m_star = m_star.detach().to(device=prior_mean.device, dtype=prior_mean.dtype)
+            v_star = v_star.detach().to(device=prior_mean.device, dtype=prior_mean.dtype)
+            local_precision = _sanitize_precision_tensor(local_precision, args)
+            prior_var = _sanitize_var_tensor(prior_var, args)
+            v_star = _sanitize_var_tensor(v_star, args)
+            n0_tensor = torch.as_tensor(n0, device=prior_mean.device, dtype=prior_mean.dtype).detach()
+            if (
+                local_precision is None
+                or prior_var is None
+                or v_star is None
+                or not torch.isfinite(local_mean).all().item()
+                or not torch.isfinite(prior_mean).all().item()
+                or not torch.isfinite(m_star).all().item()
+                or not torch.isfinite(n0_tensor).all().item()
+                or n0_tensor.numel() != 1
+                or n0_tensor.item() < 0
+            ):
+                return None
+
+            f_terms.append((local_precision * v_star + local_precision * (m_star - local_mean).square()).mean())
+            g_terms.append(
+                (
+                    torch.log(prior_var + eps)
+                    - torch.log(v_star + eps)
+                    + n0_tensor * v_star / (prior_var + eps)
+                    + n0_tensor * (m_star - prior_mean).square() / (prior_var + eps)
+                ).mean()
+            )
+        if len(f_terms) == 0:
+            return None
+        score = 0.5 * torch.stack(f_terms).mean() + 0.5 * torch.stack(g_terms).mean()
+        if not torch.isfinite(score).item():
+            return None
+        return float(score.item())
+
+
+def _scores_to_beta(scores, args):
+    min_valid_clients = int(getattr(args, "bayes_weighted_min_valid_clients", 2))
+    if len(scores) < min_valid_clients:
+        return None
+
+    score_values = []
+    for score in scores:
+        if torch.is_tensor(score):
+            if score.numel() != 1:
+                return None
+            score = score.detach().cpu().item()
+        try:
+            score_values.append(float(score))
+        except (TypeError, ValueError):
+            return None
+    score_tensor = torch.tensor(score_values, dtype=torch.float64)
+    if not torch.isfinite(score_tensor).all().item():
+        return None
+
+    eps = float(getattr(args, "bayes_weighted_eps", 1.0e-8))
+    sigma = score_tensor.std(unbiased=False)
+    if sigma.item() < eps:
+        return [1.0 / len(scores)] * len(scores)
+    z = (score_tensor - score_tensor.mean()) / (sigma + eps)
+    score_clip = float(getattr(args, "bayes_weighted_score_clip", 3.0))
+    score_tau = float(getattr(args, "bayes_weighted_score_tau", 0.5))
+    beta = torch.softmax(-score_tau * z.clamp(min=-score_clip, max=score_clip), dim=0)
+    return beta.tolist()
+
+
 class Aggregator(ABC):
     # 聚合器统一接口。后续新增聚合方法时，只需要新增实现类并在 build_aggregator 中注册。
     @abstractmethod
@@ -172,6 +357,23 @@ class ExpertBayesMetaAggregator(Aggregator):
         self.n0_init = max(float(getattr(args, "bayes_n0_init", 1.0)), self.min_precision)
         self.meta_steps = max(int(getattr(args, "bayes_meta_steps", 5)), 1)
         self.meta_lr = float(getattr(args, "bayes_meta_lr", 0.001))
+        self.meta_update_mode = str(getattr(args, "bayes_meta_update_mode", "optimizer")).lower()
+        self.weighted_score_tau = float(getattr(args, "bayes_weighted_score_tau", 0.5))
+        self.weighted_score_clip = float(getattr(args, "bayes_weighted_score_clip", 3.0))
+        self.weighted_var_rho = float(getattr(args, "bayes_weighted_var_rho", 0.05))
+        self.weighted_eps = float(getattr(args, "bayes_weighted_eps", 1.0e-8))
+        self.weighted_min_valid_clients = int(getattr(args, "bayes_weighted_min_valid_clients", 2))
+        self.weighted_precision_min = float(getattr(args, "bayes_weighted_precision_min", 1.0e-8))
+        self.weighted_precision_max = float(getattr(args, "bayes_weighted_precision_max", 1.0e8))
+        self.weighted_var_min = float(getattr(args, "bayes_weighted_var_min", 1.0e-8))
+        self.weighted_var_max = float(getattr(args, "bayes_weighted_var_max", 1.0e8))
+        self.weighted_diag = bool(
+            getattr(args, "bayes_weighted_diag", False) or getattr(args, "bayes_direction_diag", False)
+        )
+        if self.meta_update_mode not in {"optimizer", "closed_form_weighted"}:
+            raise ValueError(
+                "bayes_meta_update_mode must be one of: optimizer, closed_form_weighted"
+            )
         self.update_precision = bool(getattr(args, "bayes_update_precision", True))
         self.update_strength = bool(getattr(args, "bayes_update_strength", True))
         self.meta_device = self._resolve_meta_device(args)
@@ -267,6 +469,9 @@ class ExpertBayesMetaAggregator(Aggregator):
             for key, value in expert_params.items():
                 aggregated_state[key] = value
 
+        if self.meta_update_mode == "closed_form_weighted":
+            metrics["bayes_weighted_updated_experts"] = metrics["updated_experts"]
+            metrics["bayes_weighted_skipped_experts"] = metrics["skipped_experts"]
         updated_bayes_state["round"] = int(updated_bayes_state.get("round", 0)) + 1
         metrics["bayes_aggregation_time_sec"] = round(time.perf_counter() - aggregate_start_time, 4)
         if self.meta_device.type == "cuda" and self.empty_cache_after_aggregation:
@@ -314,6 +519,17 @@ class ExpertBayesMetaAggregator(Aggregator):
             }, 0, 0, expert_metric
 
         prior_n0 = self._get_prior_n0(prior_state)
+        if self.meta_update_mode == "closed_form_weighted":
+            return self._aggregate_expert_group_closed_form_weighted(
+                expert_keys=expert_keys,
+                global_state=global_state,
+                prior_state=prior_state,
+                prior_n0=prior_n0,
+                client_payloads=client_payloads,
+                layer_id=layer_id,
+                expert_id=expert_id,
+                expert_start_time=expert_start_time,
+            )
         optimized_mean_state, optimized_log_precision_state, optimized_log_n0, local_posterior_count, meta_loss = self._optimize_expert_prior(
             expert_keys=expert_keys,
             global_state=global_state,
@@ -350,6 +566,228 @@ class ExpertBayesMetaAggregator(Aggregator):
         )
         expert_metric["expert_meta_time_sec"] = round(time.perf_counter() - expert_start_time, 4)
         return aggregated_params, len(client_payloads), local_posterior_count, expert_metric
+
+    def _aggregate_expert_group_closed_form_weighted(
+        self,
+        expert_keys,
+        global_state,
+        prior_state,
+        prior_n0,
+        client_payloads,
+        layer_id,
+        expert_id,
+        expert_start_time,
+    ):
+        def build_skipped_result(valid_client_payloads):
+            expert_metric = self._build_expert_metric(
+                layer_id=layer_id,
+                expert_id=expert_id,
+                prior_state=prior_state,
+                meta_loss=None,
+                contributing_clients=0,
+                local_posterior_count=0,
+                status="skipped",
+                expert_keys=expert_keys,
+                client_payloads=valid_client_payloads,
+            )
+            expert_metric["expert_meta_time_sec"] = round(time.perf_counter() - expert_start_time, 4)
+            return {
+                key: global_state[key].detach().cpu().clone()
+                for key in expert_keys
+            }, 0, 0, expert_metric
+
+        prior_n0 = prior_n0.detach().to(device=self.meta_device, dtype=torch.float32)
+        if not torch.isfinite(prior_n0).all().item() or prior_n0.numel() != 1 or prior_n0.item() <= 0:
+            return build_skipped_result([])
+
+        prior_mean_state = collections.OrderedDict()
+        prior_var_state = collections.OrderedDict()
+        for key in expert_keys:
+            prior_mean = global_state[key].detach().to(device=self.meta_device, dtype=torch.float32).clone()
+            log_precision = prior_state.get("log_precision_state", {}).get(key)
+            if (
+                not torch.is_floating_point(prior_mean)
+                or not torch.is_tensor(log_precision)
+                or not torch.is_floating_point(log_precision)
+                or log_precision.shape != prior_mean.shape
+            ):
+                return build_skipped_result([])
+            log_precision = log_precision.detach().to(device=self.meta_device, dtype=torch.float32)
+            prior_precision = _sanitize_precision_tensor(torch.exp(log_precision), self.args)
+            if prior_precision is None:
+                return build_skipped_result([])
+            prior_var = _sanitize_var_tensor(1.0 / prior_precision, self.args)
+            if prior_var is None:
+                return build_skipped_result([])
+            prior_mean_state[key] = prior_mean
+            prior_var_state[key] = prior_var
+
+        valid_clients = []
+        for payload in client_payloads:
+            posterior = _compute_local_posterior_for_client(
+                local_mean_state=payload.get("mean_state"),
+                local_precision_state=payload.get("precision_state"),
+                prior_mean_state=prior_mean_state,
+                prior_var_state=prior_var_state,
+                n0=prior_n0,
+                args=self.args,
+            )
+            if posterior is None:
+                continue
+            m_star_state, v_star_state, sanitized_precision_state = posterior
+            score = _compute_evidence_score_scalar(
+                local_mean_state=payload.get("mean_state"),
+                local_precision_state=sanitized_precision_state,
+                prior_mean_state=prior_mean_state,
+                prior_var_state=prior_var_state,
+                m_star_state=m_star_state,
+                v_star_state=v_star_state,
+                n0=prior_n0,
+                args=self.args,
+            )
+            if score is None:
+                continue
+            valid_clients.append({
+                "payload": payload,
+                "m_star_state": m_star_state,
+                "sanitized_precision_state": sanitized_precision_state,
+                "score": score,
+            })
+
+        beta = _scores_to_beta([client["score"] for client in valid_clients], self.args)
+        if beta is None:
+            return build_skipped_result([client["payload"] for client in valid_clients])
+
+        rho = float(self.weighted_var_rho)
+        if not math.isfinite(rho):
+            return build_skipped_result([client["payload"] for client in valid_clients])
+
+        new_mean_state = collections.OrderedDict()
+        new_log_precision_state = collections.OrderedDict()
+        with torch.no_grad():
+            for key in expert_keys:
+                new_mean = torch.zeros_like(prior_mean_state[key])
+                a_hat = torch.zeros_like(prior_mean_state[key])
+                for client_beta, client in zip(beta, valid_clients):
+                    new_mean += client_beta * client["m_star_state"][key]
+                    a_hat += client_beta * client["sanitized_precision_state"][key]
+                if not torch.isfinite(new_mean).all().item() or not torch.isfinite(a_hat).all().item():
+                    return build_skipped_result([client["payload"] for client in valid_clients])
+
+                p_old = prior_n0 / prior_var_state[key]
+                p_new = (1.0 - rho) * p_old + rho * a_hat
+                if not torch.isfinite(p_new).all().item() or (p_new <= 0).any().item():
+                    return build_skipped_result([client["payload"] for client in valid_clients])
+                v_new = _sanitize_var_tensor(prior_n0 / p_new, self.args)
+                if v_new is None:
+                    return build_skipped_result([client["payload"] for client in valid_clients])
+                precision_new = _sanitize_precision_tensor(1.0 / v_new, self.args)
+                if precision_new is None:
+                    return build_skipped_result([client["payload"] for client in valid_clients])
+                new_mean_state[key] = new_mean
+                new_log_precision_state[key] = torch.log(precision_new)
+
+        aggregated_params = {
+            key: new_mean_state[key].detach().cpu().to(dtype=global_state[key].dtype).clone()
+            for key in expert_keys
+        }
+        for key in expert_keys:
+            prior_state["log_precision_state"][key] = new_log_precision_state[key].detach().cpu()
+
+        local_posterior_count = len(valid_clients) * len(expert_keys)
+        expert_metric = self._build_expert_metric(
+            layer_id=layer_id,
+            expert_id=expert_id,
+            prior_state=prior_state,
+            meta_loss=None,
+            contributing_clients=len(valid_clients),
+            local_posterior_count=local_posterior_count,
+            status="updated",
+            optimized_log_precision_state=new_log_precision_state,
+            optimized_log_n0=prior_state.get("log_n0"),
+            expert_keys=expert_keys,
+            client_payloads=[client["payload"] for client in valid_clients],
+            global_state=global_state,
+            optimized_mean_state=new_mean_state,
+        )
+        if self.weighted_diag:
+            expert_metric.update(self._build_closed_form_weighted_diag(
+                beta=beta,
+                valid_clients=valid_clients,
+                prior_var_state=prior_var_state,
+                prior_mean_state=prior_mean_state,
+                new_mean_state=new_mean_state,
+            ))
+        expert_metric["expert_meta_time_sec"] = round(time.perf_counter() - expert_start_time, 4)
+        return aggregated_params, len(valid_clients), local_posterior_count, expert_metric
+
+    def _build_closed_form_weighted_diag(
+        self,
+        beta,
+        valid_clients,
+        prior_var_state,
+        prior_mean_state,
+        new_mean_state,
+    ):
+        def summarize_tensors(tensors, include_std):
+            value_sum = 0.0
+            value_square_sum = 0.0
+            value_count = 0
+            value_min = None
+            value_max = None
+            for value in tensors:
+                value = value.detach().double()
+                value_sum += float(value.sum().item())
+                value_square_sum += float(value.square().sum().item())
+                value_count += value.numel()
+                tensor_min = float(value.min().item())
+                tensor_max = float(value.max().item())
+                value_min = tensor_min if value_min is None else min(value_min, tensor_min)
+                value_max = tensor_max if value_max is None else max(value_max, tensor_max)
+            mean = value_sum / value_count
+            summary = {"mean": mean, "min": value_min, "max": value_max}
+            if include_std:
+                variance = max(value_square_sum / value_count - mean * mean, 0.0)
+                summary["std"] = math.sqrt(variance)
+            return summary
+
+        beta_tensor = torch.tensor(beta, dtype=torch.float64)
+        score_tensor = torch.tensor([client["score"] for client in valid_clients], dtype=torch.float64)
+        beta_entropy = float(
+            -(beta_tensor * torch.log(beta_tensor.clamp(min=self.weighted_eps))).sum().item()
+        )
+        precision_stats = summarize_tensors(
+            [
+                client["sanitized_precision_state"][key]
+                for client in valid_clients
+                for key in client["sanitized_precision_state"]
+            ],
+            include_std=True,
+        )
+        prior_var_stats = summarize_tensors(prior_var_state.values(), include_std=False)
+        mean_update_square_sum = sum(
+            float((new_mean_state[key] - prior_mean_state[key]).double().square().sum().item())
+            for key in new_mean_state
+        )
+        return {
+            "beta_min": float(beta_tensor.min().item()),
+            "beta_max": float(beta_tensor.max().item()),
+            "beta_mean": float(beta_tensor.mean().item()),
+            "beta_entropy": beta_entropy,
+            "beta_num_clients": len(beta),
+            "score_min": float(score_tensor.min().item()),
+            "score_max": float(score_tensor.max().item()),
+            "score_mean": float(score_tensor.mean().item()),
+            "score_std": float(score_tensor.std(unbiased=False).item()),
+            "precision_mean": precision_stats["mean"],
+            "precision_std": precision_stats["std"],
+            "precision_min": precision_stats["min"],
+            "precision_max": precision_stats["max"],
+            "prior_var_mean": prior_var_stats["mean"],
+            "prior_var_min": prior_var_stats["min"],
+            "prior_var_max": prior_var_stats["max"],
+            "mean_update_norm": math.sqrt(mean_update_square_sum),
+        }
 
     def _optimize_expert_prior(
         self,
