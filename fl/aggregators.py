@@ -51,6 +51,30 @@ class FedAvgAggregator(Aggregator):
         return aggregated_state
 
 
+class ClientAvgAggregator(Aggregator):
+    # 对完整 state_dict 做客户端等权平均，每个客户端权重均为 1 / num_clients。
+    def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
+        if len(client_updates) == 0:
+            raise ValueError("ClientAvg requires at least one client update")
+        if len(client_updates) != len(client_weights):
+            raise ValueError("client_updates and client_weights must have the same length")
+
+        num_clients = len(client_updates)
+        avg_weight = 1.0 / num_clients
+        aggregated_state = collections.OrderedDict()
+        for key in client_updates[0].keys():
+            first_value = client_updates[0][key].detach().cpu()
+            if torch.is_floating_point(first_value):
+                aggregated_state[key] = torch.zeros_like(first_value)
+                for update in client_updates:
+                    aggregated_state[key] += update[key].detach().cpu() * avg_weight
+            else:
+                # 非浮点 buffer 通常不能加权平均，沿用第一个客户端的值。
+                aggregated_state[key] = first_value.clone()
+
+        return aggregated_state
+
+
 class ExpertFedAvgAggregator(Aggregator):
     # FL + MoE 专家级 FedAvg：
     # - 普通共享层仍按客户端训练样本数 n_i 做标准 FedAvg；
@@ -1307,6 +1331,8 @@ def build_aggregator(args):
         return ExpertBayesMetaAggregator(args)
     if args.agg_method == "expert_fedavg":
         return ExpertFedAvgAggregator()
+    if args.agg_method == "client_avg":
+        return ClientAvgAggregator()
     if args.agg_method == "fedavg":
         return FedAvgAggregator()
     raise ValueError(f"Unknown aggregation method: {args.agg_method}")

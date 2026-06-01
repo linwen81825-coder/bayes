@@ -126,10 +126,11 @@ progress_force_tty: false
 progress_expert_bar: false
 
 # 聚合方法：
-# - fedavg
-# - expert_fedavg
-# - expert_bayes_meta
-agg_method: expert_fedavg
+# - fedavg：按客户端样本数加权平均
+# - client_avg：按客户端数量等权平均
+# - expert_fedavg：共享层样本数加权，expert 层 usage 加权
+# - expert_bayes_meta：Bayes expert 聚合
+agg_method: client_avg
 
 # Bayesian expert aggregation
 
