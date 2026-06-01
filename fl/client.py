@@ -6,10 +6,7 @@ from types import SimpleNamespace
 from torch import nn
 
 from data.loader import build_client_train_loader
-from fl.bayes_utils import (
-    estimate_empirical_fisher_microbatch_precision,
-    run_expert_sgld_fit,
-)
+from fl.bayes_utils import run_expert_sgld_fit
 from model import build_model_from_args
 from utils.utils import record_result
 
@@ -88,123 +85,38 @@ class Client:
             self.bayes_sgld_steps - 1,
         )
         self.bayes_sgld_lr = float(getattr(self.args, "bayes_sgld_lr", 0.00005))
-        self.bayes_ai_max = float(getattr(self.args, "bayes_ai_max", 1e3))
         self.bayes_sgld_var_floor = max(float(getattr(self.args, "bayes_sgld_var_floor", 0.0)), 0.0)
-        self.bayes_precision_mode = getattr(self.args, "bayes_precision_mode", "floor_inverse")
-        self.bayes_precision_temperature = float(getattr(self.args, "bayes_precision_temperature", 0.25))
-        self.bayes_precision_target = float(getattr(self.args, "bayes_precision_target", 100.0))
-        self.bayes_precision_min = float(getattr(self.args, "bayes_precision_min", 20.0))
-        self.bayes_precision_max = float(getattr(self.args, "bayes_precision_max", 300.0))
-        self.bayes_precision_eps = float(getattr(self.args, "bayes_precision_eps", 1.0e-12))
-        self.bayes_precision_gamma = float(getattr(self.args, "bayes_precision_gamma", 0.5))
-        self.bayes_fisher_microbatch_size = max(
-            int(getattr(self.args, "bayes_fisher_microbatch_size", 8)),
-            1,
-        )
-        self.bayes_fisher_max_batches = getattr(self.args, "bayes_fisher_max_batches", None)
-        if self.bayes_fisher_max_batches is not None:
-            self.bayes_fisher_max_batches = int(self.bayes_fisher_max_batches)
-            if self.bayes_fisher_max_batches <= 0:
-                self.bayes_fisher_max_batches = None
-        self.bayes_fisher_eps = float(
-            getattr(self.args, "bayes_fisher_eps", self.bayes_precision_eps)
-        )
-        self.bayes_fisher_model_mode = str(
-            getattr(self.args, "bayes_fisher_model_mode", "eval")
-        ).lower()
+        self.bayes_precision_eps = max(float(getattr(self.args, "bayes_precision_eps", 1.0e-12)), 1.0e-12)
         self.bayes_precision_source = str(
             getattr(self.args, "bayes_precision_source", "sgld_variance")
         ).lower()
-        if self.bayes_precision_source not in {
-            "sgld_variance",
-            "laplace_diag",
-            "empirical_fisher_microbatch",
-        }:
-            raise ValueError(
-                "bayes_precision_source must be one of: "
-                "sgld_variance, laplace_diag, empirical_fisher_microbatch"
-            )
-        if self.bayes_precision_min > self.bayes_precision_max:
-            raise ValueError("bayes_precision_min must be <= bayes_precision_max")
-        if self.bayes_fisher_model_mode not in {"eval", "train"}:
-            raise ValueError("bayes_fisher_model_mode must be eval or train")
+        self.bayes_sgld_fit_mode = str(
+            getattr(self.args, "bayes_sgld_fit_mode", "adam_noise")
+        ).lower()
+        self.bayes_precision_mode = str(
+            getattr(self.args, "bayes_precision_mode", "floor_inverse")
+        ).lower()
+        if self.bayes_precision_source != "sgld_variance":
+            raise ValueError("bayes_precision_source now only supports: sgld_variance")
+        if self.bayes_sgld_fit_mode != "adam_noise":
+            raise ValueError("bayes_sgld_fit_mode now only supports: adam_noise")
+        if self.bayes_precision_mode != "floor_inverse":
+            raise ValueError("bayes_precision_mode now only supports: floor_inverse")
 
-        self.bayes_laplace_map_steps = int(getattr(self.args, "bayes_laplace_map_steps", 5))
-        self.bayes_laplace_map_lr = float(getattr(self.args, "bayes_laplace_map_lr", 1.0e-4))
-        self.bayes_laplace_map_optimizer = str(
-            getattr(self.args, "bayes_laplace_map_optimizer", "adam")
-        ).lower()
-        self.bayes_laplace_batches = int(getattr(self.args, "bayes_laplace_batches", 4))
-        self.bayes_laplace_hessian_estimator = str(
-            getattr(self.args, "bayes_laplace_hessian_estimator", "hutchinson_diag")
-        ).lower()
-        self.bayes_laplace_hutchinson_samples = int(
-            getattr(self.args, "bayes_laplace_hutchinson_samples", 2)
-        )
-        self.bayes_laplace_hutchinson_distribution = str(
-            getattr(self.args, "bayes_laplace_hutchinson_distribution", "rademacher")
-        ).lower()
-        self.bayes_laplace_positive_mode = str(
-            getattr(self.args, "bayes_laplace_positive_mode", "softplus")
-        ).lower()
-        self.bayes_laplace_softplus_beta = float(
-            getattr(self.args, "bayes_laplace_softplus_beta", 10.0)
-        )
-        self.bayes_laplace_damping = float(getattr(self.args, "bayes_laplace_damping", 1.0e-6))
-        self.bayes_laplace_normalize = str(
-            getattr(self.args, "bayes_laplace_normalize", "global")
-        ).lower()
-        self.bayes_laplace_target_precision = float(
-            getattr(self.args, "bayes_laplace_target_precision", 100.0)
-        )
-        self.bayes_laplace_min_precision = float(
-            getattr(self.args, "bayes_laplace_min_precision", 10.0)
-        )
-        self.bayes_laplace_max_precision = float(
-            getattr(self.args, "bayes_laplace_max_precision", 300.0)
-        )
-        self.bayes_laplace_eval_mode = bool(
-            getattr(self.args, "bayes_laplace_eval_mode", False)
-        )
-        self.bayes_laplace_include_router_loss = bool(
-            getattr(self.args, "bayes_laplace_include_router_loss", False)
-        )
-        if self.bayes_laplace_map_optimizer not in {"adam", "sgd"}:
-            raise ValueError("bayes_laplace_map_optimizer must be adam or sgd")
-        if self.bayes_laplace_hessian_estimator != "hutchinson_diag":
-            raise ValueError("bayes_laplace_hessian_estimator must be hutchinson_diag")
-        if self.bayes_laplace_hutchinson_distribution != "rademacher":
-            raise ValueError("bayes_laplace_hutchinson_distribution must be rademacher")
-        if self.bayes_laplace_positive_mode not in {"softplus", "relu", "abs"}:
-            raise ValueError("bayes_laplace_positive_mode must be softplus, relu, or abs")
-        if self.bayes_laplace_normalize not in {"global", "per_tensor", "none"}:
-            raise ValueError("bayes_laplace_normalize must be global, per_tensor, or none")
-        if self.bayes_laplace_min_precision > self.bayes_laplace_max_precision:
-            raise ValueError("bayes_laplace_min_precision must be <= bayes_laplace_max_precision")
-        if self.bayes_laplace_hutchinson_samples < 1:
-            raise ValueError("bayes_laplace_hutchinson_samples must be >= 1")
-        if self.bayes_laplace_map_steps < 1:
-            raise ValueError("bayes_laplace_map_steps must be >= 1")
         self.bayes_evidence_batches = max(int(getattr(self.args, "bayes_evidence_batches", 8)), 1)
-        self.bayes_evidence_log_detail = bool(getattr(self.args, "bayes_evidence_log_detail", False))
-        self.bayes_sgld_concat_cache = bool(getattr(self.args, "bayes_sgld_concat_cache", False))
         self.bayes_empty_cache_after_client_evidence = bool(
             getattr(self.args, "bayes_empty_cache_after_client_evidence", False)
         )
         self.bayes_cache_device = str(getattr(self.args, "bayes_cache_device", "cpu")).lower()
         if self.bayes_cache_device not in {"cpu", "cuda", "auto"}:
             raise ValueError("bayes_cache_device must be one of: cpu, cuda, auto")
-        self.logger.info(
-            f"--client: {self.client_id} --bayes_precision_source:{self.bayes_precision_source} "
-            f"--bayes_laplace_map_steps:{self.bayes_laplace_map_steps} "
-            f"--bayes_laplace_map_lr:{self.bayes_laplace_map_lr} "
-            f"--bayes_laplace_batches:{self.bayes_laplace_batches} "
-            f"--bayes_laplace_hutchinson_samples:{self.bayes_laplace_hutchinson_samples} "
-            f"--bayes_fisher_microbatch_size:{self.bayes_fisher_microbatch_size} "
-            f"--bayes_fisher_max_batches:{self.bayes_fisher_max_batches} "
-            f"--bayes_precision_gamma:{self.bayes_precision_gamma} "
-            f"--bayes_fisher_model_mode:{self.bayes_fisher_model_mode}"
-        )
+        if self.should_collect_bayes_evidence():
+            self.logger.info(
+                f"--client: {self.client_id} --bayes_route "
+                f"bayes_precision_source={self.bayes_precision_source} "
+                f"bayes_sgld_noise_mode={self.bayes_sgld_fit_mode} "
+                f"bayes_precision_method={self.bayes_precision_mode}"
+            )
 
     def get_current_learning_rate(self):
         base_lr = float(self.args.learning_rate)
@@ -489,43 +401,6 @@ class Client:
             for name, value in backup.items():
                 param_dict[name].copy_(value)
 
-    def summarize_named_tensor_state(self, state, high_clip=None):
-        values = []
-        for value in state.values():
-            if torch.is_tensor(value) and torch.is_floating_point(value):
-                values.append(value.detach().cpu().float().reshape(-1))
-
-        if not values:
-            return {
-                "numel": 0,
-                "mean": None,
-                "min": None,
-                "max": None,
-                "std": None,
-                "low_pct": None,
-                "high_pct": None,
-            }
-
-        vector = torch.cat(values)
-        low_threshold = 1.0001e-4
-        summary = {
-            "numel": int(vector.numel()),
-            "mean": round(float(vector.mean().item()), 6),
-            "min": round(float(vector.min().item()), 6),
-            "max": round(float(vector.max().item()), 6),
-            "std": round(float(vector.std(unbiased=False).item()), 6),
-            "low_pct": round(float((vector <= low_threshold).float().mean().item()), 6),
-        }
-        if high_clip is None or high_clip <= 0:
-            summary["high_pct"] = None
-        else:
-            high_threshold = 0.9999 * float(high_clip)
-            summary["high_pct"] = round(float((vector >= high_threshold).float().mean().item()), 6)
-        return summary
-
-    def count_cached_samples(self, batch_cache):
-        return int(sum(labels.size(0) for _, labels in batch_cache))
-
     def fit_local_expert_evidence(
         self,
         evidence_model,
@@ -533,126 +408,35 @@ class Client:
         expert_id,
         usage,
         batch_cache,
-        fisher_train_loader=None,
     ):
         expert_backup = self.backup_expert_params(evidence_model, layer_id, expert_id)
         try:
-            if self.bayes_precision_source == "empirical_fisher_microbatch":
-                mean_state, _, sgld_diag = run_expert_sgld_fit(
-                    model=evidence_model,
-                    batch_cache=batch_cache,
-                    criterion=self.criterion,
-                    layer_id=layer_id,
-                    expert_id=expert_id,
-                    device=self.device,
-                    steps=self.bayes_sgld_steps,
-                    burnin=self.bayes_sgld_burnin,
-                    alp=self.bayes_sgld_lr,
-                    ai_max=self.bayes_ai_max,
-                    var_floor=self.bayes_sgld_var_floor,
-                    precision_mode=self.bayes_precision_mode,
-                    precision_temperature=self.bayes_precision_temperature,
-                    precision_target=self.bayes_precision_target,
-                    precision_min=self.bayes_precision_min,
-                    precision_max=self.bayes_precision_max,
-                    precision_eps=self.bayes_precision_eps,
-                    sgld_concat_cache=self.bayes_sgld_concat_cache,
-                    precision_source="sgld_variance",
-                )
-                self.restore_expert_params(evidence_model, expert_backup)
-                evidence_model.zero_grad(set_to_none=True)
-                precision_state, fisher_diag = estimate_empirical_fisher_microbatch_precision(
-                    model=evidence_model,
-                    train_loader=fisher_train_loader,
-                    criterion=self.criterion,
-                    device=self.device,
-                    args=self.args,
-                    layer_id=layer_id,
-                    expert_id=expert_id,
-                )
-                sgld_diag.update(fisher_diag)
-                sgld_diag["precision_mean"] = fisher_diag.get("fisher_precision_mean")
-                sgld_diag["precision_min"] = fisher_diag.get("fisher_precision_min")
-                sgld_diag["precision_max"] = fisher_diag.get("fisher_precision_max")
-            else:
-                mean_state, precision_state, sgld_diag = run_expert_sgld_fit(
-                    model=evidence_model,
-                    batch_cache=batch_cache,
-                    criterion=self.criterion,
-                    layer_id=layer_id,
-                    expert_id=expert_id,
-                    device=self.device,
-                    steps=self.bayes_sgld_steps,
-                    burnin=self.bayes_sgld_burnin,
-                    alp=self.bayes_sgld_lr,
-                    ai_max=self.bayes_ai_max,
-                    var_floor=self.bayes_sgld_var_floor,
-                    precision_mode=self.bayes_precision_mode,
-                    precision_temperature=self.bayes_precision_temperature,
-                    precision_target=self.bayes_precision_target,
-                    precision_min=self.bayes_precision_min,
-                    precision_max=self.bayes_precision_max,
-                    precision_eps=self.bayes_precision_eps,
-                    sgld_concat_cache=self.bayes_sgld_concat_cache,
-                    precision_source=self.bayes_precision_source,
-                    laplace_map_steps=self.bayes_laplace_map_steps,
-                    laplace_map_lr=self.bayes_laplace_map_lr,
-                    laplace_map_optimizer=self.bayes_laplace_map_optimizer,
-                    laplace_batches=self.bayes_laplace_batches,
-                    laplace_hessian_estimator=self.bayes_laplace_hessian_estimator,
-                    laplace_hutchinson_samples=self.bayes_laplace_hutchinson_samples,
-                    laplace_hutchinson_distribution=self.bayes_laplace_hutchinson_distribution,
-                    laplace_positive_mode=self.bayes_laplace_positive_mode,
-                    laplace_softplus_beta=self.bayes_laplace_softplus_beta,
-                    laplace_damping=self.bayes_laplace_damping,
-                    laplace_normalize=self.bayes_laplace_normalize,
-                    laplace_target_precision=self.bayes_laplace_target_precision,
-                    laplace_min_precision=self.bayes_laplace_min_precision,
-                    laplace_max_precision=self.bayes_laplace_max_precision,
-                    laplace_eval_mode=self.bayes_laplace_eval_mode,
-                    laplace_include_router_loss=self.bayes_laplace_include_router_loss,
-                )
+            mean_state, precision_state, sgld_diag = run_expert_sgld_fit(
+                model=evidence_model,
+                batch_cache=batch_cache,
+                criterion=self.criterion,
+                layer_id=layer_id,
+                expert_id=expert_id,
+                device=self.device,
+                steps=self.bayes_sgld_steps,
+                burnin=self.bayes_sgld_burnin,
+                alp=self.bayes_sgld_lr,
+                var_floor=self.bayes_sgld_var_floor,
+                precision_eps=self.bayes_precision_eps,
+                precision_source=self.bayes_precision_source,
+                sgld_fit_mode=self.bayes_sgld_fit_mode,
+                precision_mode=self.bayes_precision_mode,
+            )
         finally:
             self.restore_expert_params(evidence_model, expert_backup)
-            del expert_backup
 
-        payload = {
+        return {
             "usage": usage,
             "num_batches": len(batch_cache),
             "mean_state": mean_state,
             "precision_state": precision_state,
             "sgld_diag": sgld_diag,
         }
-        diagnostic_keys = [
-            "precision_source",
-            "mean_state_source",
-            "precision_state_source",
-            "raw_var_used_for_precision",
-            "laplace_precision_mean",
-            "laplace_precision_min",
-            "laplace_precision_max",
-            "laplace_precision_std",
-            "laplace_hessian_negative_frac",
-            "laplace_precision_at_min_clip_frac",
-            "laplace_precision_at_max_clip_frac",
-            "laplace_compute_time_sec",
-            "fisher_precision_mean",
-            "fisher_precision_std",
-            "fisher_precision_min",
-            "fisher_precision_max",
-            "fisher_raw_mean",
-            "fisher_raw_std",
-            "fisher_raw_min",
-            "fisher_raw_max",
-            "fisher_zero_frac",
-            "fisher_num_microbatches",
-            "fisher_compute_time_sec",
-        ]
-        for key in diagnostic_keys:
-            if key in sgld_diag:
-                payload[key] = sgld_diag[key]
-
-        return payload
 
     def extract_bayesian_evidence(self, layer_stats, batch_cache_by_expert):
         if not self.should_collect_bayes_evidence():
@@ -666,16 +450,14 @@ class Client:
             if len(expert_cache) > 0
         )
         self.logger.info(
-            f"--client: {self.client_id} --bayes_active_experts : {len(active_experts)} "
-            f"--bayes_cached_experts : {cached_expert_count}"
+            f"--client: {self.client_id} --bayes_active_experts:{len(active_experts)} "
+            f"--bayes_cached_experts:{cached_expert_count}"
         )
         self.logger.info(
             f"--client: {self.client_id} --bayes_cache_diag "
-            f"--precision_source:{self.bayes_precision_source} "
             f"--bayes_cache_device:{self.bayes_cache_device} "
             f"--resolved_cache_device:{self.resolve_bayes_cache_device()} "
             f"--cached_batch_device:{self.get_cached_batch_device(batch_cache_by_expert)} "
-            f"--cached_experts:{cached_expert_count} "
             f"--estimated_cache_memory_mb:{self.estimate_bayes_cache_memory_mb(batch_cache_by_expert):.4f}"
         )
         evidence_by_layer = {}
@@ -698,7 +480,6 @@ class Client:
                 )
                 if len(batch_cache) == 0:
                     continue
-                layer_evidence = evidence_by_layer.setdefault(layer_id, {})
                 sgld_start_time = time.perf_counter()
                 expert_evidence = self.fit_local_expert_evidence(
                     evidence_model=evidence_model,
@@ -706,83 +487,11 @@ class Client:
                     expert_id=expert_id,
                     usage=usage,
                     batch_cache=batch_cache,
-                    fisher_train_loader=self.train_loader,
                 )
                 sgld_elapsed = time.perf_counter() - sgld_start_time
-                sgld_diag = expert_evidence.get("sgld_diag", {})
-                sgld_time_value = sgld_diag.get("sgld_fit_time_sec")
-                if isinstance(sgld_time_value, (int, float)):
-                    sgld_times.append(float(sgld_time_value))
-                else:
-                    sgld_times.append(sgld_elapsed)
-                layer_evidence[expert_id] = expert_evidence
-                if self.bayes_evidence_log_detail:
-                    precision_summary = self.summarize_named_tensor_state(
-                        expert_evidence["precision_state"],
-                        high_clip=self.bayes_ai_max,
-                    )
-                    mean_summary = self.summarize_named_tensor_state(expert_evidence["mean_state"])
-                    self.logger.info(
-                        f"--client: {self.client_id} --bayes_evidence_diag "
-                        f"--detail:true "
-                        f"--layer:{layer_id} --expert:{expert_id} --usage:{int(usage)} "
-                        f"--batches:{len(batch_cache)} --cached_samples:{self.count_cached_samples(batch_cache)} "
-                        f"--precision_source:{sgld_diag.get('precision_source')} "
-                        f"--mean_state_source:{sgld_diag.get('mean_state_source')} "
-                        f"--precision_state_source:{sgld_diag.get('precision_state_source')} "
-                        f"--raw_var_used_for_precision:{sgld_diag.get('raw_var_used_for_precision')} "
-                        f"--laplace_map_steps:{sgld_diag.get('laplace_map_steps')} "
-                        f"--laplace_map_lr:{sgld_diag.get('laplace_map_lr')} "
-                        f"--laplace_map_loss_start:{sgld_diag.get('laplace_map_loss_start')} "
-                        f"--laplace_map_loss_end:{sgld_diag.get('laplace_map_loss_end')} "
-                        f"--laplace_hessian_raw_mean:{sgld_diag.get('laplace_hessian_raw_mean')} "
-                        f"--laplace_hessian_raw_min:{sgld_diag.get('laplace_hessian_raw_min')} "
-                        f"--laplace_hessian_raw_max:{sgld_diag.get('laplace_hessian_raw_max')} "
-                        f"--laplace_hessian_negative_frac:{sgld_diag.get('laplace_hessian_negative_frac')} "
-                        f"--laplace_precision_mean:{sgld_diag.get('laplace_precision_mean')} "
-                        f"--laplace_precision_min:{sgld_diag.get('laplace_precision_min')} "
-                        f"--laplace_precision_max:{sgld_diag.get('laplace_precision_max')} "
-                        f"--laplace_precision_std:{sgld_diag.get('laplace_precision_std')} "
-                        f"--laplace_precision_at_min_clip_frac:{sgld_diag.get('laplace_precision_at_min_clip_frac')} "
-                        f"--laplace_precision_at_max_clip_frac:{sgld_diag.get('laplace_precision_at_max_clip_frac')} "
-                        f"--laplace_compute_time_sec:{sgld_diag.get('laplace_compute_time_sec')} "
-                        f"--fisher_precision_mean:{sgld_diag.get('fisher_precision_mean')} "
-                        f"--fisher_precision_std:{sgld_diag.get('fisher_precision_std')} "
-                        f"--fisher_precision_min:{sgld_diag.get('fisher_precision_min')} "
-                        f"--fisher_precision_max:{sgld_diag.get('fisher_precision_max')} "
-                        f"--fisher_raw_mean:{sgld_diag.get('fisher_raw_mean')} "
-                        f"--fisher_raw_std:{sgld_diag.get('fisher_raw_std')} "
-                        f"--fisher_raw_min:{sgld_diag.get('fisher_raw_min')} "
-                        f"--fisher_raw_max:{sgld_diag.get('fisher_raw_max')} "
-                        f"--fisher_zero_frac:{sgld_diag.get('fisher_zero_frac')} "
-                        f"--fisher_num_microbatches:{sgld_diag.get('fisher_num_microbatches')} "
-                        f"--fisher_compute_time_sec:{sgld_diag.get('fisher_compute_time_sec')} "
-                        f"--mean_numel:{mean_summary['numel']} "
-                        f"--precision_mean:{precision_summary['mean']} "
-                        f"--precision_min:{precision_summary['min']} "
-                        f"--precision_max:{precision_summary['max']} "
-                        f"--precision_std:{precision_summary['std']} "
-                        f"--precision_low_pct:{precision_summary['low_pct']} "
-                        f"--precision_high_pct:{precision_summary['high_pct']} "
-                        f"--local_precision_mean:{precision_summary['mean']} "
-                        f"--local_precision_min:{precision_summary['min']} "
-                        f"--local_precision_max:{precision_summary['max']} "
-                        f"--local_precision_std:{precision_summary['std']} "
-                        f"--sgld_samples:{sgld_diag.get('sample_count')} "
-                        f"--sgld_lr:{sgld_diag.get('sgld_lr')} "
-                        f"--sgld_var_floor:{sgld_diag.get('sgld_var_floor')} "
-                        f"--precision_mode:{sgld_diag.get('precision_mode')} "
-                        f"--precision_temperature:{sgld_diag.get('precision_temperature')} "
-                        f"--precision_target:{sgld_diag.get('precision_target')} "
-                        f"--raw_var_mean:{sgld_diag.get('raw_var_mean')} "
-                        f"--raw_var_min:{sgld_diag.get('raw_var_min')} "
-                        f"--raw_var_max:{sgld_diag.get('raw_var_max')} "
-                        f"--raw_var_under_floor_pct:{sgld_diag.get('raw_var_under_floor_pct')} "
-                        f"--unclipped_precision_mean:{sgld_diag.get('unclipped_precision_mean')} "
-                        f"--unclipped_precision_max:{sgld_diag.get('unclipped_precision_max')} "
-                        f"--unclipped_precision_over_ai_max_pct:"
-                        f"{sgld_diag.get('unclipped_precision_over_ai_max_pct')}"
-                    )
+                sgld_time = expert_evidence["sgld_diag"].get("sgld_fit_time_sec")
+                sgld_times.append(float(sgld_time) if isinstance(sgld_time, (int, float)) else sgld_elapsed)
+                evidence_by_layer.setdefault(layer_id, {})[expert_id] = expert_evidence
         finally:
             if evidence_model is not None:
                 del evidence_model
@@ -795,26 +504,14 @@ class Client:
 
         total_evidence_sec = time.perf_counter() - total_start_time
         per_expert_mean_sec = sum(sgld_times) / max(len(sgld_times), 1)
-        per_expert_max_sec = max(sgld_times) if sgld_times else 0.0
-        per_expert_min_sec = min(sgld_times) if sgld_times else 0.0
         self.logger.info(
             f"--client: {self.client_id} --bayes_evidence_time "
-            f"--bayes_total_evidence_time_sec:{total_evidence_sec:.4f} "
-            f"--bayes_build_model_sec:{build_model_sec:.4f} "
-            f"--bayes_per_expert_mean_sec:{per_expert_mean_sec:.4f} "
-            f"--bayes_per_expert_max_sec:{per_expert_max_sec:.4f} "
-            f"--bayes_per_expert_min_sec:{per_expert_min_sec:.4f} "
-            f"--bayes_active_experts:{len(active_experts)} "
-            f"--bayes_cached_experts:{cached_expert_count} "
-            f"--precision_source:{self.bayes_precision_source} "
-            f"--bayes_evidence_log_detail:{self.bayes_evidence_log_detail} "
-            f"--build_model_sec:{build_model_sec:.4f} "
             f"--total_sec:{total_evidence_sec:.4f} "
+            f"--build_model_sec:{build_model_sec:.4f} "
             f"--per_expert_mean_sec:{per_expert_mean_sec:.4f} "
             f"--active_experts:{len(active_experts)} "
             f"--cached_experts:{cached_expert_count}"
         )
-
         return evidence_by_layer
 
     def train(self):

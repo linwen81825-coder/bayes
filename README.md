@@ -1,6 +1,6 @@
 # Federated Learning Experiment
 
-这是一个基于 CIFAR10/CIFAR100 的 FL + MoE 实验项目，当前模型分支为 `Hybrid CNN Stem + Switch Transformer`，默认聚合方法为 `expert_bayes_meta`。
+这是一个基于 CIFAR10/CIFAR100 的 FL + MoE 实验项目，当前模型分支为 `Hybrid CNN Stem + Switch Transformer`，默认聚合方法为 `client_avg`。
 
 ## 环境准备
 
@@ -76,27 +76,15 @@ python train.py --data_cfg configs/exp/cifar10.yaml --train_cfg configs/exp/trai
 
 ## Bayes Precision 来源
 
-`expert_bayes_meta` 的客户端 evidence 可以通过 `bayes_precision_source` 选择 expert 局部 precision 来源：
-
-- `sgld_variance`：使用 SGLD 参数样本方差估计 `precision_state`
-- `laplace_diag`：MAP adaptation 后用 Hutchinson HVP 估计 Hessian diagonal
-- `empirical_fisher_microbatch`：`mean_state` 仍使用现有 SGLD/local mean 逻辑，`precision_state` 改为本地 train loader 上的 microbatch empirical Fisher diagonal
-
-`empirical_fisher_microbatch` 相关配置在 `configs/train.yaml`：
+`expert_bayes_meta` 现在只保留最基础的客户端 evidence 路线：
 
 ```yaml
-bayes_precision_source: empirical_fisher_microbatch
-bayes_fisher_microbatch_size: 8
-bayes_fisher_max_batches: null
-bayes_fisher_eps: 1.0e-12
-bayes_precision_target: 100.0
-bayes_precision_gamma: 0.5
-bayes_precision_min: 20.0
-bayes_precision_max: 300.0
-bayes_fisher_model_mode: eval
+bayes_precision_source: sgld_variance
+bayes_sgld_fit_mode: adam_noise
+bayes_precision_mode: floor_inverse
 ```
 
-该分支只改变 expert evidence 中上传给服务器的 `precision_state`，服务器端仍把它作为 `compute_optimal_local_posterior(..., local_precision=...)` 的局部 precision 使用；不会改变 FedAvg / ExpertFedAvg，也不会把 Fisher precision 当作客户端聚合权重。
+客户端对 expert 参数做 Adam-noise SGLD 采样，使用样本均值作为 `mean_state`，再对样本方差应用 `bayes_sgld_var_floor`，按 `1 / (variance + bayes_precision_eps)` 得到 `precision_state`。其他历史 evidence 与 calibration 分支不再支持。
 
 ## 运行顺序
 

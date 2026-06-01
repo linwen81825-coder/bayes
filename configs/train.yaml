@@ -7,15 +7,22 @@ server_epochs: 50
 # 每轮中每个客户端本地训练的 epoch 数
 client_epochs: 1
 
-# Client local training optimizer
+# 本次实验名；开新实验时优先只改这个字段
+run_name: exp1
+
+# 聚合方法：
+# - fedavg：按客户端样本数加权平均
+# - client_avg：按客户端数量等权平均
+# - expert_fedavg：共享层样本数加权，expert 层 usage 加权
+# - expert_bayes_meta：Bayes expert 聚合
+agg_method: client_avg
+
+# Client local training optimizer:adam/sgd
 client_optimizer: sgd
 learning_rate: 0.05
 client_momentum: 0.9
 client_weight_decay: 0.0005
 client_nesterov: false
-
-# 训练设备，例如 cpu 或 cuda
-device: cuda
 
 # 客户端本地训练的 round-level 学习率调度器。
 # - none / constant / off：保持固定 learning_rate，不做调度。
@@ -31,6 +38,52 @@ lr_warmup_rounds: 0
 
 # warmup 的起始学习率；为 null 时默认 lr_min。
 lr_warmup_start_lr: 0.00005
+
+# 实验输出根目录；最终会自动派生 save/{run_name}/data|model|result
+save_root: save
+
+# false 时，如果本次实验的目标输出目录已经非空，会直接报错防止覆盖
+allow_overwrite: false
+
+# 续跑开关：
+# false：新实验，仍然受 allow_overwrite 保护。
+# true：从 save/{run_name}/model/resume_checkpoint.pth 续跑，日志和 CSV 追加写入。
+resume: false
+
+# null 表示默认使用 save/{run_name}/model/resume_checkpoint.pth
+resume_checkpoint_path: null
+
+# 允许旧版本输出文件 fallback：
+# 没有 resume_checkpoint.pth 时，尝试用 server.pth + server CSV 推断轮数。
+# expert_bayes_meta 还需要 server_bayes_state.pth。
+resume_allow_legacy_checkpoint: true
+
+# Bayesian expert aggregation
+
+# Minimal evidence route: SGLD samples -> variance floor -> inverse precision.
+bayes_precision_source: sgld_variance
+bayes_sgld_fit_mode: adam_noise
+bayes_precision_mode: floor_inverse
+
+# Local SGLD evidence extraction.
+bayes_sgld_steps: 10
+bayes_sgld_burnin: 5
+bayes_sgld_lr: 0.00005
+bayes_sgld_var_floor: 0.0
+bayes_precision_eps: 1.0e-12
+
+# Maximum cached batches per active expert and minimum routed token count.
+bayes_evidence_batches: 4
+bayes_min_expert_tokens: 128
+
+# Server-side expert Bayes meta update.
+bayes_meta_steps: 2
+bayes_meta_lr: 0.0005
+bayes_gamma0_init: 1.0
+bayes_n0_init: 1.0
+bayes_update_precision: true
+bayes_update_strength: true
+
 
 # 是否保存每个客户端训练后的 checkpoint：save/{run_name}/model/{client_id}.pth。
 # false：推荐。客户端参数会通过内存中的 local_state_dict 直接交给 server 聚合，
@@ -77,29 +130,10 @@ empty_cache_after_round: false
 # - auto：若 self.device 是 cuda 且 bayes_evidence_batches <= 4，则放 GPU；否则放 CPU。
 # 如果出现 CUDA OOM，优先把这里改回 cpu。
 # 日志中可看 --bayes_cache_diag 的 cached_batch_device 和 estimated_cache_memory_mb。
-bayes_cache_device: cpu
+bayes_cache_device: cuda
 
-# 实验输出根目录；最终会自动派生 save/{run_name}/data|model|result
-save_root: save
-
-# 本次实验名；开新实验时优先只改这个字段
-run_name: exp1
-
-# false 时，如果本次实验的目标输出目录已经非空，会直接报错防止覆盖
-allow_overwrite: false
-
-# 续跑开关：
-# false：新实验，仍然受 allow_overwrite 保护。
-# true：从 save/{run_name}/model/resume_checkpoint.pth 续跑，日志和 CSV 追加写入。
-resume: false
-
-# null 表示默认使用 save/{run_name}/model/resume_checkpoint.pth
-resume_checkpoint_path: null
-
-# 允许旧版本输出文件 fallback：
-# 没有 resume_checkpoint.pth 时，尝试用 server.pth + server CSV 推断轮数。
-# expert_bayes_meta 还需要 server_bayes_state.pth。
-resume_allow_legacy_checkpoint: true
+# 训练设备，例如 cpu 或 cuda
+device: cuda
 
 # 是否启用 tqdm 进度条总开关
 use_tqdm: true
@@ -124,158 +158,3 @@ progress_force_tty: false
 
 # 预留开关：是否显示 expert 级进度条；当前默认关闭
 progress_expert_bar: false
-
-# 聚合方法：
-# - fedavg：按客户端样本数加权平均
-# - client_avg：按客户端数量等权平均
-# - expert_fedavg：共享层样本数加权，expert 层 usage 加权
-# - expert_bayes_meta：Bayes expert 聚合
-agg_method: client_avg
-
-# Bayesian expert aggregation
-
-# 客户端局部证据提取模式。
-# 可选：
-# - adam_noise: 旧逻辑。Adam optimizer + Langevin noise 注入到 gradient 上。
-# - two_stage_plain: 先 Adam 找 local MAP，再用手写 plain SGLD 采样。
-bayes_sgld_fit_mode: adam_noise
-
-# --- adam_noise 专用参数 ---
-# 只有 bayes_sgld_fit_mode: adam_noise 时使用。
-
-# 客户端局部证据提取阶段的 SGLD / optimizer 迭代步数
-bayes_sgld_steps: 10
-
-# SGLD burn-in 步数；小于总步数
-bayes_sgld_burnin: 5
-
-# 客户端提取局部 expert 证据时的 SGLD 学习率
-bayes_sgld_lr: 0.00005
-
-# --- two_stage_plain 专用参数 ---
-# 只有 bayes_sgld_fit_mode: two_stage_plain 时使用。
-
-# 阶段 1：Adam MAP 步数
-bayes_map_steps: 8
-
-# 阶段 1：Adam MAP 学习率；空值/null 表示使用 bayes_sgld_lr
-bayes_map_lr:
-
-# 阶段 2：plain SGLD 总步数
-bayes_plain_sgld_steps: 32
-
-# 阶段 2：plain SGLD burn-in 步数
-bayes_plain_sgld_burnin: 16
-
-# 阶段 2：plain SGLD 手写参数更新学习率
-bayes_plain_sgld_lr: 0.000001
-
-# 阶段 2：plain SGLD Langevin 温度；噪声尺度为 sqrt(2 * lr * temperature)
-bayes_sgld_temperature: 1.0
-
-# 阶段 2：plain SGLD 噪声独立缩放；最终噪声尺度为该值 * sqrt(2 * lr * temperature)
-bayes_plain_sgld_noise_scale: 1.0
-
-# 阶段 2：data_loss 梯度缩放，用于诊断梯度更新过弱
-bayes_plain_sgld_loss_scale: 1.0
-
-# 阶段 2：以 MAP 参数为中心的二次 prior precision；0 表示不加 MAP 回拉项
-bayes_plain_sgld_prior_precision: 0.0
-
-# 阶段 2：burn-in 后每隔多少步收集一次参数样本
-bayes_plain_sgld_sample_interval: 1
-
-# --- 两种证据提取模式共用参数 ---
-
-# 局部样本方差下限；floor_inverse 模式下会用它做 variance floor
-bayes_sgld_var_floor: 0.0
-
-# 对角精度上限，防止局部方差过小导致数值不稳定
-bayes_ai_max: 1000.0
-
-# local posterior precision 估计模式。
-# 可选：
-# - floor_inverse: 旧默认逻辑，precision = 1 / clamp(raw_var, bayes_sgld_var_floor)
-# - normalized_power: 对 raw_var 做 power tempering 后归一化到 target
-# - scalar_normalized_power: 每个参数张量共享一个 normalized_power precision
-# - relative_normalized_power: 先按 mean_state 参数尺度归一化 raw_var，再做 normalized_power
-bayes_precision_mode: floor_inverse
-
-# normalized_power / scalar_normalized_power / relative_normalized_power 的 power 温度
-bayes_precision_temperature: 0.25
-
-# normalized_power / relative_normalized_power / empirical_fisher_microbatch 的目标 precision 均值
-bayes_precision_target: 100.0
-
-# empirical_fisher_microbatch 对归一化 Fisher precision 的 power tempering 指数
-bayes_precision_gamma: 0.5
-
-# normalized_power / relative_normalized_power / empirical_fisher_microbatch 的 precision 下限
-bayes_precision_min: 20.0
-
-# normalized_power / relative_normalized_power / empirical_fisher_microbatch 的 precision 上限
-bayes_precision_max: 300.0
-
-# precision 计算时的数值稳定 eps
-bayes_precision_eps: 1.0e-12
-
-# 客户端上传 precision 的来源：
-# - sgld_variance：旧默认逻辑，使用 SGLD 参数样本方差估计 precision。
-# - laplace_diag：先做 MAP adaptation，再用 Hutchinson HVP 估计 Hessian diagonal。
-# - empirical_fisher_microbatch：mean_state 仍来自 SGLD/local mean，precision_state 使用 microbatch empirical Fisher diagonal。
-bayes_precision_source: empirical_fisher_microbatch
-
-# --- empirical_fisher_microbatch 专用参数 ---
-bayes_fisher_microbatch_size: 8
-bayes_fisher_max_batches: null
-bayes_fisher_eps: 1.0e-12
-bayes_fisher_model_mode: eval
-
-# --- laplace_diag 专用参数 ---
-# 第一版建议先和 post_train evidence 搭配验证，不要同时打开 prior-start。
-bayes_laplace_map_steps: 5
-bayes_laplace_map_lr: 0.0001
-bayes_laplace_map_optimizer: adam
-bayes_laplace_batches: 4
-bayes_laplace_hessian_estimator: hutchinson_diag
-bayes_laplace_hutchinson_samples: 2
-bayes_laplace_hutchinson_distribution: rademacher
-bayes_laplace_positive_mode: softplus
-bayes_laplace_softplus_beta: 10.0
-bayes_laplace_damping: 0.000001
-bayes_laplace_normalize: global
-bayes_laplace_target_precision: 100.0
-bayes_laplace_min_precision: 10.0
-bayes_laplace_max_precision: 300.0
-bayes_laplace_eval_mode: false
-bayes_laplace_include_router_loss: false
-
-# 每个 expert 在客户端最多抽多少个 batch 来估计局部证据
-bayes_evidence_batches: 4
-
-# 只有当 expert 实际处理 token 数达到该阈值时，才为它生成贝叶斯证据
-bayes_min_expert_tokens: 128
-
-# 服务端每轮对一个 expert 的元更新步数
-bayes_meta_steps: 2
-
-# 服务端元更新学习率
-bayes_meta_lr: 0.0005
-
-# 全局先验精度 gamma0 的初始值
-bayes_gamma0_init: 1.0
-
-# 全局先验强度 n0 的初始值
-bayes_n0_init: 1.0
-
-# 是否更新全局先验精度
-bayes_update_precision: true
-
-# 是否更新全局先验强度
-bayes_update_strength: true
-
-# Bayes-vs-FedAvg expert 更新方向诊断，默认关闭，不影响聚合结果
-bayes_direction_diag: false
-
-# 开启后每个 expert 额外输出一条 detail；默认关闭避免日志过长
-bayes_direction_diag_detail: false

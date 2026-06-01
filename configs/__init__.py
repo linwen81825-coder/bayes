@@ -33,7 +33,6 @@ _REQUIRED_CONFIG_KEYS = (
     "bayes_sgld_steps",
     "bayes_sgld_burnin",
     "bayes_sgld_lr",
-    "bayes_ai_max",
     "bayes_evidence_batches",
     "bayes_min_expert_tokens",
     "bayes_meta_steps",
@@ -78,39 +77,11 @@ _DEFAULT_CONFIG_VALUES = {
     "lr_min": None,
     "lr_warmup_rounds": 0,
     "lr_warmup_start_lr": None,
+    "bayes_precision_source": "sgld_variance",
     "bayes_sgld_fit_mode": "adam_noise",
-    "bayes_precision_source": "empirical_fisher_microbatch",
-    "bayes_precision_gamma": 0.5,
-    "bayes_fisher_microbatch_size": 8,
-    "bayes_fisher_max_batches": None,
-    "bayes_fisher_eps": 1.0e-12,
-    "bayes_fisher_model_mode": "eval",
-    "bayes_laplace_map_steps": 5,
-    "bayes_laplace_map_lr": 1.0e-4,
-    "bayes_laplace_map_optimizer": "adam",
-    "bayes_laplace_batches": 4,
-    "bayes_laplace_hessian_estimator": "hutchinson_diag",
-    "bayes_laplace_hutchinson_samples": 2,
-    "bayes_laplace_hutchinson_distribution": "rademacher",
-    "bayes_laplace_positive_mode": "softplus",
-    "bayes_laplace_softplus_beta": 10.0,
-    "bayes_laplace_damping": 1.0e-6,
-    "bayes_laplace_normalize": "global",
-    "bayes_laplace_target_precision": 100.0,
-    "bayes_laplace_min_precision": 10.0,
-    "bayes_laplace_max_precision": 300.0,
-    "bayes_laplace_eval_mode": False,
-    "bayes_laplace_include_router_loss": False,
-    "bayes_map_steps": 8,
-    "bayes_map_lr": None,
-    "bayes_plain_sgld_steps": 32,
-    "bayes_plain_sgld_burnin": 16,
-    "bayes_plain_sgld_lr": 1.0e-6,
-    "bayes_sgld_temperature": 1.0,
-    "bayes_plain_sgld_noise_scale": 1.0,
-    "bayes_plain_sgld_loss_scale": 1.0,
-    "bayes_plain_sgld_prior_precision": 0.0,
-    "bayes_plain_sgld_sample_interval": 1,
+    "bayes_precision_mode": "floor_inverse",
+    "bayes_sgld_var_floor": 0.0,
+    "bayes_precision_eps": 1.0e-12,
     "use_tqdm": True,
     "progress_bar": True,
     "progress_bar_leave": False,
@@ -120,6 +91,30 @@ _DEFAULT_CONFIG_VALUES = {
     "progress_force_tty": False,
     "progress_expert_bar": False,
 }
+_ALLOWED_BAYES_CONFIG_KEYS = {
+    "bayes_meta_device",
+    "bayes_empty_cache_after_aggregation",
+    "bayes_empty_cache_after_client_evidence",
+    "bayes_cache_device",
+    "bayes_precision_source",
+    "bayes_sgld_fit_mode",
+    "bayes_precision_mode",
+    "bayes_sgld_steps",
+    "bayes_sgld_burnin",
+    "bayes_sgld_lr",
+    "bayes_sgld_var_floor",
+    "bayes_precision_eps",
+    "bayes_evidence_batches",
+    "bayes_min_expert_tokens",
+    "bayes_meta_steps",
+    "bayes_meta_lr",
+    "bayes_gamma0_init",
+    "bayes_n0_init",
+    "bayes_update_precision",
+    "bayes_update_strength",
+}
+
+
 _RUN_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -175,6 +170,29 @@ def _raise_if_duplicate_keys(named_configs: list[tuple[str, dict]]) -> None:
             + "; ".join(duplicate_details)
             + ". Please keep keys unique across data.yaml, train.yaml, and model.yaml."
         )
+
+
+def _raise_if_unsupported_bayes_config(config: dict) -> None:
+    unsupported_keys = sorted(
+        key
+        for key in config
+        if key.startswith("bayes_") and key not in _ALLOWED_BAYES_CONFIG_KEYS
+    )
+    if unsupported_keys:
+        raise ValueError(
+            "Unsupported Bayes config keys for the minimal sgld_variance route: "
+            f"{unsupported_keys}"
+        )
+
+    required_values = {
+        "bayes_precision_source": "sgld_variance",
+        "bayes_sgld_fit_mode": "adam_noise",
+        "bayes_precision_mode": "floor_inverse",
+    }
+    for key, expected in required_values.items():
+        value = config.get(key, expected)
+        if str(value).lower() != expected:
+            raise ValueError(f"{key} now only supports: {expected}")
 
 
 def _raise_if_missing_required_keys(merged_config: dict) -> None:
@@ -244,15 +262,6 @@ def _derive_output_paths(merged_config: dict, train_cfg_path: Path) -> None:
 
 def _is_non_empty_dir(path: Path) -> bool:
     return path.exists() and path.is_dir() and any(path.iterdir())
-
-
-def _configure_runtime_defaults(args: SimpleNamespace) -> None:
-    try:
-        from fl.bayes_utils import configure_bayes_sgld_fit_defaults
-    except ImportError:
-        return
-
-    configure_bayes_sgld_fit_defaults(args)
 
 
 def _check_output_overwrite(args: SimpleNamespace, output_phase: str | None) -> None:
@@ -371,11 +380,11 @@ def load_args(
     for _, config in config_items:
         merged_config.update(config)
 
+    _raise_if_unsupported_bayes_config(merged_config)
     _derive_output_paths(merged_config, resolved_train_cfg_path)
     _raise_if_missing_required_keys(merged_config)
 
     args = SimpleNamespace(**merged_config)
-    _configure_runtime_defaults(args)
     _check_output_overwrite(args, output_phase)
     return args
 
