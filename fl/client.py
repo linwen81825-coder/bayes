@@ -41,6 +41,8 @@ class Client:
         self.client_momentum = float(getattr(self.args, "client_momentum", 0.9))
         self.client_weight_decay = float(getattr(self.args, "client_weight_decay", 5e-4))
         self.client_nesterov = bool(getattr(self.args, "client_nesterov", False))
+        self.client_grad_clip = bool(getattr(self.args, "client_grad_clip", True))
+        self.client_grad_clip_norm = float(getattr(self.args, "client_grad_clip_norm", 1.0))
         if self.client_optimizer == "sgd":
             self.optimizer = optim.SGD(
                 self.model.parameters(),
@@ -74,7 +76,9 @@ class Client:
             f"--client_lr:{self.current_learning_rate:.8f} "
             f"--client_momentum:{self.client_momentum} "
             f"--client_weight_decay:{self.client_weight_decay} "
-            f"--client_nesterov:{self.client_nesterov}"
+            f"--client_nesterov:{self.client_nesterov} "
+            f"--client_grad_clip:{self.client_grad_clip} "
+            f"--client_grad_clip_norm:{self.client_grad_clip_norm}"
         )
         self.router_aux_loss_coef = self.args.router_aux_loss_coef
         self.router_z_loss_coef = self.args.router_z_loss_coef
@@ -551,7 +555,11 @@ class Client:
                 extra_loss, router_aux_loss, router_z_loss = self.get_auxiliary_losses(result)
                 loss = self.criterion(outputs, labels) + extra_loss
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1)
+                if self.client_grad_clip and self.client_grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=self.client_grad_clip_norm,
+                    )
                 self.optimizer.step()
 
                 batch_size = inputs.size(0)

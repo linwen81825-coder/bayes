@@ -23,6 +23,8 @@ learning_rate: 0.05
 client_momentum: 0.9
 client_weight_decay: 0.0005
 client_nesterov: false
+client_grad_clip: true
+client_grad_clip_norm: 1.0
 
 # 客户端本地训练的 round-level 学习率调度器。
 # - none / constant / off：保持固定 learning_rate，不做调度。
