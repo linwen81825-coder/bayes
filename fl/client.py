@@ -105,8 +105,8 @@ class Client:
         ).lower()
         if self.bayes_precision_source != "sgld_variance":
             raise ValueError("bayes_precision_source now only supports: sgld_variance")
-        if self.bayes_sgld_fit_mode != "adam_noise":
-            raise ValueError("bayes_sgld_fit_mode now only supports: adam_noise")
+        if self.bayes_sgld_fit_mode not in {"adam_noise", "sgd_noise"}:
+            raise ValueError("bayes_sgld_fit_mode must be one of: adam_noise, sgd_noise")
         if self.bayes_sgld_timing not in {"after_train", "before_train"}:
             raise ValueError("bayes_sgld_timing must be one of: after_train, before_train")
         if self.bayes_precision_mode != "floor_inverse":

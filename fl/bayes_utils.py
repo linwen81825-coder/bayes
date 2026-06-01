@@ -179,8 +179,8 @@ def run_expert_sgld_fit(
         raise ValueError("bayes_precision_source now only supports: sgld_variance")
 
     sgld_fit_mode = str(sgld_fit_mode or "adam_noise").lower()
-    if sgld_fit_mode != "adam_noise":
-        raise ValueError("bayes_sgld_fit_mode now only supports: adam_noise")
+    if sgld_fit_mode not in {"adam_noise", "sgd_noise"}:
+        raise ValueError("bayes_sgld_fit_mode must be one of: adam_noise, sgd_noise")
 
     precision_mode = str(precision_mode or "floor_inverse").lower()
     if precision_mode != "floor_inverse":
@@ -217,7 +217,9 @@ def run_expert_sgld_fit(
     prepare_cache_time_sec = time.perf_counter() - prepare_start
 
     sgld_lr = max(float(alp) / float(total_samples), 1.0e-12)
-    optimizer = torch.optim.Adam(params=target_params, lr=sgld_lr)
+    optimizer = None
+    if sgld_fit_mode == "adam_noise":
+        optimizer = torch.optim.Adam(params=target_params, lr=sgld_lr)
     noise_scale = math.sqrt(1.0 / sgld_lr)
     moment1 = None
     moment2 = None
@@ -226,7 +228,11 @@ def run_expert_sgld_fit(
     forward_backward_time_sec = 0.0
 
     for step_idx in range(steps):
-        optimizer.zero_grad(set_to_none=True)
+        if optimizer is None:
+            for param in target_params:
+                param.grad = None
+        else:
+            optimizer.zero_grad(set_to_none=True)
         weighted_loss = None
         seen_samples = 0
         step_start = time.perf_counter()
@@ -253,8 +259,13 @@ def run_expert_sgld_fit(
                 if param.grad is None:
                     continue
                 param.grad.mul_(grad_scale)
-                param.grad.add_(noise_scale * torch.randn_like(param))
-        optimizer.step()
+                noise = noise_scale * torch.randn_like(param)
+                if sgld_fit_mode == "adam_noise":
+                    param.grad.add_(noise)
+                else:
+                    param.add_(param.grad + noise, alpha=-sgld_lr)
+        if optimizer is not None:
+            optimizer.step()
         forward_backward_time_sec += time.perf_counter() - step_start
 
         if step_idx >= burnin:
@@ -286,7 +297,7 @@ def run_expert_sgld_fit(
 
     diag = {
         "precision_source": "sgld_variance",
-        "sgld_noise_mode": "adam_noise",
+        "sgld_noise_mode": sgld_fit_mode,
         "precision_method": "floor_inverse",
         "mean_state_source": "sgld_sample_mean",
         "precision_state_source": "sgld_variance_floor_inverse",

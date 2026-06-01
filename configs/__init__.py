@@ -212,13 +212,16 @@ def _raise_if_unsupported_bayes_config(config: dict) -> None:
 
     required_values = {
         "bayes_precision_source": "sgld_variance",
-        "bayes_sgld_fit_mode": "adam_noise",
         "bayes_precision_mode": "floor_inverse",
     }
     for key, expected in required_values.items():
         value = config.get(key, expected)
         if str(value).lower() != expected:
             raise ValueError(f"{key} now only supports: {expected}")
+
+    sgld_fit_mode = str(config.get("bayes_sgld_fit_mode", "adam_noise")).lower()
+    if sgld_fit_mode not in {"adam_noise", "sgd_noise"}:
+        raise ValueError("bayes_sgld_fit_mode must be one of: adam_noise, sgd_noise")
 
     meta_update_mode = str(config.get("bayes_meta_update_mode", "optimizer")).lower()
     if meta_update_mode not in {"optimizer", "closed_form_weighted"}:

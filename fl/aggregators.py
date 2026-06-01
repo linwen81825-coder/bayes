@@ -385,14 +385,14 @@ class ExpertBayesMetaAggregator(Aggregator):
         precision_mode = str(getattr(args, "bayes_precision_mode", "floor_inverse")).lower()
         if precision_source != "sgld_variance":
             raise ValueError("bayes_precision_source now only supports: sgld_variance")
-        if sgld_fit_mode != "adam_noise":
-            raise ValueError("bayes_sgld_fit_mode now only supports: adam_noise")
+        if sgld_fit_mode not in {"adam_noise", "sgd_noise"}:
+            raise ValueError("bayes_sgld_fit_mode must be one of: adam_noise, sgd_noise")
         if precision_mode != "floor_inverse":
             raise ValueError("bayes_precision_mode now only supports: floor_inverse")
         print(
             "[ExpertBayesMetaAggregator] "
             "bayes_precision_source=sgld_variance "
-            "bayes_sgld_noise_mode=adam_noise "
+            f"bayes_sgld_noise_mode={sgld_fit_mode} "
             "bayes_precision_method=floor_inverse "
             f"bayes_meta_device={self.meta_device}"
         )
