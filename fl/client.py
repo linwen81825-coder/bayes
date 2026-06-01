@@ -255,7 +255,12 @@ class Client:
             total_stats[layer_key]["capacity"] = stats.get("capacity", total_stats[layer_key]["capacity"])
 
     def should_collect_bayes_evidence(self):
-        return getattr(self.args, "agg_method", "") == "expert_bayes_meta"
+        agg_method = str(getattr(self.args, "agg_method", "")).lower()
+        expert_agg_method = str(getattr(self.args, "expert_agg_method", "")).lower()
+        return (
+            agg_method == "expert_bayes_meta"
+            or (agg_method == "decoupled_moe" and expert_agg_method == "expert_bayes_meta")
+        )
 
     def get_active_expert_refs(self, layer_stats):
         active_experts = []

@@ -93,7 +93,12 @@ class Server:
         torch.save(cpu_state_dict, self.args.model_save_path + f"/server.pth")
 
     def uses_bayesian_aggregation(self):
-        return self.args.agg_method == "expert_bayes_meta"
+        agg_method = str(getattr(self.args, "agg_method", "")).lower()
+        expert_agg_method = str(getattr(self.args, "expert_agg_method", "")).lower()
+        return (
+            agg_method == "expert_bayes_meta"
+            or (agg_method == "decoupled_moe" and expert_agg_method == "expert_bayes_meta")
+        )
 
     def resolve_resume_checkpoint_path(self):
         path = getattr(self.args, "resume_checkpoint_path", None)
