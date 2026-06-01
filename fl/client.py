@@ -97,6 +97,9 @@ class Client:
         self.bayes_sgld_fit_mode = str(
             getattr(self.args, "bayes_sgld_fit_mode", "adam_noise")
         ).lower()
+        self.bayes_sgld_timing = str(
+            getattr(self.args, "bayes_sgld_timing", "after_train")
+        ).lower()
         self.bayes_precision_mode = str(
             getattr(self.args, "bayes_precision_mode", "floor_inverse")
         ).lower()
@@ -104,6 +107,8 @@ class Client:
             raise ValueError("bayes_precision_source now only supports: sgld_variance")
         if self.bayes_sgld_fit_mode != "adam_noise":
             raise ValueError("bayes_sgld_fit_mode now only supports: adam_noise")
+        if self.bayes_sgld_timing not in {"after_train", "before_train"}:
+            raise ValueError("bayes_sgld_timing must be one of: after_train, before_train")
         if self.bayes_precision_mode != "floor_inverse":
             raise ValueError("bayes_precision_mode now only supports: floor_inverse")
 
@@ -119,6 +124,7 @@ class Client:
                 f"--client: {self.client_id} --bayes_route "
                 f"bayes_precision_source={self.bayes_precision_source} "
                 f"bayes_sgld_noise_mode={self.bayes_sgld_fit_mode} "
+                f"bayes_sgld_timing={self.bayes_sgld_timing} "
                 f"bayes_precision_method={self.bayes_precision_mode}"
             )
 
@@ -382,6 +388,55 @@ class Client:
             batch_cache.append((cached_inputs, cached_labels))
         return batch_cache
 
+    def backup_torch_rng_state(self):
+        rng_state = {"cpu": torch.get_rng_state()}
+        if str(self.device).startswith("cuda") and torch.cuda.is_available():
+            rng_state["cuda"] = torch.cuda.get_rng_state_all()
+        return rng_state
+
+    def restore_torch_rng_state(self, rng_state):
+        torch.set_rng_state(rng_state["cpu"])
+        if "cuda" in rng_state:
+            torch.cuda.set_rng_state_all(rng_state["cuda"])
+
+    def collect_before_train_bayes_inputs(self):
+        layer_usage_total = {}
+        batch_cache_by_expert = {}
+        evidence_loader = build_client_train_loader(
+            args=self.args,
+            client_id=self.client_id,
+            meta=self.partition_meta,
+        )
+        was_training = self.model.training
+        non_blocking = bool(getattr(self.args, "pin_memory", False)) and str(self.device).startswith("cuda")
+        self.model.train()
+        try:
+            with torch.no_grad():
+                for inputs, labels in evidence_loader:
+                    inputs = inputs.to(self.device, non_blocking=non_blocking)
+                    labels = labels.to(self.device, non_blocking=non_blocking)
+                    result = self.model(inputs)
+                    batch_layer_stats = self.get_layer_expert_stats(result)
+                    self.add_layer_stats(layer_usage_total, batch_layer_stats)
+                    self.update_bayes_batch_cache(
+                        batch_cache_by_expert=batch_cache_by_expert,
+                        inputs=inputs,
+                        labels=labels,
+                        layer_stats=batch_layer_stats,
+                    )
+        finally:
+            self.model.train(was_training)
+        return layer_usage_total, batch_cache_by_expert
+
+    def log_bayes_evidence_timing(self, before_train_restore_done):
+        if not self.should_collect_bayes_evidence():
+            return
+        self.logger.info(
+            f"--client: {self.client_id} --bayes_evidence_diag "
+            f"--evidence_timing:{self.bayes_sgld_timing} "
+            f"--before_train_restore_done:{str(bool(before_train_restore_done)).lower()}"
+        )
+
     def build_evidence_model(self):
         evidence_model = build_model_from_args(self.args)
         cpu_state_dict = {
@@ -532,6 +587,27 @@ class Client:
             f"--lr_scheduler:{getattr(self.args, 'lr_scheduler', 'none')}"
         )
 
+        before_train_bayes_evidence = None
+        before_train_bayes_evidence_time = 0.0
+        if self.should_collect_bayes_evidence() and self.bayes_sgld_timing == "before_train":
+            model_state_before_sgld = {
+                key: value.detach().cpu().clone()
+                for key, value in self.model.state_dict().items()
+            }
+            rng_state_before_sgld = self.backup_torch_rng_state()
+            bayes_evidence_start = time.perf_counter()
+            try:
+                before_train_layer_stats, before_train_batch_cache = self.collect_before_train_bayes_inputs()
+                before_train_bayes_evidence = self.extract_bayesian_evidence(
+                    before_train_layer_stats,
+                    before_train_batch_cache,
+                )
+            finally:
+                self.model.load_state_dict(model_state_before_sgld)
+                self.restore_torch_rng_state(rng_state_before_sgld)
+            before_train_bayes_evidence_time = time.perf_counter() - bayes_evidence_start
+            self.log_bayes_evidence_timing(before_train_restore_done=True)
+
         local_train_start = time.perf_counter()
         last_avg_router_probs = torch.zeros(self.args.num_experts, device=self.device)
         local_usage_total = torch.zeros(self.args.num_experts, device=self.device)
@@ -578,12 +654,13 @@ class Client:
                 usage_total += self.get_expert_activations(result)
                 batch_layer_stats = self.get_layer_expert_stats(result)
                 self.add_layer_stats(layer_usage_total, batch_layer_stats)
-                self.update_bayes_batch_cache(
-                    batch_cache_by_expert=bayes_batch_cache_by_expert,
-                    inputs=inputs,
-                    labels=labels,
-                    layer_stats=batch_layer_stats,
-                )
+                if self.bayes_sgld_timing == "after_train":
+                    self.update_bayes_batch_cache(
+                        batch_cache_by_expert=bayes_batch_cache_by_expert,
+                        inputs=inputs,
+                        labels=labels,
+                        layer_stats=batch_layer_stats,
+                    )
                 router_prob_sum += self.get_avg_router_probs(result) * batch_size
 
             denom = max(total_samples, 1)
@@ -640,9 +717,14 @@ class Client:
             }
             for layer_id, stats in local_layer_usage_total.items()
         }
-        bayes_evidence_start = time.perf_counter()
-        bayes_evidence = self.extract_bayesian_evidence(layer_stats_cpu, bayes_batch_cache_by_expert)
-        bayes_evidence_time = time.perf_counter() - bayes_evidence_start
+        if before_train_bayes_evidence is None:
+            bayes_evidence_start = time.perf_counter()
+            bayes_evidence = self.extract_bayesian_evidence(layer_stats_cpu, bayes_batch_cache_by_expert)
+            bayes_evidence_time = time.perf_counter() - bayes_evidence_start
+            self.log_bayes_evidence_timing(before_train_restore_done=False)
+        else:
+            bayes_evidence = before_train_bayes_evidence
+            bayes_evidence_time = before_train_bayes_evidence_time
         return {
             "local_state_dict": local_state_dict,
             "expert_activations": local_usage_total.detach().cpu(),

@@ -81,6 +81,7 @@ _DEFAULT_CONFIG_VALUES = {
     "lr_warmup_start_lr": None,
     "bayes_precision_source": "sgld_variance",
     "bayes_sgld_fit_mode": "adam_noise",
+    "bayes_sgld_timing": "after_train",
     "bayes_precision_mode": "floor_inverse",
     "bayes_sgld_var_floor": 0.0,
     "bayes_precision_eps": 1.0e-12,
@@ -111,6 +112,7 @@ _ALLOWED_BAYES_CONFIG_KEYS = {
     "bayes_cache_device",
     "bayes_precision_source",
     "bayes_sgld_fit_mode",
+    "bayes_sgld_timing",
     "bayes_precision_mode",
     "bayes_sgld_steps",
     "bayes_sgld_burnin",
@@ -223,6 +225,10 @@ def _raise_if_unsupported_bayes_config(config: dict) -> None:
         raise ValueError(
             "bayes_meta_update_mode must be one of: optimizer, closed_form_weighted"
         )
+
+    sgld_timing = str(config.get("bayes_sgld_timing", "after_train")).lower()
+    if sgld_timing not in {"after_train", "before_train"}:
+        raise ValueError("bayes_sgld_timing must be one of: after_train, before_train")
 
 
 def _raise_if_missing_required_keys(merged_config: dict) -> None:
