@@ -99,7 +99,13 @@ def _build_shared_precision_calibration(client_payloads, expert_keys, args):
     }
 
 
-def _apply_shared_precision_calibration(local_precision_state, expert_keys, scales, args):
+def _apply_shared_precision_calibration(
+    local_precision_state,
+    expert_keys,
+    scales,
+    args,
+    precision_clip_diag=None,
+):
     if not isinstance(local_precision_state, dict):
         return local_precision_state
     precision_min = float(getattr(args, "bayes_weighted_precision_min", 1.0e-8))
@@ -110,9 +116,17 @@ def _apply_shared_precision_calibration(local_precision_state, expert_keys, scal
         if not torch.is_tensor(raw_precision) or not torch.isfinite(raw_precision).all().item():
             effective_state[key] = raw_precision
             continue
-        effective_state[key] = (
-            raw_precision.detach().double() * float(scales.get(key, 1.0))
-        ).clamp(min=precision_min, max=precision_max)
+        scaled_precision = raw_precision.detach().double() * float(scales.get(key, 1.0))
+        if precision_clip_diag is not None:
+            valid = torch.isfinite(scaled_precision)
+            precision_clip_diag["precision_total_count"] += int(valid.sum().item())
+            precision_clip_diag["precision_clip_max_count"] += int(
+                ((scaled_precision > precision_max) & valid).sum().item()
+            )
+            precision_clip_diag["precision_clip_min_count"] += int(
+                ((scaled_precision < precision_min) & valid).sum().item()
+            )
+        effective_state[key] = scaled_precision.clamp(min=precision_min, max=precision_max)
     return effective_state
 
 
@@ -727,12 +741,20 @@ class ExpertBayesMetaAggregator(Aggregator):
         valid_clients = []
         for payload in client_payloads:
             local_precision_state = payload.get("precision_state")
+            precision_clip_diag = None
             if self.weighted_precision_calibration == "median_target":
+                if bool(getattr(self.args, "bayes_weighted_diag", False)):
+                    precision_clip_diag = {
+                        "precision_clip_max_count": 0,
+                        "precision_clip_min_count": 0,
+                        "precision_total_count": 0,
+                    }
                 local_precision_state = _apply_shared_precision_calibration(
                     local_precision_state=local_precision_state,
                     expert_keys=expert_keys,
                     scales=precision_scales,
                     args=self.args,
+                    precision_clip_diag=precision_clip_diag,
                 )
             posterior = _compute_local_posterior_for_client(
                 local_mean_state=payload.get("mean_state"),
@@ -762,6 +784,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                 "m_star_state": m_star_state,
                 "sanitized_precision_state": sanitized_precision_state,
                 "score": score,
+                "precision_clip_diag": precision_clip_diag,
             })
 
         beta = _scores_to_beta([client["score"] for client in valid_clients], self.args)
@@ -876,6 +899,38 @@ class ExpertBayesMetaAggregator(Aggregator):
             ],
             include_std=True,
         )
+        precision_clip_diags = [
+            client["precision_clip_diag"]
+            for client in valid_clients
+            if client["precision_clip_diag"] is not None
+        ]
+        precision_clip_stats = {}
+        if precision_clip_diags:
+            precision_clip_max_count = sum(
+                diag["precision_clip_max_count"] for diag in precision_clip_diags
+            )
+            precision_clip_min_count = sum(
+                diag["precision_clip_min_count"] for diag in precision_clip_diags
+            )
+            precision_total_count = sum(
+                diag["precision_total_count"] for diag in precision_clip_diags
+            )
+            precision_clip_count = precision_clip_max_count + precision_clip_min_count
+            if precision_total_count > 0:
+                precision_clip_max_frac = precision_clip_max_count / precision_total_count
+                precision_clip_min_frac = precision_clip_min_count / precision_total_count
+                precision_clip_frac = precision_clip_count / precision_total_count
+            else:
+                precision_clip_max_frac = 0.0
+                precision_clip_min_frac = 0.0
+                precision_clip_frac = 0.0
+            precision_clip_stats = {
+                "precision_clip_frac": precision_clip_frac,
+                "precision_clip_max_frac": precision_clip_max_frac,
+                "precision_clip_min_frac": precision_clip_min_frac,
+                "precision_clip_count": precision_clip_count,
+                "precision_total_count": precision_total_count,
+            }
         prior_var_stats = summarize_tensors(prior_var_state.values(), include_std=False)
         mean_update_square_sum = sum(
             float((new_mean_state[key] - prior_mean_state[key]).double().square().sum().item())
@@ -899,6 +954,7 @@ class ExpertBayesMetaAggregator(Aggregator):
             "prior_var_min": prior_var_stats["min"],
             "prior_var_max": prior_var_stats["max"],
             "mean_update_norm": math.sqrt(mean_update_square_sum),
+            **precision_clip_stats,
             **precision_calibration_diag,
         }
 
