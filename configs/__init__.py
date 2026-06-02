@@ -82,6 +82,7 @@ _DEFAULT_CONFIG_VALUES = {
     "bayes_precision_source": "sgld_variance",
     "bayes_sgld_fit_mode": "adam_noise",
     "bayes_sgld_timing": "after_train",
+    "bayes_evidence_mean_source": "sgld_mean",
     "bayes_sgld_movement_diag": False,
     "bayes_sgld_movement_diag_detail": False,
     "bayes_sgld_stuck_rel_threshold": 1.0e-5,
@@ -119,6 +120,7 @@ _ALLOWED_BAYES_CONFIG_KEYS = {
     "bayes_precision_source",
     "bayes_sgld_fit_mode",
     "bayes_sgld_timing",
+    "bayes_evidence_mean_source",
     "bayes_sgld_movement_diag",
     "bayes_sgld_movement_diag_detail",
     "bayes_sgld_stuck_rel_threshold",
@@ -244,6 +246,17 @@ def _raise_if_unsupported_bayes_config(config: dict) -> None:
     sgld_timing = str(config.get("bayes_sgld_timing", "after_train")).lower()
     if sgld_timing not in {"after_train", "before_train"}:
         raise ValueError("bayes_sgld_timing must be one of: after_train, before_train")
+
+    evidence_mean_source = str(config.get("bayes_evidence_mean_source", "sgld_mean")).lower()
+    if evidence_mean_source not in {"sgld_mean", "train_final"}:
+        raise ValueError(
+            "bayes_evidence_mean_source must be one of: sgld_mean, train_final"
+        )
+    if sgld_timing == "after_train" and evidence_mean_source == "train_final":
+        raise ValueError(
+            "bayes_evidence_mean_source=train_final currently requires "
+            "bayes_sgld_timing=before_train"
+        )
 
     precision_calibration = str(config.get("bayes_weighted_precision_calibration", "none")).lower()
     if precision_calibration not in {"none", "median_target"}:

@@ -100,6 +100,9 @@ class Client:
         self.bayes_sgld_timing = str(
             getattr(self.args, "bayes_sgld_timing", "after_train")
         ).lower()
+        self.bayes_evidence_mean_source = str(
+            getattr(self.args, "bayes_evidence_mean_source", "sgld_mean")
+        ).lower()
         self.bayes_sgld_movement_diag = bool(getattr(self.args, "bayes_sgld_movement_diag", False))
         self.bayes_sgld_movement_diag_detail = bool(
             getattr(self.args, "bayes_sgld_movement_diag_detail", False)
@@ -121,6 +124,15 @@ class Client:
             raise ValueError("bayes_sgld_fit_mode must be one of: adam_noise, sgd_noise")
         if self.bayes_sgld_timing not in {"after_train", "before_train"}:
             raise ValueError("bayes_sgld_timing must be one of: after_train, before_train")
+        if self.bayes_evidence_mean_source not in {"sgld_mean", "train_final"}:
+            raise ValueError(
+                "bayes_evidence_mean_source must be one of: sgld_mean, train_final"
+            )
+        if self.bayes_sgld_timing == "after_train" and self.bayes_evidence_mean_source == "train_final":
+            raise ValueError(
+                "bayes_evidence_mean_source=train_final currently requires "
+                "bayes_sgld_timing=before_train"
+            )
         if self.bayes_precision_mode != "floor_inverse":
             raise ValueError("bayes_precision_mode now only supports: floor_inverse")
 
@@ -137,6 +149,7 @@ class Client:
                 f"bayes_precision_source={self.bayes_precision_source} "
                 f"bayes_sgld_noise_mode={self.bayes_sgld_fit_mode} "
                 f"bayes_sgld_timing={self.bayes_sgld_timing} "
+                f"bayes_evidence_mean_source={self.bayes_evidence_mean_source} "
                 f"bayes_precision_method={self.bayes_precision_mode}"
             )
 
@@ -440,12 +453,24 @@ class Client:
             self.model.train(was_training)
         return layer_usage_total, batch_cache_by_expert
 
-    def log_bayes_evidence_timing(self, before_train_restore_done):
+    def log_bayes_evidence_timing(
+        self,
+        before_train_restore_done,
+        train_final_mean_applied=False,
+        missing_train_final_mean_keys=0,
+    ):
         if not self.should_collect_bayes_evidence():
             return
+        evidence_precision_source = (
+            "pre_sgld" if self.bayes_sgld_timing == "before_train" else "post_train_sgld"
+        )
         self.logger.info(
             f"--client: {self.client_id} --bayes_evidence_diag "
+            f"--bayes_evidence_mean_source:{self.bayes_evidence_mean_source} "
             f"--evidence_timing:{self.bayes_sgld_timing} "
+            f"--evidence_precision_source:{evidence_precision_source} "
+            f"--train_final_mean_applied:{str(bool(train_final_mean_applied)).lower()} "
+            f"--missing_train_final_mean_keys:{int(missing_train_final_mean_keys)} "
             f"--before_train_restore_done:{str(bool(before_train_restore_done)).lower()}"
         )
 
@@ -476,6 +501,36 @@ class Client:
         with torch.no_grad():
             for name, value in backup.items():
                 param_dict[name].copy_(value)
+
+    def apply_train_final_evidence_means(self, evidence_by_layer, train_final_state):
+        train_final_mean_applied = False
+        missing_train_final_mean_keys = 0
+        for expert_map in evidence_by_layer.values():
+            if not isinstance(expert_map, dict):
+                continue
+            for expert_evidence in expert_map.values():
+                if not isinstance(expert_evidence, dict):
+                    continue
+                mean_state = expert_evidence.get("mean_state")
+                precision_state = expert_evidence.get("precision_state")
+                if not isinstance(mean_state, dict) or not isinstance(precision_state, dict):
+                    continue
+                for key, sgld_mean in mean_state.items():
+                    if key not in precision_state:
+                        continue
+                    train_final_mean = train_final_state.get(key)
+                    if (
+                        not torch.is_tensor(train_final_mean)
+                        or not torch.is_tensor(sgld_mean)
+                        or not torch.is_tensor(precision_state[key])
+                        or train_final_mean.shape != sgld_mean.shape
+                        or train_final_mean.shape != precision_state[key].shape
+                    ):
+                        missing_train_final_mean_keys += 1
+                        continue
+                    mean_state[key] = train_final_mean.detach().cpu().clone()
+                    train_final_mean_applied = True
+        return train_final_mean_applied, missing_train_final_mean_keys
 
     def fit_local_expert_evidence(
         self,
@@ -680,7 +735,8 @@ class Client:
                 self.model.load_state_dict(model_state_before_sgld)
                 self.restore_torch_rng_state(rng_state_before_sgld)
             before_train_bayes_evidence_time = time.perf_counter() - bayes_evidence_start
-            self.log_bayes_evidence_timing(before_train_restore_done=True)
+            if self.bayes_evidence_mean_source == "sgld_mean":
+                self.log_bayes_evidence_timing(before_train_restore_done=True)
 
         local_train_start = time.perf_counter()
         last_avg_router_probs = torch.zeros(self.args.num_experts, device=self.device)
@@ -795,10 +851,25 @@ class Client:
             bayes_evidence_start = time.perf_counter()
             bayes_evidence = self.extract_bayesian_evidence(layer_stats_cpu, bayes_batch_cache_by_expert)
             bayes_evidence_time = time.perf_counter() - bayes_evidence_start
-            self.log_bayes_evidence_timing(before_train_restore_done=False)
+            if self.bayes_evidence_mean_source == "sgld_mean":
+                self.log_bayes_evidence_timing(before_train_restore_done=False)
         else:
             bayes_evidence = before_train_bayes_evidence
             bayes_evidence_time = before_train_bayes_evidence_time
+
+        train_final_mean_applied = False
+        missing_train_final_mean_keys = 0
+        if before_train_bayes_evidence is not None and self.bayes_evidence_mean_source == "train_final":
+            train_final_mean_applied, missing_train_final_mean_keys = self.apply_train_final_evidence_means(
+                evidence_by_layer=bayes_evidence,
+                train_final_state=local_state_dict,
+            )
+        if self.bayes_evidence_mean_source == "train_final":
+            self.log_bayes_evidence_timing(
+                before_train_restore_done=before_train_bayes_evidence is not None,
+                train_final_mean_applied=train_final_mean_applied,
+                missing_train_final_mean_keys=missing_train_final_mean_keys,
+            )
         return {
             "local_state_dict": local_state_dict,
             "expert_activations": local_usage_total.detach().cpu(),

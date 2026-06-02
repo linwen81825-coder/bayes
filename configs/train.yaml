@@ -85,6 +85,7 @@ bayes_precision_mode: floor_inverse
 
 # Local SGLD evidence extraction.
 bayes_sgld_timing: after_train
+bayes_evidence_mean_source: sgld_mean
 bayes_sgld_movement_diag: false
 bayes_sgld_movement_diag_detail: false
 bayes_sgld_stuck_rel_threshold: 1.0e-5
