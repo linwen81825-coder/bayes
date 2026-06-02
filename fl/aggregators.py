@@ -41,6 +41,81 @@ def _sanitize_var_tensor(V, args):
     return V.clamp(min=var_min, max=var_max)
 
 
+def _summarize_finite_scalars(values):
+    values = [float(value) for value in values if math.isfinite(float(value))]
+    if not values:
+        return {"mean": None, "min": None, "max": None}
+    return {
+        "mean": sum(values) / len(values),
+        "min": min(values),
+        "max": max(values),
+    }
+
+
+def _build_shared_precision_calibration(client_payloads, expert_keys, args):
+    mode = str(getattr(args, "bayes_weighted_precision_calibration", "none")).lower()
+    target = float(getattr(args, "bayes_weighted_precision_target", 100.0))
+    eps = max(float(getattr(args, "bayes_weighted_eps", 1.0e-8)), 1.0e-12)
+    scales = collections.OrderedDict((key, 1.0) for key in expert_keys)
+    raw_medians = []
+    invalid_count = 0
+    if mode == "median_target":
+        for key in expert_keys:
+            client_medians = []
+            for payload in client_payloads:
+                raw_precision = payload.get("precision_state", {}).get(key)
+                if not torch.is_tensor(raw_precision):
+                    continue
+                raw_precision = raw_precision.detach()
+                valid_values = raw_precision[torch.isfinite(raw_precision) & (raw_precision > 0)]
+                if valid_values.numel() > 0:
+                    client_medians.append(float(torch.quantile(valid_values.double(), 0.5).item()))
+            if client_medians:
+                raw_median = float(torch.quantile(torch.tensor(client_medians, dtype=torch.float64), 0.5).item())
+            else:
+                raw_median = None
+            if raw_median is None or not math.isfinite(raw_median) or raw_median <= 0:
+                invalid_count += 1
+                continue
+            scale = target / (raw_median + eps)
+            if not math.isfinite(scale) or scale <= 0:
+                invalid_count += 1
+                continue
+            scales[key] = float(scale)
+            raw_medians.append(raw_median)
+
+    scale_stats = _summarize_finite_scalars(scales.values())
+    raw_median_stats = _summarize_finite_scalars(raw_medians)
+    return scales, {
+        "precision_calibration_mode": mode,
+        "precision_target": target,
+        "precision_scale_mean": scale_stats["mean"],
+        "precision_scale_min": scale_stats["min"],
+        "precision_scale_max": scale_stats["max"],
+        "raw_precision_median_mean": raw_median_stats["mean"],
+        "raw_precision_median_min": raw_median_stats["min"],
+        "raw_precision_median_max": raw_median_stats["max"],
+        "invalid_precision_calibration_count": invalid_count,
+    }
+
+
+def _apply_shared_precision_calibration(local_precision_state, expert_keys, scales, args):
+    if not isinstance(local_precision_state, dict):
+        return local_precision_state
+    precision_min = float(getattr(args, "bayes_weighted_precision_min", 1.0e-8))
+    precision_max = float(getattr(args, "bayes_weighted_precision_max", 1.0e8))
+    effective_state = collections.OrderedDict()
+    for key in expert_keys:
+        raw_precision = local_precision_state.get(key)
+        if not torch.is_tensor(raw_precision) or not torch.isfinite(raw_precision).all().item():
+            effective_state[key] = raw_precision
+            continue
+        effective_state[key] = (
+            raw_precision.detach().double() * float(scales.get(key, 1.0))
+        ).clamp(min=precision_min, max=precision_max)
+    return effective_state
+
+
 def _compute_local_posterior_for_client(
     local_mean_state,
     local_precision_state,
@@ -365,6 +440,10 @@ class ExpertBayesMetaAggregator(Aggregator):
         self.weighted_min_valid_clients = int(getattr(args, "bayes_weighted_min_valid_clients", 2))
         self.weighted_precision_min = float(getattr(args, "bayes_weighted_precision_min", 1.0e-8))
         self.weighted_precision_max = float(getattr(args, "bayes_weighted_precision_max", 1.0e8))
+        self.weighted_precision_calibration = str(
+            getattr(args, "bayes_weighted_precision_calibration", "none")
+        ).lower()
+        self.weighted_precision_target = float(getattr(args, "bayes_weighted_precision_target", 100.0))
         self.weighted_var_min = float(getattr(args, "bayes_weighted_var_min", 1.0e-8))
         self.weighted_var_max = float(getattr(args, "bayes_weighted_var_max", 1.0e8))
         self.weighted_diag = bool(
@@ -373,6 +452,10 @@ class ExpertBayesMetaAggregator(Aggregator):
         if self.meta_update_mode not in {"optimizer", "closed_form_weighted"}:
             raise ValueError(
                 "bayes_meta_update_mode must be one of: optimizer, closed_form_weighted"
+            )
+        if self.weighted_precision_calibration not in {"none", "median_target"}:
+            raise ValueError(
+                "bayes_weighted_precision_calibration must be one of: none, median_target"
             )
         self.update_precision = bool(getattr(args, "bayes_update_precision", True))
         self.update_strength = bool(getattr(args, "bayes_update_strength", True))
@@ -622,11 +705,38 @@ class ExpertBayesMetaAggregator(Aggregator):
             prior_mean_state[key] = prior_mean
             prior_var_state[key] = prior_var
 
+        calibration_payloads = []
+        if self.weighted_precision_calibration == "median_target":
+            for payload in client_payloads:
+                posterior = _compute_local_posterior_for_client(
+                    local_mean_state=payload.get("mean_state"),
+                    local_precision_state=payload.get("precision_state"),
+                    prior_mean_state=prior_mean_state,
+                    prior_var_state=prior_var_state,
+                    n0=prior_n0,
+                    args=self.args,
+                )
+                if posterior is not None:
+                    calibration_payloads.append(payload)
+        precision_scales, precision_calibration_diag = _build_shared_precision_calibration(
+            client_payloads=calibration_payloads,
+            expert_keys=expert_keys,
+            args=self.args,
+        )
+
         valid_clients = []
         for payload in client_payloads:
+            local_precision_state = payload.get("precision_state")
+            if self.weighted_precision_calibration == "median_target":
+                local_precision_state = _apply_shared_precision_calibration(
+                    local_precision_state=local_precision_state,
+                    expert_keys=expert_keys,
+                    scales=precision_scales,
+                    args=self.args,
+                )
             posterior = _compute_local_posterior_for_client(
                 local_mean_state=payload.get("mean_state"),
-                local_precision_state=payload.get("precision_state"),
+                local_precision_state=local_precision_state,
                 prior_mean_state=prior_mean_state,
                 prior_var_state=prior_var_state,
                 n0=prior_n0,
@@ -717,6 +827,7 @@ class ExpertBayesMetaAggregator(Aggregator):
                 prior_var_state=prior_var_state,
                 prior_mean_state=prior_mean_state,
                 new_mean_state=new_mean_state,
+                precision_calibration_diag=precision_calibration_diag,
             ))
         expert_metric["expert_meta_time_sec"] = round(time.perf_counter() - expert_start_time, 4)
         return aggregated_params, len(valid_clients), local_posterior_count, expert_metric
@@ -728,6 +839,7 @@ class ExpertBayesMetaAggregator(Aggregator):
         prior_var_state,
         prior_mean_state,
         new_mean_state,
+        precision_calibration_diag,
     ):
         def summarize_tensors(tensors, include_std):
             value_sum = 0.0
@@ -787,6 +899,7 @@ class ExpertBayesMetaAggregator(Aggregator):
             "prior_var_min": prior_var_stats["min"],
             "prior_var_max": prior_var_stats["max"],
             "mean_update_norm": math.sqrt(mean_update_square_sum),
+            **precision_calibration_diag,
         }
 
     def _optimize_expert_prior(

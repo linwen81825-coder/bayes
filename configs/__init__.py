@@ -97,6 +97,8 @@ _DEFAULT_CONFIG_VALUES = {
     "bayes_weighted_min_valid_clients": 2,
     "bayes_weighted_precision_min": 1.0e-8,
     "bayes_weighted_precision_max": 1.0e8,
+    "bayes_weighted_precision_calibration": "none",
+    "bayes_weighted_precision_target": 100.0,
     "bayes_weighted_var_min": 1.0e-8,
     "bayes_weighted_var_max": 1.0e8,
     "bayes_weighted_diag": False,
@@ -135,6 +137,8 @@ _ALLOWED_BAYES_CONFIG_KEYS = {
     "bayes_weighted_min_valid_clients",
     "bayes_weighted_precision_min",
     "bayes_weighted_precision_max",
+    "bayes_weighted_precision_calibration",
+    "bayes_weighted_precision_target",
     "bayes_weighted_var_min",
     "bayes_weighted_var_max",
     "bayes_weighted_diag",
@@ -240,6 +244,12 @@ def _raise_if_unsupported_bayes_config(config: dict) -> None:
     sgld_timing = str(config.get("bayes_sgld_timing", "after_train")).lower()
     if sgld_timing not in {"after_train", "before_train"}:
         raise ValueError("bayes_sgld_timing must be one of: after_train, before_train")
+
+    precision_calibration = str(config.get("bayes_weighted_precision_calibration", "none")).lower()
+    if precision_calibration not in {"none", "median_target"}:
+        raise ValueError(
+            "bayes_weighted_precision_calibration must be one of: none, median_target"
+        )
 
 
 def _raise_if_missing_required_keys(merged_config: dict) -> None:

@@ -110,6 +110,8 @@ bayes_weighted_eps: 1e-8
 bayes_weighted_min_valid_clients: 2
 bayes_weighted_precision_min: 1e-8
 bayes_weighted_precision_max: 1e8
+bayes_weighted_precision_calibration: none
+bayes_weighted_precision_target: 100.0
 bayes_weighted_var_min: 1e-8
 bayes_weighted_var_max: 1e8
 bayes_weighted_diag: false

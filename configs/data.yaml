@@ -8,7 +8,7 @@ data_path: ./data
 batch_size: 128
 
 # Dirichlet 划分后，每个客户端至少要有多少条训练样本
-min_datasize: 0
+min_datasize: 1
 
 # Dirichlet 分布参数，越小表示客户端间数据越不均匀
 alpha: 0.1
