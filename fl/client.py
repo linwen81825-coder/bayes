@@ -503,7 +503,7 @@ class Client:
                 param_dict[name].copy_(value)
 
     def apply_train_final_evidence_means(self, evidence_by_layer, train_final_state):
-        train_final_mean_applied = False
+        train_final_mean_applied_count = 0
         missing_train_final_mean_keys = 0
         for expert_map in evidence_by_layer.values():
             if not isinstance(expert_map, dict):
@@ -515,6 +515,8 @@ class Client:
                 precision_state = expert_evidence.get("precision_state")
                 if not isinstance(mean_state, dict) or not isinstance(precision_state, dict):
                     continue
+                applied_count = 0
+                missing_count = 0
                 for key, sgld_mean in mean_state.items():
                     if key not in precision_state:
                         continue
@@ -527,10 +529,25 @@ class Client:
                         or train_final_mean.shape != precision_state[key].shape
                     ):
                         missing_train_final_mean_keys += 1
+                        missing_count += 1
                         continue
                     mean_state[key] = train_final_mean.detach().cpu().clone()
-                    train_final_mean_applied = True
-        return train_final_mean_applied, missing_train_final_mean_keys
+                    train_final_mean_applied_count += 1
+                    applied_count += 1
+                if applied_count > 0:
+                    sgld_diag = expert_evidence.get("sgld_diag")
+                    if isinstance(sgld_diag, dict):
+                        sgld_diag.update({
+                            "mean_state_source": "train_final",
+                            "precision_state_source": "pre_sgld",
+                            "train_final_mean_applied": True,
+                            "missing_train_final_mean_keys": missing_count,
+                        })
+        return (
+            train_final_mean_applied_count,
+            missing_train_final_mean_keys,
+            train_final_mean_applied_count > 0,
+        )
 
     def fit_local_expert_evidence(
         self,
@@ -860,7 +877,7 @@ class Client:
         train_final_mean_applied = False
         missing_train_final_mean_keys = 0
         if before_train_bayes_evidence is not None and self.bayes_evidence_mean_source == "train_final":
-            train_final_mean_applied, missing_train_final_mean_keys = self.apply_train_final_evidence_means(
+            _, missing_train_final_mean_keys, train_final_mean_applied = self.apply_train_final_evidence_means(
                 evidence_by_layer=bayes_evidence,
                 train_final_state=local_state_dict,
             )
