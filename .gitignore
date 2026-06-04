@@ -1,0 +1,36 @@
+# 默认忽略所有文件
+*
+
+# 保留 .gitignore 自己
+!.gitignore
+
+# 根目录下保留这三个文件
+!environment.yml
+!README.md
+!train.py
+
+# configs：只保留 __init__.py 和 config.yaml
+!configs/
+configs/*
+!configs/__init__.py
+!configs/config.yaml
+
+# data：保留当前目录下所有 .py 文件
+!data/
+data/*
+!data/*.py
+
+# fl：保留当前目录下所有 .py 文件
+!fl/
+fl/*
+!fl/*.py
+
+# model：保留当前目录下所有 .py 文件
+!model/
+model/*
+!model/*.py
+
+# utils：保留当前目录下所有 .py 文件
+!utils/
+utils/*
+!utils/*.py
