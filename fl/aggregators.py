@@ -22,6 +22,14 @@ class Aggregator(ABC):
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
         pass
 
+    def get_checkpoint_state(self):
+        # 默认聚合器没有跨 round 状态，checkpoint 中保存空状态即可。
+        return {}
+
+    def load_checkpoint_state(self, state, map_location=None):
+        # 旧聚合器没有可恢复状态；保留 hook 让 server 统一调用。
+        return
+
 
 def build_client_weights(method, client_sample_counts):
     if method == "sample_weighted":
@@ -534,15 +542,62 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             args=args,
             non_expert_method=args.non_expert_agg_method,
         )
+        self.pism_input_dim = int(getattr(args, "uoc_foga_pism_input_dim", 3))
+        self.pism_hidden_size = int(getattr(args, "uoc_foga_pism_hidden_size", 64))
+        self.pism_dropout = float(getattr(args, "uoc_foga_pism_dropout", 0.0))
+        self.pism_lr = float(getattr(args, "uoc_foga_pism_lr", 1e-3))
+        self.pism_tau = float(getattr(args, "uoc_foga_pism_tau", 1.0))
+        self.pism_renorm_inputs = bool(getattr(args, "uoc_foga_pism_renorm_inputs", True))
+        self.pism_min_clients = int(getattr(args, "uoc_foga_pism_min_clients", 2))
+        self.pism_update_steps = 0
         self.meta_net = ExpertPISM(
-            input_dim=getattr(args, "uoc_foga_pism_input_dim", 3),
-            hidden_size=getattr(args, "uoc_foga_pism_hidden_size", 64),
-            dropout=getattr(args, "uoc_foga_pism_dropout", 0.0),
+            input_dim=self.pism_input_dim,
+            hidden_size=self.pism_hidden_size,
+            dropout=self.pism_dropout,
         )
         self.meta_optimizer = torch.optim.Adam(
             self.meta_net.parameters(),
-            lr=getattr(args, "uoc_foga_pism_lr", 1e-3),
+            lr=self.pism_lr,
         )
+
+    def get_checkpoint_state(self):
+        return {
+            "type": "uoc_foga_pism_expert_align",
+            "meta_net": self.meta_net.state_dict(),
+            "meta_optimizer": self.meta_optimizer.state_dict(),
+            "pism_update_steps": int(self.pism_update_steps),
+            "pism_config": {
+                "input_dim": self.pism_input_dim,
+                "hidden_size": self.pism_hidden_size,
+                "dropout": self.pism_dropout,
+                "lr": self.pism_lr,
+                "tau": self.pism_tau,
+                "renorm_inputs": self.pism_renorm_inputs,
+                "min_clients": self.pism_min_clients,
+            },
+        }
+
+    def load_checkpoint_state(self, state, map_location=None):
+        if not state:
+            return
+        if not isinstance(state, dict):
+            return
+        if state.get("type") != "uoc_foga_pism_expert_align":
+            print("aggregator checkpoint type mismatch")
+            return
+
+        if "meta_net" in state:
+            self.meta_net.load_state_dict(state["meta_net"])
+        if "meta_optimizer" in state:
+            self.meta_optimizer.load_state_dict(state["meta_optimizer"])
+        self.pism_update_steps = int(state.get("pism_update_steps", 0))
+
+    def _move_meta_optimizer_state_to_device(self, device):
+        # resume 后 optimizer state 可能还在 CPU，聚合前搬到 meta_net 同设备。
+        for optimizer_state in self.meta_optimizer.state.values():
+            for key, value in optimizer_state.items():
+                if torch.is_tensor(value):
+                    optimizer_state[key] = value.to(device)
 
     def _add_pism_metric_defaults(self, metric):
         metric.update({
@@ -768,8 +823,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "too_few_valid_clients",
             )
 
-        pism_min_clients = int(getattr(self.args, "uoc_foga_pism_min_clients", 2))
-        if valid_clients < pism_min_clients:
+        if valid_clients < self.pism_min_clients:
             return metric, self._fallback_expert(
                 aggregated_state,
                 global_state,
@@ -785,7 +839,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             delta_norm=delta_norms,
             device=device,
         )
-        if bool(getattr(self.args, "uoc_foga_pism_renorm_inputs", True)):
+        if self.pism_renorm_inputs:
             features = normalize_pism_inputs(features)
         if not torch.isfinite(features).all():
             return metric, self._fallback_expert(
@@ -825,7 +879,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         device,
     ):
         metric = record["metric"]
-        tau = float(getattr(self.args, "uoc_foga_pism_tau", 1.0))
+        tau = self.pism_tau
         with torch.no_grad():
             weights_tensor = self.meta_net(record["features"], tau=tau)
         if not torch.isfinite(weights_tensor).all():
@@ -904,6 +958,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         client_stats = self._normalize_client_stats(kwargs.get("client_stats"), len(client_updates))
         device = self._get_model_device(global_model)
         self.meta_net.to(device)
+        self._move_meta_optimizer_state_to_device(device)
 
         uoc_foga_stats = {}
         per_expert_records = []
@@ -932,7 +987,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         meta_loss_value = None
         meta_loss_failed = False
         if per_expert_records:
-            tau = float(getattr(self.args, "uoc_foga_pism_tau", 1.0))
+            tau = self.pism_tau
             meta_losses = []
             for record in per_expert_records:
                 weights = self.meta_net(record["features"], tau=tau)
@@ -945,6 +1000,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 self.meta_optimizer.zero_grad()
                 meta_loss.backward()
                 self.meta_optimizer.step()
+                self.pism_update_steps += 1
                 meta_loss_value = float(meta_loss.detach().cpu().item())
         else:
             meta_loss_failed = True
@@ -970,31 +1026,77 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                     device,
                 )
 
-        pism_meta_losses = [
-            expert_metric.get("pism_meta_loss")
+        # 只汇总轻量 Python 标量，便于 server 日志观察 PISM 趋势。
+        expert_metrics = [
+            expert_metric
             for layer_stats in uoc_foga_stats.values()
             for expert_metric in layer_stats.values()
-            if expert_metric.get("pism_meta_loss") is not None
         ]
-        updated_experts = sum(
-            1
-            for layer_stats in uoc_foga_stats.values()
-            for expert_metric in layer_stats.values()
-            if expert_metric.get("pism_used")
-        )
-        fallback_experts = sum(
-            1
-            for layer_stats in uoc_foga_stats.values()
-            for expert_metric in layer_stats.values()
-            if expert_metric.get("fallback_reason") is not None
-        )
-        self.last_aggregation_metrics = {
-            "uoc_foga_stats": uoc_foga_stats,
+        total_experts = len(expert_metrics)
+        pism_meta_losses = []
+        pism_weight_entropies = []
+        pism_weight_max_values = []
+        pism_fallback_reason_counts = collections.defaultdict(int)
+        updated_experts = 0
+
+        for expert_metric in expert_metrics:
+            pism_used = bool(expert_metric.get("pism_used", False))
+            fallback_reason = expert_metric.get("fallback_reason")
+            pism_fallback_reason = expert_metric.get("pism_fallback_reason")
+            reason = (
+                pism_fallback_reason
+                if pism_fallback_reason is not None
+                else fallback_reason
+                if fallback_reason is not None
+                else "none"
+            )
+            pism_fallback_reason_counts[str(reason)] += 1
+
+            if not pism_used or fallback_reason is not None:
+                continue
+
+            updated_experts += 1
+            meta_loss_value = expert_metric.get("pism_meta_loss")
+            if meta_loss_value is not None:
+                pism_meta_losses.append(float(meta_loss_value))
+            entropy_value = expert_metric.get("pism_weight_entropy")
+            if entropy_value is not None:
+                pism_weight_entropies.append(float(entropy_value))
+            weight_max_value = expert_metric.get("pism_weight_max")
+            if weight_max_value is not None:
+                pism_weight_max_values.append(float(weight_max_value))
+
+        fallback_experts = total_experts - updated_experts
+        pism_summary = {
             "uoc_foga_pism_meta_loss_mean": (
                 sum(pism_meta_losses) / len(pism_meta_losses)
                 if pism_meta_losses
                 else None
             ),
+            "uoc_foga_pism_updated_experts": updated_experts,
+            "uoc_foga_pism_fallback_experts": fallback_experts,
+            "uoc_foga_pism_fallback_reason_counts": dict(pism_fallback_reason_counts),
+            "uoc_foga_pism_weight_entropy_mean": (
+                sum(pism_weight_entropies) / len(pism_weight_entropies)
+                if pism_weight_entropies
+                else None
+            ),
+            "uoc_foga_pism_weight_max_mean": (
+                sum(pism_weight_max_values) / len(pism_weight_max_values)
+                if pism_weight_max_values
+                else None
+            ),
+            "uoc_foga_pism_used_frac": (
+                updated_experts / total_experts
+                if total_experts > 0
+                else 0.0
+            ),
+            "uoc_foga_pism_update_steps": int(self.pism_update_steps),
+        }
+        self.last_aggregation_metrics = {
+            "uoc_foga_stats": uoc_foga_stats,
+            "uoc_foga_pism_summary": pism_summary,
+            "uoc_foga_pism_meta_loss_mean": pism_summary["uoc_foga_pism_meta_loss_mean"],
             "uoc_foga_pism_updated_experts": updated_experts,
             "uoc_foga_pism_fallback_experts": fallback_experts,
         }

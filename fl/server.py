@@ -451,7 +451,10 @@ class Server:
             for id in self.clientsID_list:
                 client_sizes.append(self.get_client_train_size(id))
 
-        use_uoc_foga = self.args.expert_agg_method == "uoc_foga_expert_align"
+        use_uoc_foga = self.args.expert_agg_method in {
+            "uoc_foga_expert_align",
+            "uoc_foga_pism_expert_align",
+        }
         if use_uoc_foga:
             # UOC-FOGA 需要在 global_model 上计算 g_query，让模型先到目标设备。
             self.model.to(self.device)
@@ -472,6 +475,20 @@ class Server:
         uoc_foga_stats = aggregation_metrics.get("uoc_foga_stats")
         if uoc_foga_stats is not None:
             self.logger.info(f"--uoc_foga_stats : {uoc_foga_stats}\n")
+
+        pism_summary = aggregation_metrics.get("uoc_foga_pism_summary", None)
+        if pism_summary is not None:
+            # PISM summary 只打印轻量标量/字典，不输出 per-expert 大对象。
+            for key in (
+                "uoc_foga_pism_meta_loss_mean",
+                "uoc_foga_pism_updated_experts",
+                "uoc_foga_pism_fallback_experts",
+                "uoc_foga_pism_fallback_reason_counts",
+                "uoc_foga_pism_weight_entropy_mean",
+                "uoc_foga_pism_weight_max_mean",
+                "uoc_foga_pism_used_frac",
+            ):
+                self.logger.info(f"--{key} : {pism_summary.get(key)}\n")
         self.logger.info(
             f"--non_expert_agg_method : {self.args.non_expert_agg_method} "
             f"--expert_agg_method : {self.args.expert_agg_method}\n"
