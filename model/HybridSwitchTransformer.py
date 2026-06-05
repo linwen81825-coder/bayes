@@ -103,8 +103,8 @@ class TokenSwitchFFN(nn.Module):
             for _ in range(num_experts)
         ])
 
-    def forward(self, x):
-        batch_size, num_tokens, embed_dim = x.shape
+    def forward(self, x, return_router_info: bool = False):
+        embed_dim = x.size(-1)
         router_input = x
         if self.training and self.router_jitter_noise > 0:
             noise = torch.empty_like(router_input).uniform_(
@@ -117,11 +117,11 @@ class TokenSwitchFFN(nn.Module):
         router_probs = F.softmax(router_logits.float(), dim=-1).to(x.dtype)
         top1_probs, top1_indices = torch.max(router_probs, dim=-1)
 
-        flat_x = x.reshape(batch_size * num_tokens, embed_dim)
+        flat_x = x.reshape(-1, embed_dim)
         flat_output = torch.zeros_like(flat_x)
         flat_indices = top1_indices.reshape(-1)
         flat_top1_probs = top1_probs.reshape(-1)
-        total_tokens = max(batch_size * num_tokens, 1)
+        total_tokens = max(flat_x.size(0), 1)
         capacity = max(
             self.min_capacity,
             math.ceil(self.capacity_factor * total_tokens / self.num_experts),
@@ -151,9 +151,17 @@ class TokenSwitchFFN(nn.Module):
                 flat_output[accepted_positions] = expert_output * flat_top1_probs[accepted_positions].unsqueeze(-1)
 
         # overflow token 的 FFN 增量保持为 0，外层 residual 会让这些 token 走 identity bypass。
-        output = flat_output.reshape(batch_size, num_tokens, embed_dim)
+        output = flat_output.reshape_as(x)
+        if return_router_info:
+            # top1_expert_ids/top1_gates 来自 router 的 top1 选择。
+            router_info = {
+                "top1_expert_ids": top1_indices.detach(),
+                "top1_gates": top1_probs.detach(),
+            }
+            return output, router_info
+
         usage_fraction = selected_counts.float() / float(total_tokens)
-        avg_router_probs = router_probs.float().mean(dim=(0, 1))
+        avg_router_probs = router_probs.float().mean(dim=tuple(range(router_probs.dim() - 1)))
 
         # Switch Transformer load-balancing auxiliary loss:
         # aux = E * sum_e(f_e * p_e)
@@ -224,13 +232,28 @@ class HybridTransformerBlock(nn.Module):
                 dropout_rate=dropout_rate,
             )
 
-    def forward(self, x):
+    def forward(self, x, return_uoc_info: bool = False, layer_id=None):
         norm_x = self.norm1(x)
         attention_out, _ = self.attention(norm_x, norm_x, norm_x, need_weights=False)
         x = x + self.dropout(attention_out)
 
         ffn_input = self.norm2(x)
         if self.use_switch_ffn:
+            if return_uoc_info:
+                # hidden 是 TokenSwitchFFN 的输入 ffn_input。
+                hidden = ffn_input.detach()
+                ffn_out, router_info = self.ffn(ffn_input, return_router_info=True)
+                x = x + self.dropout(ffn_out)
+                uoc_layer_id = self.layer_id if layer_id is None else layer_id
+                uoc_info = {
+                    str(uoc_layer_id): {
+                        "hidden": hidden.detach(),
+                        "top1_expert_ids": router_info["top1_expert_ids"],
+                        "top1_gates": router_info["top1_gates"],
+                    }
+                }
+                return x, None, uoc_info
+
             switch_result = self.ffn(ffn_input)
             x = x + self.dropout(switch_result["hidden"])
             return x, {
@@ -245,6 +268,8 @@ class HybridTransformerBlock(nn.Module):
             }
 
         x = x + self.dropout(self.ffn(ffn_input))
+        if return_uoc_info:
+            return x, None, {}
         return x, None
 
 
@@ -376,6 +401,34 @@ class HybridSwitchTransformer(nn.Module):
                     "params": expert.parameters(),
                 })
         return parameter_groups
+
+    def collect_uoc_evidence(self, x, max_samples=None, use_top1=True):
+        # collect_uoc_evidence 只用于采集 UOC evidence，不改变正常 forward。
+        if not use_top1:
+            raise ValueError("collect_uoc_evidence currently supports use_top1=True only")
+        if max_samples is not None:
+            x = x[:max_samples]
+
+        with torch.no_grad():
+            feature_map = self.stem(x)
+            feature_map = self.token_pool(feature_map)
+            tokens = self.token_projection(feature_map)
+            tokens = tokens.flatten(2).transpose(1, 2)
+            if self.cls_token is not None:
+                cls_tokens = self.cls_token.expand(tokens.size(0), -1, -1)
+                tokens = torch.cat([cls_tokens, tokens], dim=1)
+            tokens = self.position_dropout(tokens + self.position_embedding)
+
+            uoc_evidence = {}
+            for layer_id, block in enumerate(self.blocks):
+                tokens, _, block_uoc_info = block(
+                    tokens,
+                    return_uoc_info=True,
+                    layer_id=layer_id,
+                )
+                uoc_evidence.update(block_uoc_info)
+
+        return uoc_evidence
 
     def forward(self, x):
         feature_map = self.stem(x)
