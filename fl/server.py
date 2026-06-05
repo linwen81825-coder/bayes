@@ -87,6 +87,19 @@ class Server:
 
         restore_rng_state(checkpoint.get("rng_state"))
 
+        aggregator_state = checkpoint.get("aggregator_state", None)
+        if aggregator_state is not None and hasattr(self.aggregator, "load_checkpoint_state"):
+            self.aggregator.load_checkpoint_state(
+                aggregator_state,
+                map_location=self.device,
+            )
+            self.logger.info("--aggregator_checkpoint_loaded : true\n")
+            pism_steps = getattr(self.aggregator, "pism_update_steps", None)
+            if pism_steps is not None:
+                self.logger.info(f"--pism_update_steps_loaded : {int(pism_steps)}\n")
+        else:
+            self.logger.info("--aggregator_checkpoint_loaded : false\n")
+
         self.save_server_model()
         if not bool(getattr(self.args, "in_memory_client_updates", True)):
             self.sync_clients_model()
@@ -157,6 +170,11 @@ class Server:
 
     def save_training_checkpoint(self, round_completed):
         """保存训练 checkpoint，用于后续从下一轮继续训练。"""
+        aggregator_state = None
+        if hasattr(self.aggregator, "get_checkpoint_state"):
+            # 只保存聚合器内部轻量状态；不保存 evidence、client updates 或日志缓存。
+            aggregator_state = self.aggregator.get_checkpoint_state()
+
         checkpoint = {
             "round_completed": int(round_completed),
             "model_state_dict": {
@@ -176,6 +194,7 @@ class Server:
             ),
             "rng_state": capture_rng_state(),
             "config": dict(vars(self.args)),
+            "aggregator_state": aggregator_state,
         }
 
         round_path = os.path.join(
@@ -188,6 +207,10 @@ class Server:
         torch.save(checkpoint, latest_path)
 
         self.logger.info(f"--checkpoint_saved : {round_path}\n")
+        self.logger.info(f"--aggregator_checkpoint_saved : {aggregator_state is not None}\n")
+        pism_steps = getattr(self.aggregator, "pism_update_steps", None)
+        if pism_steps is not None:
+            self.logger.info(f"--pism_update_steps : {int(pism_steps)}\n")
 
     def save_server_model(self):
         # 保存当前服务端模型参数到 server.pth。
@@ -487,6 +510,7 @@ class Server:
                 "uoc_foga_pism_weight_entropy_mean",
                 "uoc_foga_pism_weight_max_mean",
                 "uoc_foga_pism_used_frac",
+                "uoc_foga_pism_update_steps",
             ):
                 self.logger.info(f"--{key} : {pism_summary.get(key)}\n")
         self.logger.info(
