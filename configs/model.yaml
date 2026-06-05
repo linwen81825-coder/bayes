@@ -1,4 +1,5 @@
 model_type: hybrid_switch_transformer
+#resnet18/cnn_stem
 backbone_type: cnn_stem
 num_experts: 8
 dropout: 0.2

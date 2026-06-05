@@ -103,7 +103,6 @@ class Server:
 
             usage_list = [int(v) for v in round_expert_usage_summary.tolist()]
             self.logger.info(f"--round_expert_usage_summary : {usage_list}\n")
-            self.last_client_expert_usages = round_client_expert_usages
             client_usage_list = [
                 [int(v) for v in stats["expert_activations"].tolist()]
                 for stats in round_client_expert_usages
@@ -203,13 +202,13 @@ class Server:
         return True
 
     def get_client_train_size(self,client_id):
-        # FedAvg 使用客户端训练样本数作为聚合权重。
+        # sample_weighted 聚合会使用客户端训练样本数作为权重来源。
         return get_client_train_size(self.args, client_id, meta=self.partition_meta)
 
     def aggregation_by_method(self):
         # 聚合器接口：
-        # - fedavg：对完整 state_dict 按客户端训练样本数加权平均；
-        # - expert_fedavg：普通层按客户端样本数聚合，专家层按每个 expert 实际处理样本数聚合。
+        # - 非专家参数使用 non_expert_agg_method；
+        # - 专家参数使用 expert_agg_method。
         client_states = []
         client_sizes = []
         for id in self.clientsID_list:
@@ -220,18 +219,16 @@ class Server:
             client_states.append(client_state_dict)
             client_sizes.append(self.get_client_train_size(id))
 
-        total_size = sum(client_sizes)
-        if total_size <= 0:
-            raise ValueError("FedAvg requires at least one training sample across clients")
-
-        fedavg_state = self.aggregator.aggregate(
+        aggregated_state = self.aggregator.aggregate(
             client_updates=client_states,
             client_weights=client_sizes,
             global_model=self.model,
-            expert_weights=getattr(self, "last_client_expert_usages", None),
         )
-        self.model.load_state_dict(fedavg_state)
-        self.logger.info(f"--aggregation_method : {self.args.agg_method}\n")
+        self.model.load_state_dict(aggregated_state)
+        self.logger.info(
+            f"--non_expert_agg_method : {self.args.non_expert_agg_method} "
+            f"--expert_agg_method : {self.args.expert_agg_method}\n"
+        )
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
 
     def aggregation(self):

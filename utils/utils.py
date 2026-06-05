@@ -25,7 +25,8 @@ def get_experiment_stem(args):
         f"clients_{args.num_clients}_"
         f"alpha_{args.alpha}_"
         f"seed_{args.seed}_"
-        f"agg_{args.agg_method}"
+        f"non_expert_agg_{args.non_expert_agg_method}_"
+        f"expert_agg_{args.expert_agg_method}"
     )
 
 

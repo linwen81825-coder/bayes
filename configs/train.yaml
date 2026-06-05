@@ -3,4 +3,6 @@ server_epochs: 50
 client_epochs: 1
 device: cuda
 save_root: ./save/default_exp
-agg_method: expert_fedavg
+#uniform/sample_weighted
+non_expert_agg_method: sample_weighted
+expert_agg_method: sample_weighted

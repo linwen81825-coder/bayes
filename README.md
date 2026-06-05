@@ -1,6 +1,6 @@
 # Federated Learning Experiment
 
-这是一个基于 CIFAR10/CIFAR100 的 FL + MoE 实验项目，当前模型分支为 `Hybrid CNN Stem + Switch Transformer`，默认聚合方法为 `expert_fedavg`。
+这是一个基于 CIFAR10/CIFAR100 的 FL + MoE 实验项目，当前模型分支为 `Hybrid CNN Stem + Switch Transformer`，默认对非专家参数和专家参数都按客户端训练样本数加权聚合。
 
 ## 环境准备
 
@@ -8,13 +8,13 @@
 
 ```bash
 conda env create -f environment.yml
-conda activate fedwolf
+conda activate bayes_env
 ```
 
 如果环境已经存在，直接激活即可：
 
 ```bash
-conda activate fedwolf
+conda activate bayes_env
 ```
 
 ## 配置方式
@@ -42,7 +42,7 @@ conda activate fedwolf
 
 - 切 CIFAR10 / CIFAR100：修改 `configs/data.yaml` 中的 `data_name`
 - 改 `alpha`：修改 `configs/data.yaml` 中的 `alpha`
-- 切聚合方法：修改 `configs/train.yaml` 中的 `agg_method`
+- 切聚合方法：修改 `configs/train.yaml` 中的 `non_expert_agg_method` 和 `expert_agg_method`
 - 改完 YAML 后，直接运行 `python train.py`；训练入口会自动重建 partition
 - 每次训练都会覆盖已有的 `partition_meta.pt` 和 `partition_stats.json`
 - 如果想切换另一套 YAML，也可以使用轻量命令行入口：
@@ -50,8 +50,23 @@ conda activate fedwolf
 ```bash
 python train.py
 
-python train.py --data_cfg configs/exp/cifar10.yaml --train_cfg configs/exp/train_fedavg.yaml --model_cfg configs/model.yaml
+python train.py --data_cfg configs/data.yaml --train_cfg configs/train.yaml --model_cfg configs/model.yaml
 ```
+
+## 聚合配置
+
+`configs/train.yaml` 中使用两条聚合配置链路：
+
+```yaml
+non_expert_agg_method: sample_weighted
+expert_agg_method: sample_weighted
+```
+
+- `non_expert_agg_method` 控制非专家参数聚合
+- `expert_agg_method` 控制专家参数聚合
+- `sample_weighted`：按客户端训练样本数加权平均
+- `uniform`：每个客户端等权平均
+- 后续新增聚合方法时，在 `fl/aggregators.py` 注册即可
 
 ## 运行顺序
 
@@ -124,7 +139,8 @@ CSV 和日志文件名都会包含：
 - `num_clients`
 - `alpha`
 - `seed`
-- `agg_method`
+- `non_expert_agg_method`
+- `expert_agg_method`
 
 ## Checkpoint 约定
 

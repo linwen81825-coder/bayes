@@ -29,7 +29,8 @@ _REQUIRED_CONFIG_KEYS = (
     "client_epochs",
     "device",
     "save_root",
-    "agg_method",
+    "non_expert_agg_method",
+    "expert_agg_method",
     "model_type",
     "backbone_type",
     "num_experts",
@@ -112,6 +113,16 @@ def _raise_if_missing_required_keys(merged_config: dict) -> None:
         )
 
 
+def _validate_aggregation_methods(merged_config: dict) -> None:
+    allowed_methods = {"sample_weighted", "uniform"}
+    for key in ["non_expert_agg_method", "expert_agg_method"]:
+        value = merged_config.get(key)
+        if value not in allowed_methods:
+            raise ValueError(
+                f"{key} must be one of {sorted(allowed_methods)}, got {value!r}"
+            )
+
+
 def _derive_save_paths(merged_config: dict) -> None:
     save_root = Path(str(merged_config["save_root"]))
     merged_config["data_save_path"] = str(save_root / "data")
@@ -155,6 +166,7 @@ def load_args(
         merged_config.update(config)
 
     _raise_if_missing_required_keys(merged_config)
+    _validate_aggregation_methods(merged_config)
     _derive_save_paths(merged_config)
 
     return SimpleNamespace(**merged_config)
