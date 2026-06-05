@@ -117,15 +117,117 @@ class Client:
                     total_stats[layer_key][stat_key] += value.to(self.device)
             total_stats[layer_key]["capacity"] = stats.get("capacity", total_stats[layer_key]["capacity"])
 
+    def _should_collect_uoc_evidence_before_train(self):
+        agg_method = getattr(self.args, "agg_method", None)
+        uoc_foga_enabled = bool(getattr(self.args, "uoc_foga_enabled", False))
+        uoc_foga_collect_before_train = bool(
+            getattr(self.args, "uoc_foga_collect_before_train", True)
+        )
+        if not uoc_foga_collect_before_train:
+            return False
+
+        return (
+            agg_method in ["uoc_foga_expert_align", "uoc_foga_pism_expert_align"]
+            or uoc_foga_enabled
+        )
+
+    def _collect_uoc_evidence_before_train(self):
+        # 只在本地训练前，从 round-start global model 采集少量 UOC evidence。
+        if not self._should_collect_uoc_evidence_before_train():
+            return {}
+        if not hasattr(self.model, "collect_uoc_evidence"):
+            return {}
+
+        samples_per_client = int(getattr(self.args, "uoc_foga_samples_per_client", 64))
+        uoc_foga_use_top1 = bool(getattr(self.args, "uoc_foga_use_top1", True))
+        if samples_per_client <= 0:
+            return {}
+
+        evidence_chunks_by_layer = {}
+        collected_samples = 0
+        evidence_loader = iter(self.train_loader)
+        inference_context = (
+            torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
+        )
+
+        for images, labels in evidence_loader:
+            remaining = samples_per_client - collected_samples
+            if remaining <= 0:
+                break
+
+            images = images[:remaining]
+            labels = labels[:remaining]
+            images = images.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+            if labels.size(0) == 0:
+                continue
+
+            with inference_context():
+                batch_evidence = self.model.collect_uoc_evidence(
+                    images,
+                    max_samples=remaining,
+                    use_top1=uoc_foga_use_top1,
+                )
+
+            batch_sample_count = labels.size(0)
+            for layer_id, layer_evidence in batch_evidence.items():
+                layer_key = str(layer_id)
+                hidden = layer_evidence["hidden"].detach()
+                top1_expert_ids = layer_evidence["top1_expert_ids"].detach()
+                top1_gates = layer_evidence["top1_gates"].detach()
+                layer_labels = labels[: hidden.size(0)].detach()
+
+                if layer_key not in evidence_chunks_by_layer:
+                    evidence_chunks_by_layer[layer_key] = {
+                        "hidden": [],
+                        "labels": [],
+                        "top1_expert_ids": [],
+                        "top1_gates": [],
+                    }
+
+                evidence_chunks_by_layer[layer_key]["hidden"].append(hidden.cpu())
+                evidence_chunks_by_layer[layer_key]["labels"].append(layer_labels.cpu())
+                evidence_chunks_by_layer[layer_key]["top1_expert_ids"].append(
+                    top1_expert_ids.cpu()
+                )
+                evidence_chunks_by_layer[layer_key]["top1_gates"].append(
+                    top1_gates.cpu()
+                )
+
+            collected_samples += batch_sample_count
+
+        uoc_evidence_by_layer = {
+            layer_id: {
+                stat_key: torch.cat(chunks, dim=0).detach().cpu()
+                for stat_key, chunks in layer_chunks.items()
+            }
+            for layer_id, layer_chunks in evidence_chunks_by_layer.items()
+        }
+
+        if uoc_evidence_by_layer and self.logger is not None:
+            counts_by_layer = {
+                layer_id: int(layer_evidence["hidden"].size(0))
+                for layer_id, layer_evidence in uoc_evidence_by_layer.items()
+            }
+            self.logger.info(
+                f"[UOCEvidence] client={self.client_id} counts_by_layer={counts_by_layer}"
+            )
+
+        return uoc_evidence_by_layer
+
     def train(self):
         # 本地训练保持普通监督学习；不同模型通过 forward 返回的 aux loss / stats 接入路由约束和日志。
         non_blocking = (
             str(self.device).startswith("cuda")
             and bool(getattr(self.args, "pin_memory", False))
         )
+        uoc_evidence_by_layer = self._collect_uoc_evidence_before_train()
         last_avg_router_probs = torch.zeros(self.args.num_experts, device=self.device)
         local_usage_total = torch.zeros(self.args.num_experts, device=self.device)
         local_layer_usage_total = {}
+        round_loss_total = 0.0
+        round_corrects = torch.zeros((), device=self.device)
+        round_total_samples = 0
 
         for epoch in range(self.client_epochs):
             self.model.train()
@@ -165,6 +267,9 @@ class Client:
 
             train_loss = running_loss / len(self.train_loader.dataset)
             train_acc = running_corrects.double() / len(self.train_loader.dataset)
+            round_loss_total += running_loss
+            round_corrects += running_corrects.detach()
+            round_total_samples += len(self.train_loader.dataset)
             avg_aux_loss = running_aux_loss / max(total_samples, 1)
             avg_z_loss = running_z_loss / max(total_samples, 1)
             local_usage_total += usage_total.detach()
@@ -204,6 +309,8 @@ class Client:
 
         if self.save_model_to_disk:
             self.save_client_model()
+        round_train_loss = round_loss_total / max(round_total_samples, 1)
+        round_train_acc = (round_corrects.double() / max(round_total_samples, 1)).item()
         layer_stats_cpu = {
             layer_id: {
                 stat_key: (value.detach().cpu() if torch.is_tensor(value) else value)
@@ -218,6 +325,10 @@ class Client:
                 layer_id: stats["expert_activations"]
                 for layer_id, stats in layer_stats_cpu.items()
             },
+            "uoc_evidence_by_layer": uoc_evidence_by_layer,
+            "train_loss": round_train_loss,
+            "client_loss": round_train_loss,
+            "train_acc": round_train_acc,
         }
 
         if not self.save_model_to_disk:
