@@ -1,0 +1,364 @@
+import math
+
+import torch
+
+
+def flatten_float_tensors(tensor_dict, device=None):
+    if torch.is_tensor(tensor_dict):
+        if not torch.is_floating_point(tensor_dict):
+            return None
+        tensor = tensor_dict.to(device) if device is not None else tensor_dict
+        return tensor.reshape(-1)
+
+    if not isinstance(tensor_dict, dict):
+        return None
+
+    flattened_tensors = []
+    for key in sorted(tensor_dict.keys()):
+        tensor = tensor_dict[key]
+        if tensor is None or not torch.is_tensor(tensor):
+            continue
+        if not torch.is_floating_point(tensor):
+            continue
+        tensor = tensor.to(device) if device is not None else tensor
+        flattened_tensors.append(tensor.reshape(-1))
+
+    if not flattened_tensors:
+        return None
+
+    return torch.cat(flattened_tensors, dim=0)
+
+
+def cosine_delta_to_negative_grad(delta_state, grad_state, eps=1e-12, device=None):
+    delta_vector = flatten_float_tensors(delta_state, device=device)
+    grad_vector = flatten_float_tensors(grad_state, device=device)
+    if delta_vector is None or grad_vector is None:
+        return None
+    if delta_vector.shape != grad_vector.shape:
+        return None
+    if delta_vector.device != grad_vector.device:
+        grad_vector = grad_vector.to(delta_vector.device)
+
+    delta_vector = delta_vector.float()
+    grad_vector = grad_vector.float()
+    delta_norm = torch.linalg.vector_norm(delta_vector)
+    grad_norm = torch.linalg.vector_norm(grad_vector)
+    if delta_norm.item() <= eps or grad_norm.item() <= eps:
+        return None
+
+    score = torch.dot(delta_vector, -grad_vector) / (delta_norm * grad_norm)
+    return float(score.item())
+
+
+def l2_norm_state(tensor_dict, eps=1e-12, device=None):
+    vector = flatten_float_tensors(tensor_dict, device=device)
+    if vector is None:
+        return 0.0
+
+    norm = torch.linalg.vector_norm(vector.float())
+    if norm.item() <= eps:
+        return 0.0
+    return float(norm.item())
+
+
+def _empty_query_result(num_classes, fallback_reason):
+    return {
+        "hidden": None,
+        "labels": None,
+        "gates": None,
+        "class_hist": [0 for _ in range(num_classes)],
+        "query_size": 0,
+        "query_num_classes": 0,
+        "fallback_reason": fallback_reason,
+    }
+
+
+def _get_layer_evidence(client_evidence, layer_id):
+    if not isinstance(client_evidence, dict):
+        return None
+    if layer_id in client_evidence:
+        return client_evidence[layer_id]
+
+    layer_key = str(layer_id)
+    if layer_key in client_evidence:
+        return client_evidence[layer_key]
+
+    for key, value in client_evidence.items():
+        if str(key) == layer_key:
+            return value
+    return None
+
+
+def _as_cpu_tensor(value):
+    if not torch.is_tensor(value):
+        return None
+    return value.detach().cpu()
+
+
+def _select_expert_samples(layer_evidence, expert_id):
+    hidden = _as_cpu_tensor(layer_evidence.get("hidden"))
+    labels = _as_cpu_tensor(layer_evidence.get("labels"))
+    top1_expert_ids = _as_cpu_tensor(layer_evidence.get("top1_expert_ids"))
+    top1_gates = _as_cpu_tensor(layer_evidence.get("top1_gates"))
+    if (
+        hidden is None
+        or labels is None
+        or top1_expert_ids is None
+        or top1_gates is None
+    ):
+        return None
+    if (
+        hidden.dim() == 0
+        or labels.dim() == 0
+        or top1_expert_ids.dim() == 0
+        or top1_gates.dim() == 0
+    ):
+        return None
+
+    sample_count = min(
+        hidden.size(0),
+        labels.size(0),
+        top1_expert_ids.size(0),
+        top1_gates.size(0),
+    )
+    if sample_count <= 0:
+        return None
+
+    hidden = hidden[:sample_count]
+    labels = labels[:sample_count]
+    top1_expert_ids = top1_expert_ids[:sample_count].long()
+    top1_gates = top1_gates[:sample_count].float()
+    expert_id = int(expert_id)
+
+    if top1_expert_ids.dim() == 1:
+        sample_mask = top1_expert_ids == expert_id
+        if top1_gates.dim() == 1:
+            gate_per_sample = top1_gates
+        else:
+            gate_per_sample = top1_gates.reshape(sample_count, -1).mean(dim=1)
+    else:
+        # token-level：任意 token 命中 expert_id，该样本就进入 query pool。
+        expert_ids_flat = top1_expert_ids.reshape(sample_count, -1)
+        gates_flat = top1_gates.reshape(sample_count, -1)
+        if expert_ids_flat.shape != gates_flat.shape:
+            return None
+        token_mask = expert_ids_flat == expert_id
+        token_count = token_mask.sum(dim=1)
+        sample_mask = token_count > 0
+        gate_sum = gates_flat.masked_fill(~token_mask, 0.0).sum(dim=1)
+        gate_per_sample = gate_sum / token_count.clamp_min(1).to(gates_flat.dtype)
+
+    if sample_mask.sum().item() == 0:
+        return None
+
+    return {
+        "hidden": hidden[sample_mask],
+        "labels": labels[sample_mask].long(),
+        "gates": gate_per_sample[sample_mask],
+    }
+
+
+def build_stratified_query_for_expert(
+    uoc_evidences,
+    layer_id,
+    expert_id,
+    num_classes,
+    query_per_class,
+    min_query_samples,
+    min_query_classes,
+    use_top1=True,
+    seed=None,
+):
+    if not use_top1:
+        raise ValueError("build_stratified_query_for_expert currently supports use_top1=True only")
+    if not uoc_evidences:
+        return _empty_query_result(num_classes, "no_uoc_evidence")
+
+    query_per_class = int(query_per_class)
+    min_query_samples = int(min_query_samples)
+    min_query_classes = int(min_query_classes)
+    has_any_evidence = False
+    has_layer_evidence = False
+    pool_hidden_chunks = []
+    pool_label_chunks = []
+    pool_gate_chunks = []
+    hidden_tail_shape = None
+
+    for client_evidence in uoc_evidences:
+        if client_evidence:
+            has_any_evidence = True
+
+        layer_evidence = _get_layer_evidence(client_evidence, layer_id)
+        if not isinstance(layer_evidence, dict):
+            continue
+        has_layer_evidence = True
+
+        selected = _select_expert_samples(layer_evidence, expert_id)
+        if selected is None:
+            continue
+
+        if hidden_tail_shape is None:
+            hidden_tail_shape = selected["hidden"].shape[1:]
+        elif selected["hidden"].shape[1:] != hidden_tail_shape:
+            # 不同模型/层形状混入时跳过，避免拼接时报错。
+            continue
+
+        pool_hidden_chunks.append(selected["hidden"])
+        pool_label_chunks.append(selected["labels"])
+        pool_gate_chunks.append(selected["gates"])
+
+    if not has_any_evidence:
+        return _empty_query_result(num_classes, "no_uoc_evidence")
+    if not has_layer_evidence:
+        return _empty_query_result(num_classes, "missing_layer_evidence")
+    if not pool_hidden_chunks:
+        return _empty_query_result(num_classes, "no_samples_for_expert")
+
+    pool_hidden = torch.cat(pool_hidden_chunks, dim=0)
+    pool_labels = torch.cat(pool_label_chunks, dim=0).long()
+    pool_gates = torch.cat(pool_gate_chunks, dim=0).float()
+    class_hist = [0 for _ in range(num_classes)]
+    selected_indices = []
+    generator = None
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+
+    for class_id in range(num_classes):
+        class_indices = torch.nonzero(pool_labels == class_id, as_tuple=False).flatten()
+        if class_indices.numel() == 0:
+            continue
+
+        take_count = min(max(query_per_class, 0), class_indices.numel())
+        if take_count == 0:
+            continue
+
+        perm = torch.randperm(class_indices.numel(), generator=generator)
+        chosen = class_indices[perm[:take_count]]
+        selected_indices.append(chosen)
+        class_hist[class_id] = int(take_count)
+
+    if selected_indices:
+        selected_indices = torch.cat(selected_indices, dim=0)
+        query_hidden = pool_hidden[selected_indices].detach().cpu()
+        query_labels = pool_labels[selected_indices].detach().cpu()
+        query_gates = pool_gates[selected_indices].detach().cpu()
+        query_size = int(query_labels.size(0))
+        query_num_classes = sum(1 for count in class_hist if count > 0)
+    else:
+        query_hidden = None
+        query_labels = None
+        query_gates = None
+        query_size = 0
+        query_num_classes = 0
+
+    fallback_reason = None
+    if query_size < min_query_samples:
+        fallback_reason = "query_size_too_small"
+    elif query_num_classes < min_query_classes:
+        fallback_reason = "query_classes_too_few"
+
+    return {
+        "hidden": query_hidden,
+        "labels": query_labels,
+        "gates": query_gates,
+        "class_hist": class_hist,
+        "query_size": query_size,
+        "query_num_classes": query_num_classes,
+        "fallback_reason": fallback_reason,
+    }
+
+
+def positive_score_to_weights(client_scores, mode="relu", eps=1e-12):
+    if mode != "relu":
+        raise ValueError(f"Unknown score weighting mode: {mode!r}")
+
+    positive_scores = {}
+    for client_id, score in client_scores.items():
+        if score is None:
+            continue
+        positive_scores[client_id] = max(float(score), 0.0)
+
+    if not positive_scores:
+        return {}, "no_valid_scores"
+
+    total_score = sum(positive_scores.values())
+    if total_score > eps:
+        weights = {
+            client_id: score / total_score
+            for client_id, score in positive_scores.items()
+        }
+        return weights, None
+
+    uniform_weight = 1.0 / len(positive_scores)
+    weights = {client_id: uniform_weight for client_id in positive_scores}
+    return weights, "all_scores_non_positive_or_zero"
+
+
+def expert_weight_entropy(weights, eps=1e-12):
+    if not weights:
+        return None
+
+    entropy = 0.0
+    for weight in weights.values():
+        weight = float(weight)
+        if weight <= eps:
+            continue
+        entropy -= weight * math.log(weight)
+    return float(entropy)
+
+
+def summarize_scores(client_scores):
+    scores = [
+        float(score)
+        for score in client_scores.values()
+        if score is not None
+    ]
+    if not scores:
+        return {
+            "score_mean": None,
+            "score_min": None,
+            "score_max": None,
+            "score_pos_frac": None,
+            "valid_score_count": 0,
+        }
+
+    return {
+        "score_mean": sum(scores) / len(scores),
+        "score_min": min(scores),
+        "score_max": max(scores),
+        "score_pos_frac": sum(1 for score in scores if score > 0.0) / len(scores),
+        "valid_score_count": len(scores),
+    }
+
+
+def extract_expert_delta_state(client_state, global_state, expert_keys, device=None):
+    delta_state = {}
+    for key in expert_keys:
+        if key not in client_state or key not in global_state:
+            continue
+
+        client_tensor = client_state[key]
+        global_tensor = global_state[key]
+        if not torch.is_tensor(client_tensor) or not torch.is_tensor(global_tensor):
+            continue
+        if (
+            not torch.is_floating_point(client_tensor)
+            or not torch.is_floating_point(global_tensor)
+        ):
+            continue
+
+        if device is not None:
+            client_tensor = client_tensor.to(device)
+            global_tensor = global_tensor.to(device)
+        delta_state[key] = client_tensor - global_tensor
+
+    return delta_state
+
+
+def make_uniform_weights(client_ids):
+    if not client_ids:
+        return {}
+
+    weight = 1.0 / len(client_ids)
+    return {client_id: weight for client_id in client_ids}
