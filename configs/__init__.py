@@ -16,7 +16,6 @@ DEFAULT_MODEL_CFG_PATH = "configs/model.yaml"
 _REQUIRED_CONFIG_KEYS = (
     "data_name",
     "data_path",
-    "global_val_ratio",
     "batch_size",
     "min_datasize",
     "alpha",

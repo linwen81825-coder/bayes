@@ -1,6 +1,5 @@
 data_name: cifar100
 data_path: ./data
-global_val_ratio: 0.1
 batch_size: 32
 min_datasize: 32
 alpha: 0.1

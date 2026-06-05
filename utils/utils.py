@@ -25,7 +25,6 @@ def get_experiment_stem(args):
         f"clients_{args.num_clients}_"
         f"alpha_{args.alpha}_"
         f"seed_{args.seed}_"
-        f"gval_{args.global_val_ratio}_"
         f"agg_{args.agg_method}"
     )
 
@@ -56,8 +55,8 @@ def load_best_server_checkpoint(path):
     required_keys = {
         "model_state_dict",
         "best_round",
-        "best_val_acc",
-        "best_val_loss",
+        "best_test_acc",
+        "best_test_loss",
     }
 
     if not isinstance(checkpoint, dict):
@@ -69,7 +68,7 @@ def load_best_server_checkpoint(path):
     if missing_keys:
         raise ValueError(
             f"`{path}` is missing checkpoint keys {sorted(missing_keys)}. "
-            "best_server.pth must contain model_state_dict, best_round, best_val_acc, and best_val_loss."
+            "best_server.pth must contain model_state_dict, best_round, best_test_acc, and best_test_loss."
         )
 
     return checkpoint
@@ -95,15 +94,11 @@ def init_server_result_csv(args):
         fieldnames = [
             'phase',
             'round',
-            'val_loss',
-            'val_acc',
-            'best_val_acc',
-            'best_val_loss',
-            'is_best',
-            'selected_for_test',
             'test_loss',
             'test_acc',
-            'selected_round',
+            'best_test_acc',
+            'best_test_loss',
+            'is_best',
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
@@ -124,15 +119,11 @@ def record_server_result(record_dic:dict, args):
         fieldnames = [
             'phase',
             'round',
-            'val_loss',
-            'val_acc',
-            'best_val_acc',
-            'best_val_loss',
-            'is_best',
-            'selected_for_test',
             'test_loss',
             'test_acc',
-            'selected_round',
+            'best_test_acc',
+            'best_test_loss',
+            'is_best',
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writerow(record_dic)

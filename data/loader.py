@@ -6,8 +6,8 @@ from torchvision import transforms
 from torchvision.datasets import CIFAR10, CIFAR100
 
 
-EXPECTED_PROTOCOL = "server_global_val_client_train_index_partition"
-EXPECTED_VERSION = 1
+EXPECTED_PROTOCOL = "server_global_test_client_train_index_partition"
+EXPECTED_VERSION = 2
 
 
 def get_cifar_stats(data_name):
@@ -54,7 +54,7 @@ def load_partition_meta(args):
     if not os.path.exists(meta_path):
         raise FileNotFoundError(
             f"Missing partition metadata: {meta_path}. "
-            "Update the YAML config files if needed, then run `python -m data.data` before training."
+            "Run `python train.py` to rebuild partition_meta.pt and partition_stats.json."
         )
 
     meta = torch.load(meta_path, weights_only=False)
@@ -74,7 +74,6 @@ def validate_partition_meta(meta, args):
         ("num_clients", meta.get("num_clients"), args.num_clients, "int"),
         ("alpha", meta.get("alpha"), args.alpha, "float"),
         ("seed", meta.get("seed"), args.seed, "int"),
-        ("global_val_ratio", meta.get("global_val_ratio"), args.global_val_ratio, "float"),
         ("min_datasize", meta.get("min_datasize"), args.min_datasize, "int"),
         ("data_path", meta.get("data_path"), args.data_path, "path"),
     ]
@@ -91,12 +90,11 @@ def validate_partition_structure(meta, args):
     if not isinstance(splits, dict):
         raise ValueError(
             "partition_meta is incomplete: missing a valid `splits` dictionary. "
-            "Please regenerate partition_meta.pt and partition_stats.json."
+            "Run `python train.py` to rebuild partition_meta.pt and partition_stats.json."
         )
 
     required_split_keys = {
-        "global_val_indices",
-        "federated_train_pool_indices",
+        "client_train_pool_indices",
         "client_train_indices",
         "global_test_indices",
     }
@@ -104,13 +102,13 @@ def validate_partition_structure(meta, args):
     if missing:
         raise ValueError(
             f"partition_meta is incomplete: missing split keys {sorted(missing)}. "
-            "Please regenerate partition_meta.pt and partition_stats.json."
+            "Run `python train.py` to rebuild partition_meta.pt and partition_stats.json."
         )
 
     if not isinstance(splits["client_train_indices"], dict):
         raise ValueError(
             "`splits['client_train_indices']` must be a dict. "
-            "Please regenerate partition_meta.pt and partition_stats.json."
+            "Run `python train.py` to rebuild partition_meta.pt and partition_stats.json."
         )
 
     expected_client_keys = {str(i) for i in range(1, args.num_clients + 1)}
@@ -119,21 +117,21 @@ def validate_partition_structure(meta, args):
         raise ValueError(
             "partition_meta has incomplete client_train_indices keys: "
             f"expected {sorted(expected_client_keys)}, found {sorted(actual_client_keys)}. "
-            "Please regenerate partition_meta.pt and partition_stats.json."
+            "Run `python train.py` to rebuild partition_meta.pt and partition_stats.json."
         )
 
     for client_id, indices in splits["client_train_indices"].items():
         if not isinstance(indices, (list, tuple)):
             raise ValueError(
                 f"`splits['client_train_indices']['{client_id}']` must be a list or tuple. "
-                "Please regenerate partition_meta.pt and partition_stats.json."
+                "Run `python train.py` to rebuild partition_meta.pt and partition_stats.json."
             )
 
-    for key in ["global_val_indices", "federated_train_pool_indices", "global_test_indices"]:
+    for key in ["client_train_pool_indices", "global_test_indices"]:
         if not isinstance(splits[key], (list, tuple)):
             raise ValueError(
                 f"`splits['{key}']` must be a list or tuple. "
-                "Please regenerate partition_meta.pt and partition_stats.json."
+                "Run `python train.py` to rebuild partition_meta.pt and partition_stats.json."
             )
 
 
@@ -152,8 +150,7 @@ def metadata_value_matches(actual, expected, value_type):
 def raise_partition_mismatch(field, actual, expected):
     raise ValueError(
         f"partition_meta mismatch for `{field}`: found {actual!r}, expected {expected!r}. "
-        "Please update the YAML config files and re-run `python -m data.data` "
-        "to regenerate partition_meta.pt."
+        "Run `python train.py` to rebuild partition_meta.pt and partition_stats.json."
     )
 
 
@@ -170,9 +167,8 @@ def build_raw_cifar_dataset(args, train, transform):
         raise FileNotFoundError(
             f"Could not load raw CIFAR data from `{args.data_path}` with download=False. "
             "This project uses index-based partition metadata, so training still requires "
-            "the original CIFAR files. Please make sure the raw dataset exists under data_path, "
-            "or re-run: `python -m data.data` "
-            "to download the dataset and regenerate partition files."
+            "the original CIFAR files. Run `python train.py` to rebuild partition files "
+            "after ensuring the dataset is available."
         ) from e
     except RuntimeError as e:
         error_text = str(e).lower()
@@ -183,9 +179,8 @@ def build_raw_cifar_dataset(args, train, transform):
             raise FileNotFoundError(
                 f"Could not load raw CIFAR data from `{args.data_path}` with download=False. "
                 "This project uses index-based partition metadata, so training still requires "
-                "the original CIFAR files. Please make sure the raw dataset exists under data_path, "
-                "or re-run: `python -m data.data` "
-                "to download the dataset and regenerate partition files."
+                "the original CIFAR files. Run `python train.py` to rebuild partition files "
+                "after ensuring the dataset is available."
             ) from e
 
         if any(keyword in error_text for keyword in corrupt_keywords):
@@ -193,24 +188,21 @@ def build_raw_cifar_dataset(args, train, transform):
                 f"Raw CIFAR files were found under `{args.data_path}`, but loading failed and "
                 "the dataset may be corrupted or incomplete. This project uses index-based "
                 "partition metadata, so training still requires the original CIFAR files. "
-                "Please check the dataset files or re-run: "
-                "`python -m data.data` "
-                "to re-download and regenerate partition files."
+                "Please check the dataset files, then run `python train.py` to rebuild "
+                "partition files."
             ) from e
 
         raise RuntimeError(
             f"Failed to load raw CIFAR data from `{args.data_path}` with download=False. "
             "This project uses index-based partition metadata, so training still requires "
-            "the original CIFAR files. Please check data_path or re-run: "
-            "`python -m data.data` "
-            "to regenerate partition files after ensuring the dataset can be read."
+            "the original CIFAR files. Please check data_path, then run `python train.py` "
+            "to rebuild partition files after ensuring the dataset can be read."
         ) from e
     except Exception as e:
         raise RuntimeError(
             f"Unexpected error while loading raw CIFAR data from `{args.data_path}` with download=False. "
             "This project uses index-based partition metadata, so training still requires "
-            "the original CIFAR files. Please check data_path or re-run: "
-            "`python -m data.data`."
+            "the original CIFAR files. Please check data_path, then run `python train.py`."
         ) from e
 
 
@@ -226,9 +218,6 @@ def build_index_dataset(args, split, client_id=None, meta=None):
             raise ValueError("client_id is required for client_train split")
         indices = splits["client_train_indices"][str(client_id)]
         dataset = build_raw_cifar_dataset(args, train=True, transform=train_transform)
-    elif split == "global_val":
-        indices = splits["global_val_indices"]
-        dataset = build_raw_cifar_dataset(args, train=True, transform=eval_transform)
     elif split == "global_test":
         indices = splits["global_test_indices"]
         dataset = build_raw_cifar_dataset(args, train=False, transform=eval_transform)
@@ -255,8 +244,8 @@ def build_client_train_loader(args, client_id, meta=None):
 
 
 def build_global_eval_loader(args, split, meta=None):
-    if split not in {"global_val", "global_test"}:
-        raise ValueError("split must be global_val or global_test")
+    if split != "global_test":
+        raise ValueError("split must be global_test")
 
     dataset = build_index_dataset(args=args, split=split, meta=meta)
     return DataLoader(

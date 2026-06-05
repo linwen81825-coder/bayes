@@ -65,9 +65,10 @@ python train.py
 
 当前项目使用的是 index-based partition 协议：
 
-- official `train` 先做分层切分，得到 `global_val` 和 `federated_train_pool`
-- `federated_train_pool` 再通过 Dirichlet non-IID 划分得到各客户端的 `client_train_indices`
-- official `test` 直接作为 `global_test`
+- official `train` 全部作为客户端训练池 `client_train_pool`
+- `client_train_pool` 通过 Dirichlet non-IID 划分得到各客户端的 `client_train_indices`
+- official `test` 完整保留给服务器做 `global_test`
+- `python train.py` 会在训练前自动重建并覆盖 `partition_meta.pt` 和 `partition_stats.json`
 - `partition_meta.pt` 只保存索引和元信息，不保存原始图像数据
 - `partition_stats.json` 保存各 split 的样本规模和类别统计
 
@@ -84,11 +85,11 @@ python train.py
 ## 训练与评估协议
 
 - client 只训练自己的 `client_train`
-- server 每轮在 `global_val` 上评估当前全局模型
+- server 每轮在 `global_test` 上评估当前全局模型
 - best model 选择规则：
-  - 先比较 `global_val_acc`
-  - 若相同，再比较 `global_val_loss`
-- `global_test` 不参与模型选择，只在训练结束后做最终评估
+  - 先比较 `global_test_acc`
+  - 若相同，再比较 `global_test_loss`
+- 不再单独划分验证集
 
 ## 输出文件
 
@@ -113,7 +114,7 @@ python train.py
 - `save/result/detail/*.csv`
   - client 侧逐轮训练明细
 - `save/result/server/*.csv`
-  - server 侧逐轮 `global_val` 与最终 `global_test` 结果
+  - server 侧逐轮 `global_test` 结果
 - `save/result/logs/*.log`
   - 本次实验的完整日志
 
@@ -123,7 +124,6 @@ CSV 和日志文件名都会包含：
 - `num_clients`
 - `alpha`
 - `seed`
-- `global_val_ratio`
 - `agg_method`
 
 ## Checkpoint 约定
@@ -136,8 +136,8 @@ CSV 和日志文件名都会包含：
   - checkpoint dict，至少包含：
     - `model_state_dict`
     - `best_round`
-    - `best_val_acc`
-    - `best_val_loss`
+    - `best_test_acc`
+    - `best_test_loss`
 
 如果需要读取 `best_server.pth`，请使用 `utils/utils.py` 中的 `load_best_server_checkpoint(path)`，不要把它当成纯 `state_dict` 直接使用。
 
