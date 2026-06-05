@@ -244,6 +244,8 @@ class Server:
                 round_expert_usage_summary = torch.zeros(self.args.num_experts)
                 round_layer_stats = {}
                 round_client_expert_usages = []
+                round_client_uoc_evidences = []
+                round_client_stats = []
                 client_states = []
                 for id in self.clientsID_list:
                     # 每个客户端执行本地训练，并返回本轮信息。
@@ -268,6 +270,25 @@ class Server:
                                 "in_memory_client_updates=True requires Client.train() to return model_state_dict"
                             )
                         client_states.append(client_stats.pop("model_state_dict"))
+
+                    uoc_evidence = client_stats.get("uoc_evidence_by_layer", {})
+                    round_client_uoc_evidences.append(uoc_evidence)
+                    # 传给聚合器的 client stats 保持轻量，不重复保存 model_state_dict 或 evidence 大 tensor。
+                    round_client_stats.append({
+                        "client_id": id,
+                        "client_loss": client_stats.get(
+                            "client_loss",
+                            client_stats.get("train_loss", 0.0),
+                        ),
+                        "train_loss": client_stats.get("train_loss", None),
+                        "train_acc": client_stats.get("train_acc", None),
+                        "expert_activations": client_stats.get("expert_activations", None),
+                        "expert_stats_by_layer": client_stats.get("expert_stats_by_layer", None),
+                        "expert_activations_by_layer": client_stats.get(
+                            "expert_activations_by_layer",
+                            None,
+                        ),
+                    })
 
                     client_expert_usage = client_stats["expert_activations"].float().cpu()
                     round_client_expert_usages.append(client_stats)
@@ -297,10 +318,25 @@ class Server:
                     }
                     for layer_id, stats in round_layer_stats.items()
                 }
+                client_uoc_evidence_counts = []
+                for uoc_evidence in round_client_uoc_evidences:
+                    if not uoc_evidence:
+                        client_uoc_evidence_counts.append(0)
+                        continue
+                    client_uoc_evidence_counts.append({
+                        str(layer_id): int(layer_evidence["hidden"].shape[0])
+                        for layer_id, layer_evidence in uoc_evidence.items()
+                        if isinstance(layer_evidence, dict) and "hidden" in layer_evidence
+                    })
                 self.logger.info(f"--client_expert_usage_summary : {client_usage_list}\n")
                 self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
+                self.logger.info(f"--client_uoc_evidence_counts : {client_uoc_evidence_counts}\n")
                 # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
-                self.aggregation(client_states=client_states if use_in_memory_updates else None)
+                self.aggregation(
+                    client_states=client_states if use_in_memory_updates else None,
+                    uoc_evidence=round_client_uoc_evidences,
+                    client_stats=round_client_stats,
+                )
 
                 test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
                 self.logger.info(f"--server_global_test_loss : {test_loss:.4f} --server_global_test_acc : {test_acc:.4f}\n")
@@ -395,7 +431,7 @@ class Server:
         # sample_weighted 聚合会使用客户端训练样本数作为权重来源。
         return get_client_train_size(self.args, client_id, meta=self.partition_meta)
 
-    def aggregation_by_method(self, client_states=None):
+    def aggregation_by_method(self, client_states=None, uoc_evidence=None, client_stats=None):
         # 聚合器接口：
         # - 非专家参数使用 non_expert_agg_method；
         # - 专家参数使用 expert_agg_method。
@@ -419,13 +455,23 @@ class Server:
             client_updates=client_states,
             client_weights=client_sizes,
             global_model=self.model,
+            uoc_evidence=uoc_evidence,
+            client_stats=client_stats,
         )
         self.model.load_state_dict(aggregated_state)
+        aggregation_metrics = getattr(self.aggregator, "last_aggregation_metrics", {})
+        uoc_foga_stats = aggregation_metrics.get("uoc_foga_stats")
+        if uoc_foga_stats is not None:
+            self.logger.info(f"--uoc_foga_stats : {uoc_foga_stats}\n")
         self.logger.info(
             f"--non_expert_agg_method : {self.args.non_expert_agg_method} "
             f"--expert_agg_method : {self.args.expert_agg_method}\n"
         )
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
 
-    def aggregation(self, client_states=None):
-        self.aggregation_by_method(client_states=client_states)
+    def aggregation(self, client_states=None, uoc_evidence=None, client_stats=None):
+        self.aggregation_by_method(
+            client_states=client_states,
+            uoc_evidence=uoc_evidence,
+            client_stats=client_stats,
+        )
