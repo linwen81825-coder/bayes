@@ -66,6 +66,8 @@ def _empty_query_result(num_classes, fallback_reason):
         "hidden": None,
         "labels": None,
         "gates": None,
+        "residual": None,
+        "has_residual": False,
         "class_hist": [0 for _ in range(num_classes)],
         "query_size": 0,
         "query_num_classes": 0,
@@ -100,6 +102,7 @@ def _select_expert_samples(layer_evidence, expert_id):
     labels = _as_cpu_tensor(layer_evidence.get("labels"))
     top1_expert_ids = _as_cpu_tensor(layer_evidence.get("top1_expert_ids"))
     top1_gates = _as_cpu_tensor(layer_evidence.get("top1_gates"))
+    residual = _as_cpu_tensor(layer_evidence.get("residual"))
     if (
         hidden is None
         or labels is None
@@ -114,13 +117,18 @@ def _select_expert_samples(layer_evidence, expert_id):
         or top1_gates.dim() == 0
     ):
         return None
+    if residual is not None and residual.dim() == 0:
+        residual = None
 
-    sample_count = min(
+    sample_count_values = [
         hidden.size(0),
         labels.size(0),
         top1_expert_ids.size(0),
         top1_gates.size(0),
-    )
+    ]
+    if residual is not None:
+        sample_count_values.append(residual.size(0))
+    sample_count = min(sample_count_values)
     if sample_count <= 0:
         return None
 
@@ -128,6 +136,10 @@ def _select_expert_samples(layer_evidence, expert_id):
     labels = labels[:sample_count]
     top1_expert_ids = top1_expert_ids[:sample_count].long()
     top1_gates = top1_gates[:sample_count].float()
+    if residual is not None:
+        residual = residual[:sample_count]
+        if residual.shape[1:] != hidden.shape[1:]:
+            residual = None
     expert_id = int(expert_id)
 
     if top1_expert_ids.dim() == 1:
@@ -151,11 +163,16 @@ def _select_expert_samples(layer_evidence, expert_id):
     if sample_mask.sum().item() == 0:
         return None
 
-    return {
+    selected = {
         "hidden": hidden[sample_mask],
         "labels": labels[sample_mask].long(),
         "gates": gate_per_sample[sample_mask],
+        "residual": None,
     }
+    if residual is not None:
+        # residual 和 hidden 必须使用同一个 sample_mask，否则 server 无法恢复 block 输出。
+        selected["residual"] = residual[sample_mask]
+    return selected
 
 
 def build_stratified_query_for_expert(
@@ -182,6 +199,8 @@ def build_stratified_query_for_expert(
     pool_hidden_chunks = []
     pool_label_chunks = []
     pool_gate_chunks = []
+    pool_residual_chunks = []
+    missing_selected_residual = False
     hidden_tail_shape = None
 
     for client_evidence in uoc_evidences:
@@ -206,6 +225,10 @@ def build_stratified_query_for_expert(
         pool_hidden_chunks.append(selected["hidden"])
         pool_label_chunks.append(selected["labels"])
         pool_gate_chunks.append(selected["gates"])
+        if selected["residual"] is None:
+            missing_selected_residual = True
+        else:
+            pool_residual_chunks.append(selected["residual"])
 
     if not has_any_evidence:
         return _empty_query_result(num_classes, "no_uoc_evidence")
@@ -217,6 +240,11 @@ def build_stratified_query_for_expert(
     pool_hidden = torch.cat(pool_hidden_chunks, dim=0)
     pool_labels = torch.cat(pool_label_chunks, dim=0).long()
     pool_gates = torch.cat(pool_gate_chunks, dim=0).float()
+    pool_has_residual = (
+        not missing_selected_residual
+        and len(pool_residual_chunks) == len(pool_hidden_chunks)
+    )
+    pool_residual = torch.cat(pool_residual_chunks, dim=0) if pool_has_residual else None
     class_hist = [0 for _ in range(num_classes)]
     selected_indices = []
     generator = None
@@ -243,12 +271,20 @@ def build_stratified_query_for_expert(
         query_hidden = pool_hidden[selected_indices].detach().cpu()
         query_labels = pool_labels[selected_indices].detach().cpu()
         query_gates = pool_gates[selected_indices].detach().cpu()
+        # residual 必须和 hidden 使用同一个 final_indices，才能恢复：
+        # x_after_block = residual + forced_expert(hidden)。
+        query_residual = (
+            pool_residual[selected_indices].detach().cpu()
+            if pool_residual is not None
+            else None
+        )
         query_size = int(query_labels.size(0))
         query_num_classes = sum(1 for count in class_hist if count > 0)
     else:
         query_hidden = None
         query_labels = None
         query_gates = None
+        query_residual = None
         query_size = 0
         query_num_classes = 0
 
@@ -258,10 +294,17 @@ def build_stratified_query_for_expert(
     elif query_num_classes < min_query_classes:
         fallback_reason = "query_classes_too_few"
 
+    has_residual = query_residual is not None
+    if fallback_reason is not None:
+        query_residual = None
+        has_residual = False
+
     return {
         "hidden": query_hidden,
         "labels": query_labels,
         "gates": query_gates,
+        "residual": query_residual,
+        "has_residual": has_residual,
         "class_hist": class_hist,
         "query_size": query_size,
         "query_num_classes": query_num_classes,
