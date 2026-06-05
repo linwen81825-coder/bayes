@@ -36,15 +36,15 @@ conda activate bayes_env
 
 这三份 YAML 的顶层都必须是 key-value mapping；空文件会按空配置处理。
 三份 YAML 配置文件会在启动时读取并合并。为避免歧义，顶层 key 必须全局唯一；如果出现重复 key，`load_args()` 会直接报错，而不是静默覆盖。
-默认假设从项目根目录运行 `python train.py`；除非显式传入绝对路径，否则会读取项目根目录下的 `configs/data.yaml`、`configs/train.yaml` 和 `configs/model.yaml`。`train.py` 会在训练前自动重建并覆盖数据划分文件。
+默认假设从项目根目录运行 `python train.py`；除非显式传入绝对路径，否则会读取项目根目录下的 `configs/data.yaml`、`configs/train.yaml` 和 `configs/model.yaml`。`resume=false` 时，`train.py` 会在训练前自动重建并覆盖数据划分文件。
 
 ## 实验切换方式
 
 - 切 CIFAR10 / CIFAR100：修改 `configs/data.yaml` 中的 `data_name`
 - 改 `alpha`：修改 `configs/data.yaml` 中的 `alpha`
 - 切聚合方法：修改 `configs/train.yaml` 中的 `non_expert_agg_method` 和 `expert_agg_method`
-- 改完 YAML 后，直接运行 `python train.py`；训练入口会自动重建 partition
-- 每次训练都会覆盖已有的 `partition_meta.pt` 和 `partition_stats.json`
+- 改完 YAML 后，直接运行 `python train.py`；`resume=false` 时训练入口会自动重建 partition
+- `resume=false` 时会覆盖已有的 `partition_meta.pt` 和 `partition_stats.json`
 - 如果想切换另一套 YAML，也可以使用轻量命令行入口：
 
 ```bash
@@ -60,6 +60,8 @@ python train.py --data_cfg configs/data.yaml --train_cfg configs/train.yaml --mo
 ```yaml
 non_expert_agg_method: sample_weighted
 expert_agg_method: sample_weighted
+resume: false
+resume_checkpoint: latest
 ```
 
 - `non_expert_agg_method` 控制非专家参数聚合
@@ -68,9 +70,42 @@ expert_agg_method: sample_weighted
 - `uniform`：每个客户端等权平均
 - 后续新增聚合方法时，在 `fl/aggregators.py` 注册即可
 
+## 断点续训
+
+从头训练时保持默认配置：
+
+```yaml
+resume: false
+resume_checkpoint: latest
+```
+
+启动训练：
+
+```bash
+python train.py
+```
+
+中断后续训时改为：
+
+```yaml
+resume: true
+resume_checkpoint: latest
+```
+
+再次运行：
+
+```bash
+python train.py
+```
+
+- `resume=false` 时会重新划分数据并覆盖旧 CSV
+- `resume=true` 时不会重新划分数据，不会覆盖旧 CSV，会从 `latest.pth` 的下一轮继续
+- checkpoint 固定每轮保存一次
+- checkpoint 保存在 `save_root/model/checkpoints/`
+
 ## 运行顺序
 
-按需要修改上述 YAML 文件后，直接启动训练；`train.py` 会在训练前自动重建并覆盖数据划分文件：
+按需要修改上述 YAML 文件后，直接启动训练；`resume=false` 时，`train.py` 会在训练前自动重建并覆盖数据划分文件：
 
 ```bash
 python train.py
@@ -83,7 +118,7 @@ python train.py
 - official `train` 全部作为客户端训练池 `client_train_pool`
 - `client_train_pool` 通过 Dirichlet non-IID 划分得到各客户端的 `client_train_indices`
 - official `test` 完整保留给服务器做 `global_test`
-- `python train.py` 会在训练前自动重建并覆盖 `partition_meta.pt` 和 `partition_stats.json`
+- `resume=false` 时，`python train.py` 会在训练前自动重建并覆盖 `partition_meta.pt` 和 `partition_stats.json`
 - `partition_meta.pt` 只保存索引和元信息，不保存原始图像数据
 - `partition_stats.json` 保存各 split 的样本规模和类别统计
 
@@ -154,6 +189,8 @@ CSV 和日志文件名都会包含：
     - `best_round`
     - `best_test_acc`
     - `best_test_loss`
+- `save/model/checkpoints/round_*.pth` / `save/model/checkpoints/latest.pth`
+  - 断点续训 checkpoint，包含服务端模型、已完成轮次、best 指标、best 模型、随机数状态和配置快照
 
 如果需要读取 `best_server.pth`，请使用 `utils/utils.py` 中的 `load_best_server_checkpoint(path)`，不要把它当成纯 `state_dict` 直接使用。
 

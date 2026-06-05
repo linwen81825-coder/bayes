@@ -56,9 +56,12 @@ def main():
     set_seed(args.seed)
     logger = build_logger(args)
 
-    logger.info("[Partition] Rebuilding data partition before training...")
-    CIFARPartitionBuilder(args=args).build()
-    logger.info("[Partition] Data partition rebuilt successfully.")
+    if args.resume:
+        logger.info("[Resume] Enabled. Skip rebuilding data partition and use existing partition files.")
+    else:
+        logger.info("[Partition] Rebuilding data partition before training...")
+        CIFARPartitionBuilder(args=args).build()
+        logger.info("[Partition] Data partition rebuilt successfully.")
 
     set_seed(args.seed)
     # 项目主入口：创建服务端对象，然后启动联邦训练流程。

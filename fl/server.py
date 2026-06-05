@@ -8,7 +8,14 @@ from data.loader import build_global_eval_loader, get_client_train_size, load_pa
 from fl.aggregators import build_aggregator
 from fl.client import Client
 from model import build_model_from_args
-from utils.utils import init_result_csv, init_server_result_csv, record_server_result
+from utils.utils import (
+    capture_rng_state,
+    init_result_csv,
+    init_server_result_csv,
+    record_server_result,
+    restore_rng_state,
+)
+
 
 class Server:
     # Server 表示联邦学习中的服务端。
@@ -20,43 +27,168 @@ class Server:
         self.num_clients = self.args.num_clients
         self.server_epochs = self.args.server_epochs
         # 客户端编号从 1 开始，例如 num_clients=4 时为 [1, 2, 3, 4]。
-        self.clientsID_list = [i+1 for i in range(self.num_clients)]
+        self.clientsID_list = [i + 1 for i in range(self.num_clients)]
         self.device = self.args.device
-        # 服务端模型保存路径，例如 ./save/model/server.pth。
-        self.model_path = self.args.model_save_path + f"/server.pth"
         self.logger = logger
+        # 服务端模型保存路径，例如 ./save/model/server.pth。
+        self.model_path = os.path.join(self.args.model_save_path, "server.pth")
+        self.resume_enabled = bool(getattr(self.args, "resume", False))
+        self.start_round = 0
+        self.checkpoint_dir = os.path.join(self.args.model_save_path, "checkpoints")
+
         os.makedirs(self.args.model_save_path, exist_ok=True)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
         self.partition_meta = load_partition_meta(self.args)
         self.global_test_loader = build_global_eval_loader(
             args=self.args,
             split="global_test",
             meta=self.partition_meta,
         )
-        # 初始化全局模型，并保存到 server.pth。
-        self.init_global_model()
-        # 客户端初始模型直接来自同一个服务端模型，避免额外随机初始化。
-        self.sync_clients_model()
         self.num_experts = self.args.num_experts
         self.criterion = nn.CrossEntropyLoss()
+
+        if self.resume_enabled:
+            self.init_resume_training_state()
+            init_result_csv(self.args, overwrite=False)
+            init_server_result_csv(self.args, overwrite=False)
+        else:
+            self.clear_old_checkpoints()
+            self.init_fresh_training_state()
+            init_result_csv(self.args, overwrite=True)
+            init_server_result_csv(self.args, overwrite=True)
+
+    def init_fresh_training_state(self):
+        """从头训练：初始化随机全局模型并覆盖旧结果。"""
+        self.model = build_model_from_args(self.args)
         self.best_test_acc = -1.0
         self.best_test_loss = float("inf")
         self.best_round = 0
         self.best_state_dict = None
-        # 初始化 CSV 结果文件，后续客户端训练会不断追加记录。
-        init_result_csv(self.args)
-        init_server_result_csv(self.args)
-
-
-    def init_global_model(self):
-        # 根据 model_type 初始化全局模型。
-        self.model = build_model_from_args(self.args)
-        # 初始化完成后立即保存，客户端 renew_model 时会读取这个文件。
+        self.start_round = 0
         self.save_server_model()
+        self.sync_clients_model()
+
+    def init_resume_training_state(self):
+        """断点续训：从 checkpoint 恢复服务端模型和训练状态。"""
+        self.model = build_model_from_args(self.args)
+        checkpoint_path = self.resolve_resume_checkpoint_path()
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self.validate_training_checkpoint(checkpoint, checkpoint_path)
+
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.best_test_acc = float(checkpoint["best_test_acc"])
+        self.best_test_loss = float(checkpoint["best_test_loss"])
+        self.best_round = int(checkpoint["best_round"])
+        self.best_state_dict = checkpoint.get("best_state_dict")
+        self.start_round = int(checkpoint["round_completed"])
+
+        restore_rng_state(checkpoint.get("rng_state"))
+
+        self.save_server_model()
+        self.sync_clients_model()
+
+        self.logger.info(f"[Resume] Loaded checkpoint from {checkpoint_path}")
+        self.logger.info(
+            f"[Resume] Completed rounds: {self.start_round}, next round: {self.start_round + 1}"
+        )
+
+    def clear_old_checkpoints(self):
+        """从头训练时清理旧 checkpoint，避免 latest.pth 残留造成误用。"""
+        if not os.path.isdir(self.checkpoint_dir):
+            return
+
+        for filename in os.listdir(self.checkpoint_dir):
+            if filename == "latest.pth" or (
+                filename.startswith("round_") and filename.endswith(".pth")
+            ):
+                os.remove(os.path.join(self.checkpoint_dir, filename))
+
+    def resolve_resume_checkpoint_path(self):
+        """解析 resume_checkpoint 配置。"""
+        resume_checkpoint = getattr(self.args, "resume_checkpoint", "latest")
+        if resume_checkpoint == "latest":
+            checkpoint_path = os.path.join(self.checkpoint_dir, "latest.pth")
+        else:
+            checkpoint_path = resume_checkpoint
+
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(
+                f"resume=true but checkpoint not found: {checkpoint_path}. "
+                "If you want to start a fresh run, set resume: false."
+            )
+        return checkpoint_path
+
+    def validate_training_checkpoint(self, checkpoint, checkpoint_path):
+        """检查训练 checkpoint 是否包含断点续训所需字段。"""
+        if not isinstance(checkpoint, dict):
+            raise ValueError(
+                f"Training checkpoint must be a dict: {checkpoint_path}, "
+                f"got {type(checkpoint).__name__}."
+            )
+
+        required_keys = {
+            "round_completed",
+            "model_state_dict",
+            "best_test_acc",
+            "best_test_loss",
+            "best_round",
+            "rng_state",
+        }
+        missing_keys = required_keys - set(checkpoint.keys())
+        if missing_keys:
+            raise ValueError(
+                f"Training checkpoint {checkpoint_path} is missing keys: {sorted(missing_keys)}"
+            )
+
+        round_completed = int(checkpoint["round_completed"])
+        if round_completed < 0:
+            raise ValueError(
+                f"Training checkpoint {checkpoint_path} has negative round_completed: {round_completed}"
+            )
+        if round_completed > self.server_epochs:
+            raise ValueError(
+                f"Training checkpoint round_completed={round_completed} exceeds "
+                f"server_epochs={self.server_epochs}. Please check the config."
+            )
+
+    def save_training_checkpoint(self, round_completed):
+        """保存训练 checkpoint，用于后续从下一轮继续训练。"""
+        checkpoint = {
+            "round_completed": int(round_completed),
+            "model_state_dict": {
+                key: value.detach().cpu().clone()
+                for key, value in self.model.state_dict().items()
+            },
+            "best_test_acc": float(self.best_test_acc),
+            "best_test_loss": float(self.best_test_loss),
+            "best_round": int(self.best_round),
+            "best_state_dict": (
+                None
+                if self.best_state_dict is None
+                else {
+                    key: value.detach().cpu().clone()
+                    for key, value in self.best_state_dict.items()
+                }
+            ),
+            "rng_state": capture_rng_state(),
+            "config": dict(vars(self.args)),
+        }
+
+        round_path = os.path.join(
+            self.checkpoint_dir,
+            f"round_{round_completed:04d}.pth",
+        )
+        latest_path = os.path.join(self.checkpoint_dir, "latest.pth")
+
+        torch.save(checkpoint, round_path)
+        torch.save(checkpoint, latest_path)
+
+        self.logger.info(f"--checkpoint_saved : {round_path}\n")
 
     def save_server_model(self):
         # 保存当前服务端模型参数到 server.pth。
-        torch.save(self.model.state_dict(), self.args.model_save_path + f"/server.pth")
-
+        torch.save(self.model.state_dict(), self.model_path)
 
     def sync_clients_model(self):
         server_state_dict = {
@@ -65,15 +197,18 @@ class Server:
         }
         for id in self.clientsID_list:
             # 初始化时所有客户端文件都保存同一个服务端 state_dict。
-            model_path = self.args.model_save_path + f"/{id}.pth"
+            model_path = os.path.join(self.args.model_save_path, f"{id}.pth")
             torch.save(server_state_dict, model_path)
 
-
-
-
     def train(self):
+        if self.start_round >= self.server_epochs:
+            self.logger.info(
+                f"[Resume] Checkpoint already reached server_epochs={self.server_epochs}. Nothing to train."
+            )
+            return
+
         # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
-        for c_T in range(self.server_epochs):
+        for c_T in range(self.start_round, self.server_epochs):
             self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
             round_expert_usage_summary = torch.zeros(self.args.num_experts)
             round_layer_stats = {}
@@ -136,8 +271,10 @@ class Server:
                 self.args,
             )
 
-            # 每轮结束保存当前服务端模型，供下一轮客户端同步。
+            # 每轮结束保存当前服务端模型，供下一轮客户端同步和断点续训。
             self.save_server_model()
+            round_completed = c_T + 1
+            self.save_training_checkpoint(round_completed)
             torch.cuda.empty_cache()
 
         self.logger.info(
@@ -201,7 +338,7 @@ class Server:
         )
         return True
 
-    def get_client_train_size(self,client_id):
+    def get_client_train_size(self, client_id):
         # sample_weighted 聚合会使用客户端训练样本数作为权重来源。
         return get_client_train_size(self.args, client_id, meta=self.partition_meta)
 
@@ -213,7 +350,7 @@ class Server:
         client_sizes = []
         for id in self.clientsID_list:
             client_state_dict = torch.load(
-                self.args.model_save_path + f"/{id}.pth",
+                os.path.join(self.args.model_save_path, f"{id}.pth"),
                 map_location="cpu",
             )
             client_states.append(client_state_dict)

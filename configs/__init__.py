@@ -31,6 +31,8 @@ _REQUIRED_CONFIG_KEYS = (
     "save_root",
     "non_expert_agg_method",
     "expert_agg_method",
+    "resume",
+    "resume_checkpoint",
     "model_type",
     "backbone_type",
     "num_experts",
@@ -123,6 +125,16 @@ def _validate_aggregation_methods(merged_config: dict) -> None:
             )
 
 
+def _validate_checkpoint_config(merged_config: dict) -> None:
+    resume = merged_config["resume"]
+    if not isinstance(resume, bool):
+        raise ValueError("resume must be a boolean: true or false")
+
+    resume_checkpoint = merged_config["resume_checkpoint"]
+    if not isinstance(resume_checkpoint, str) or not resume_checkpoint:
+        raise ValueError("resume_checkpoint must be a non-empty string")
+
+
 def _derive_save_paths(merged_config: dict) -> None:
     save_root = Path(str(merged_config["save_root"]))
     merged_config["data_save_path"] = str(save_root / "data")
@@ -167,6 +179,7 @@ def load_args(
 
     _raise_if_missing_required_keys(merged_config)
     _validate_aggregation_methods(merged_config)
+    _validate_checkpoint_config(merged_config)
     _derive_save_paths(merged_config)
 
     return SimpleNamespace(**merged_config)

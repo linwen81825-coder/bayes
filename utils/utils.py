@@ -19,6 +19,34 @@ def set_seed(seed:int):
     torch.backends.cudnn.deterministic = True
 
 
+def capture_rng_state():
+    """保存当前随机数状态，用于断点续训后尽量保持实验连续性。"""
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+    }
+
+
+def restore_rng_state(rng_state):
+    """恢复 checkpoint 中保存的随机数状态。"""
+    if not rng_state:
+        return
+
+    if "python" in rng_state:
+        random.setstate(rng_state["python"])
+
+    if "numpy" in rng_state:
+        np.random.set_state(rng_state["numpy"])
+
+    if "torch" in rng_state:
+        torch.set_rng_state(rng_state["torch"])
+
+    if torch.cuda.is_available() and rng_state.get("cuda") is not None:
+        torch.cuda.set_rng_state_all(rng_state["cuda"])
+
+
 def get_experiment_stem(args):
     return (
         f"data_{args.data_name}_"
@@ -74,13 +102,15 @@ def load_best_server_checkpoint(path):
 
     return checkpoint
 
-def init_result_csv(args):
+def init_result_csv(args, overwrite=True):
     """初始化结果 CSV，写入表头。
 
-    Server 初始化时会调用一次，所以每次重新运行训练会覆盖同名 CSV。
+    Server 初始化时会调用一次；断点续训时保留已有 CSV 并继续追加。
     """
 
     csv_path = get_csv_path(args)
+    if not overwrite and os.path.exists(csv_path):
+        return
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     with open(csv_path, 'w', newline='') as csvfile:
         fieldnames = ['T', 'client_epoch', 'client_id',"train_loss","train_acc","router_aux_loss","router_z_loss"]
@@ -88,8 +118,10 @@ def init_result_csv(args):
         writer.writeheader()
 
 
-def init_server_result_csv(args):
+def init_server_result_csv(args, overwrite=True):
     csv_path = get_server_csv_path(args)
+    if not overwrite and os.path.exists(csv_path):
+        return
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     with open(csv_path, 'w', newline='') as csvfile:
         fieldnames = [

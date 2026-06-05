@@ -6,3 +6,5 @@ save_root: ./save/default_exp
 #uniform/sample_weighted
 non_expert_agg_method: sample_weighted
 expert_agg_method: sample_weighted
+resume: false
+resume_checkpoint: latest
