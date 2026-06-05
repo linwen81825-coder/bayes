@@ -144,86 +144,92 @@ class Client:
         if samples_per_client <= 0:
             return {}
 
-        evidence_chunks_by_layer = {}
-        collected_samples = 0
-        evidence_loader = iter(self.train_loader)
-        inference_context = (
-            torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
-        )
-
-        for images, labels in evidence_loader:
-            remaining = samples_per_client - collected_samples
-            if remaining <= 0:
-                break
-
-            images = images[:remaining]
-            labels = labels[:remaining]
-            images = images.to(self.device, non_blocking=True)
-            labels = labels.to(self.device, non_blocking=True)
-            if labels.size(0) == 0:
-                continue
-
-            with inference_context():
-                batch_evidence = self.model.collect_uoc_evidence(
-                    images,
-                    max_samples=remaining,
-                    use_top1=uoc_foga_use_top1,
-                )
-
-            batch_sample_count = labels.size(0)
-            for layer_id, layer_evidence in batch_evidence.items():
-                layer_key = str(layer_id)
-                hidden = layer_evidence["hidden"].detach()
-                top1_expert_ids = layer_evidence["top1_expert_ids"].detach()
-                top1_gates = layer_evidence["top1_gates"].detach()
-                residual = layer_evidence.get("residual")
-                if residual is not None:
-                    # residual 用于 server 端精确恢复当前 MoE block 输出：
-                    # x_after_block = residual + forced_expert(hidden)。
-                    residual = residual[: hidden.size(0)].detach()
-                layer_labels = labels[: hidden.size(0)].detach()
-
-                if layer_key not in evidence_chunks_by_layer:
-                    evidence_chunks_by_layer[layer_key] = {
-                        "hidden": [],
-                        "labels": [],
-                        "top1_expert_ids": [],
-                        "top1_gates": [],
-                    }
-                if residual is not None and "residual" not in evidence_chunks_by_layer[layer_key]:
-                    evidence_chunks_by_layer[layer_key]["residual"] = []
-
-                evidence_chunks_by_layer[layer_key]["hidden"].append(hidden.cpu())
-                evidence_chunks_by_layer[layer_key]["labels"].append(layer_labels.cpu())
-                evidence_chunks_by_layer[layer_key]["top1_expert_ids"].append(
-                    top1_expert_ids.cpu()
-                )
-                evidence_chunks_by_layer[layer_key]["top1_gates"].append(
-                    top1_gates.cpu()
-                )
-                if residual is not None:
-                    evidence_chunks_by_layer[layer_key]["residual"].append(residual.cpu())
-
-            collected_samples += batch_sample_count
-
-        uoc_evidence_by_layer = {
-            layer_id: {
-                stat_key: torch.cat(chunks, dim=0).detach().cpu()
-                for stat_key, chunks in layer_chunks.items()
-            }
-            for layer_id, layer_chunks in evidence_chunks_by_layer.items()
-        }
-
-        if uoc_evidence_by_layer and self.logger is not None:
-            counts_by_layer = {
-                layer_id: int(layer_evidence["hidden"].size(0))
-                for layer_id, layer_evidence in uoc_evidence_by_layer.items()
-            }
-            self.logger.info(
-                f"[UOCEvidence] client={self.client_id} counts_by_layer={counts_by_layer}"
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            evidence_chunks_by_layer = {}
+            collected_samples = 0
+            evidence_loader = iter(self.train_loader)
+            inference_context = (
+                torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
             )
 
-        return uoc_evidence_by_layer
+            for images, labels in evidence_loader:
+                remaining = samples_per_client - collected_samples
+                if remaining <= 0:
+                    break
+
+                images = images[:remaining]
+                labels = labels[:remaining]
+                images = images.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+                if labels.size(0) == 0:
+                    continue
+
+                with inference_context():
+                    batch_evidence = self.model.collect_uoc_evidence(
+                        images,
+                        max_samples=remaining,
+                        use_top1=uoc_foga_use_top1,
+                    )
+
+                batch_sample_count = labels.size(0)
+                for layer_id, layer_evidence in batch_evidence.items():
+                    layer_key = str(layer_id)
+                    hidden = layer_evidence["hidden"].detach()
+                    top1_expert_ids = layer_evidence["top1_expert_ids"].detach()
+                    top1_gates = layer_evidence["top1_gates"].detach()
+                    residual = layer_evidence.get("residual")
+                    if residual is not None:
+                        # residual 用于 server 端精确恢复当前 MoE block 输出：
+                        # x_after_block = residual + forced_expert(hidden)。
+                        residual = residual[: hidden.size(0)].detach()
+                    layer_labels = labels[: hidden.size(0)].detach()
+
+                    if layer_key not in evidence_chunks_by_layer:
+                        evidence_chunks_by_layer[layer_key] = {
+                            "hidden": [],
+                            "labels": [],
+                            "top1_expert_ids": [],
+                            "top1_gates": [],
+                        }
+                    if residual is not None and "residual" not in evidence_chunks_by_layer[layer_key]:
+                        evidence_chunks_by_layer[layer_key]["residual"] = []
+
+                    evidence_chunks_by_layer[layer_key]["hidden"].append(hidden.cpu())
+                    evidence_chunks_by_layer[layer_key]["labels"].append(layer_labels.cpu())
+                    evidence_chunks_by_layer[layer_key]["top1_expert_ids"].append(
+                        top1_expert_ids.cpu()
+                    )
+                    evidence_chunks_by_layer[layer_key]["top1_gates"].append(
+                        top1_gates.cpu()
+                    )
+                    if residual is not None:
+                        evidence_chunks_by_layer[layer_key]["residual"].append(residual.cpu())
+
+                collected_samples += batch_sample_count
+
+            uoc_evidence_by_layer = {
+                layer_id: {
+                    stat_key: torch.cat(chunks, dim=0).detach().cpu()
+                    for stat_key, chunks in layer_chunks.items()
+                }
+                for layer_id, layer_chunks in evidence_chunks_by_layer.items()
+            }
+
+            if uoc_evidence_by_layer and self.logger is not None:
+                counts_by_layer = {
+                    layer_id: int(layer_evidence["hidden"].size(0))
+                    for layer_id, layer_evidence in uoc_evidence_by_layer.items()
+                }
+                self.logger.info(
+                    f"[UOCEvidence] client={self.client_id} counts_by_layer={counts_by_layer}"
+                )
+
+            return uoc_evidence_by_layer
+        finally:
+            # evidence 采集临时使用 eval，结束后恢复原来的训练状态。
+            self.model.train(was_training)
 
     def train(self):
         # 本地训练保持普通监督学习；不同模型通过 forward 返回的 aux loss / stats 接入路由约束和日志。

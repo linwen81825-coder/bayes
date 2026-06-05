@@ -451,14 +451,23 @@ class Server:
             for id in self.clientsID_list:
                 client_sizes.append(self.get_client_train_size(id))
 
-        aggregated_state = self.aggregator.aggregate(
-            client_updates=client_states,
-            client_weights=client_sizes,
-            global_model=self.model,
-            uoc_evidence=uoc_evidence,
-            client_stats=client_stats,
-        )
-        self.model.load_state_dict(aggregated_state)
+        use_uoc_foga = self.args.expert_agg_method == "uoc_foga_expert_align"
+        if use_uoc_foga:
+            # UOC-FOGA 需要在 global_model 上计算 g_query，让模型先到目标设备。
+            self.model.to(self.device)
+
+        try:
+            aggregated_state = self.aggregator.aggregate(
+                client_updates=client_states,
+                client_weights=client_sizes,
+                global_model=self.model,
+                uoc_evidence=uoc_evidence,
+                client_stats=client_stats,
+            )
+            self.model.load_state_dict(aggregated_state)
+        finally:
+            if use_uoc_foga:
+                self.model.to("cpu")
         aggregation_metrics = getattr(self.aggregator, "last_aggregation_metrics", {})
         uoc_foga_stats = aggregation_metrics.get("uoc_foga_stats")
         if uoc_foga_stats is not None:
