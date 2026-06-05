@@ -183,6 +183,22 @@ class TokenSwitchFFN(nn.Module):
             "avg_router_probs": avg_router_probs,
         }
 
+    def forward_force_expert(self, x, expert_id, gate_mode="one"):
+        # UOC query 强制经过指定 expert，用于后续计算该 expert 的参考梯度。
+        if gate_mode != "one":
+            raise ValueError("forward_force_expert currently supports gate_mode='one' only")
+
+        expert_id = int(expert_id)
+        if expert_id < 0 or expert_id >= self.num_experts:
+            raise ValueError(
+                f"expert_id must be in [0, {self.num_experts}), got {expert_id}"
+            )
+
+        embed_dim = x.size(-1)
+        flat_x = x.reshape(-1, embed_dim)
+        forced_output = self.experts[expert_id](flat_x)
+        return forced_output.reshape_as(x)
+
 
 class HybridTransformerBlock(nn.Module):
     # 标准 pre-norm Transformer block；FFN 可选择 dense 或 token-level Switch FFN。
@@ -242,12 +258,15 @@ class HybridTransformerBlock(nn.Module):
             if return_uoc_info:
                 # hidden 是 TokenSwitchFFN 的输入 ffn_input。
                 hidden = ffn_input.detach()
+                # residual 是 FFN 残差相加前的 x，用于从 hidden 精确恢复 block 输出。
+                residual = x.detach()
                 ffn_out, router_info = self.ffn(ffn_input, return_router_info=True)
                 x = x + self.dropout(ffn_out)
                 uoc_layer_id = self.layer_id if layer_id is None else layer_id
                 uoc_info = {
                     str(uoc_layer_id): {
                         "hidden": hidden.detach(),
+                        "residual": residual.detach(),
                         "top1_expert_ids": router_info["top1_expert_ids"],
                         "top1_gates": router_info["top1_gates"],
                     }
@@ -271,6 +290,27 @@ class HybridTransformerBlock(nn.Module):
         if return_uoc_info:
             return x, None, {}
         return x, None
+
+    def forward_from_ffn_input(
+        self,
+        hidden,
+        force_expert_id,
+        gate_mode="one",
+        residual=None,
+    ):
+        # 从采集到的 ffn_input 继续前向，不影响默认 block.forward。
+        if not self.use_switch_ffn:
+            raise ValueError("forward_from_ffn_input requires a TokenSwitchFFN block")
+
+        forced_ffn_out = self.ffn.forward_force_expert(
+            hidden,
+            force_expert_id,
+            gate_mode=gate_mode,
+        )
+        if residual is None:
+            # 兼容旧 evidence：缺少 residual 时只能用 hidden 近似残差，推荐后续 evidence 带 residual。
+            residual = hidden
+        return residual + self.dropout(forced_ffn_out)
 
 
 class HybridSwitchTransformer(nn.Module):
@@ -429,6 +469,35 @@ class HybridSwitchTransformer(nn.Module):
                 uoc_evidence.update(block_uoc_info)
 
         return uoc_evidence
+
+    def forward_uoc_from_hidden(
+        self,
+        hidden,
+        layer_id,
+        force_expert_id,
+        gate_mode="one",
+        residual=None,
+    ):
+        # 该接口只服务于 server 端 UOC-FOGA/PISM 聚合，不改变正常 forward。
+        layer_index = int(layer_id)
+        if layer_index < 0 or layer_index >= len(self.blocks):
+            raise ValueError(f"layer_id is outside model depth: {layer_id}")
+
+        block = self.blocks[layer_index]
+        x = block.forward_from_ffn_input(
+            hidden,
+            force_expert_id=force_expert_id,
+            gate_mode=gate_mode,
+            residual=residual,
+        )
+
+        for next_block in self.blocks[layer_index + 1:]:
+            x, _ = next_block(x)
+
+        x = self.norm(x)
+        pooled = x[:, 0] if self.cls_token is not None else x.mean(dim=1)
+        logits = self.classifier(pooled)
+        return {"logits": logits}
 
     def forward(self, x):
         feature_map = self.stem(x)
