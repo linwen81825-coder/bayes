@@ -22,27 +22,34 @@ conda activate bayes_env
 项目现在使用 YAML 作为唯一配置来源，不再依赖 `configs/args.py + argparse`。
 配置加载使用真正的 `PyYAML` 解析，也就是 `yaml.safe_load(...)`，不再使用手写的逐行 flat parser。
 
-配置分为三份：
+项目现在只使用一个配置文件：
 
-- `configs/data.yaml`
-  - 数据集、划分协议、随机种子等
-- `configs/train.yaml`
-  - 联邦训练轮数、设备、结果输出路径等
-- `configs/model.yaml`
-  - 模型结构和优化器超参数等
-  - `backbone_type` 控制图像 backbone：`cnn_stem` 为原始轻量 CNN stem，`resnet18` 为 CIFAR 版 ResNet18 backbone，后面仍接当前 Switch Transformer / MoE experts
+- `configs/config.yaml`
 
-项目入口会调用 `configs/__init__.py` 中的 `load_args()`，将三份 YAML 合并成一个扁平的 `args` 对象，因此项目内部仍然继续使用 `args.xxx` 访问配置。
+`configs/config.yaml` 按功能分组：
 
-这三份 YAML 的顶层都必须是 key-value mapping；空文件会按空配置处理。
-三份 YAML 配置文件会在启动时读取并合并。为避免歧义，顶层 key 必须全局唯一；如果出现重复 key，`load_args()` 会直接报错，而不是静默覆盖。
-默认假设从项目根目录运行 `python train.py`；除非显式传入绝对路径，否则会读取项目根目录下的 `configs/data.yaml`、`configs/train.yaml` 和 `configs/model.yaml`。`resume=false` 时，`train.py` 会在训练前自动重建并覆盖数据划分文件。
+- `data`：数据集和划分
+- `federated`：联邦训练
+- `runtime`：输出目录和断点续训
+- `aggregation`：非专家/专家参数聚合
+- `model`：模型主干
+- `moe`：MoE 和 router
+
+项目入口会调用 `configs/__init__.py` 中的 `load_args()`，将分组配置压平成一个扁平的 `args` 对象，因此项目内部仍然继续使用 `args.xxx` 访问配置。
+
+配置文件顶层必须是按功能分组的 mapping；每个分组下的 key 会在启动时压平。为避免歧义，压平后的 key 必须全局唯一；如果出现重复 key，`load_args()` 会直接报错，而不是静默覆盖。
+默认假设从项目根目录运行 `python train.py`；除非显式传入绝对路径，否则会读取项目根目录下的 `configs/config.yaml`。`resume=false` 时，`train.py` 会在训练前自动重建并覆盖数据划分文件。
 
 ## 实验切换方式
 
-- 切 CIFAR10 / CIFAR100：修改 `configs/data.yaml` 中的 `data_name`
-- 改 `alpha`：修改 `configs/data.yaml` 中的 `alpha`
-- 切聚合方法：修改 `configs/train.yaml` 中的 `non_expert_agg_method` 和 `expert_agg_method`
+- 切 CIFAR10 / CIFAR100：修改 `configs/config.yaml` 中的 `data.data_name`
+- 改 `alpha`：修改 `configs/config.yaml` 中的 `data.alpha`
+- 改客户端数：修改 `configs/config.yaml` 中的 `federated.num_clients`
+- 切聚合方法：修改 `configs/config.yaml` 中的 `aggregation.non_expert_agg_method` 和 `aggregation.expert_agg_method`
+- 改 backbone：修改 `configs/config.yaml` 中的 `model.backbone_type`
+- 改 expert 数：修改 `configs/config.yaml` 中的 `moe.num_experts`
+- 改输出目录：修改 `configs/config.yaml` 中的 `runtime.save_root`
+- 续训：修改 `configs/config.yaml` 中的 `runtime.resume` 和 `runtime.resume_checkpoint`
 - 改完 YAML 后，直接运行 `python train.py`；`resume=false` 时训练入口会自动重建 partition
 - `resume=false` 时会覆盖已有的 `partition_meta.pt` 和 `partition_stats.json`
 - 如果想切换另一套 YAML，也可以使用轻量命令行入口：
@@ -50,18 +57,17 @@ conda activate bayes_env
 ```bash
 python train.py
 
-python train.py --data_cfg configs/data.yaml --train_cfg configs/train.yaml --model_cfg configs/model.yaml
+python train.py --config configs/config.yaml
 ```
 
 ## 聚合配置
 
-`configs/train.yaml` 中使用两条聚合配置链路：
+`configs/config.yaml` 的 `aggregation` 分组中使用两条聚合配置链路：
 
 ```yaml
-non_expert_agg_method: sample_weighted
-expert_agg_method: sample_weighted
-resume: false
-resume_checkpoint: latest
+aggregation:
+  non_expert_agg_method: sample_weighted
+  expert_agg_method: sample_weighted
 ```
 
 - `non_expert_agg_method` 控制非专家参数聚合
@@ -75,8 +81,9 @@ resume_checkpoint: latest
 从头训练时保持默认配置：
 
 ```yaml
-resume: false
-resume_checkpoint: latest
+runtime:
+  resume: false
+  resume_checkpoint: latest
 ```
 
 启动训练：
@@ -88,8 +95,9 @@ python train.py
 中断后续训时改为：
 
 ```yaml
-resume: true
-resume_checkpoint: latest
+runtime:
+  resume: true
+  resume_checkpoint: latest
 ```
 
 再次运行：
@@ -105,7 +113,7 @@ python train.py
 
 ## 运行顺序
 
-按需要修改上述 YAML 文件后，直接启动训练；`resume=false` 时，`train.py` 会在训练前自动重建并覆盖数据划分文件：
+按需要修改 `configs/config.yaml` 后，直接启动训练；`resume=false` 时，`train.py` 会在训练前自动重建并覆盖数据划分文件：
 
 ```bash
 python train.py
@@ -130,7 +138,7 @@ python train.py
 
 动态构造 `Dataset` / `DataLoader`。
 
-如果训练时报原始 CIFAR 缺失，请检查 `configs/data.yaml` 中的 `data_path`，然后重新运行 `python train.py`。
+如果训练时报原始 CIFAR 缺失，请检查 `configs/config.yaml` 中的 `data.data_path`，然后重新运行 `python train.py`。
 
 ## 训练与评估协议
 

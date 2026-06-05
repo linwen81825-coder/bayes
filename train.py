@@ -43,16 +43,12 @@ def build_logger(args):
 
 
 def main():
-    cli_parser = argparse.ArgumentParser(description="Train with YAML configuration files.")
+    cli_parser = argparse.ArgumentParser(description="Train with a YAML configuration file.")
     add_config_path_arguments(cli_parser)
     cli_args = cli_parser.parse_args()
 
-    # Read experiment settings from YAML config files under `configs/`.
-    args = load_args(
-        data_cfg_path=cli_args.data_cfg,
-        train_cfg_path=cli_args.train_cfg,
-        model_cfg_path=cli_args.model_cfg,
-    )
+    # Read experiment settings from the YAML config file under `configs/`.
+    args = load_args(config_path=cli_args.config)
     set_seed(args.seed)
     logger = build_logger(args)
 

@@ -1,0 +1,151 @@
+# ============================================================
+# 联邦训练配置
+# ============================================================
+federated:
+  # 客户端数量
+  num_clients: 20
+
+  # 服务端通信轮数
+  server_epochs: 50
+
+  # 每轮每个客户端本地训练 epoch 数
+  client_epochs: 1
+
+  # 训练设备：cuda / cpu
+  device: cuda
+
+
+# ============================================================
+# 聚合配置
+# ============================================================
+aggregation:
+  # 非专家参数聚合方法：sample_weighted / uniform
+  non_expert_agg_method: sample_weighted
+
+  # 专家参数聚合方法：sample_weighted / uniform
+  expert_agg_method: sample_weighted
+
+
+
+# ============================================================
+# 数据集与数据划分配置
+# ============================================================
+data:
+  # 数据集名称：支持 cifar10 / cifar100
+  data_name: cifar100
+
+  # 原始 CIFAR 数据保存目录
+  data_path: ./data
+
+  # DataLoader 每个 batch 的样本数
+  batch_size: 32
+
+  # 每个客户端至少分到的样本数
+  min_datasize: 32
+
+  # Dirichlet non-IID 划分参数，越小表示客户端数据越偏
+  alpha: 0.1
+
+  # 随机种子，控制数据划分和训练随机性
+  seed: 1
+
+  # 数据划分元信息文件名
+  partition_meta_name: partition_meta.pt
+
+  # 数据划分类别统计文件名
+  partition_stats_name: partition_stats.json
+
+  # DataLoader worker 数量
+  num_workers: 0
+
+  # 是否启用 DataLoader pin_memory
+  pin_memory: false
+
+
+
+# ============================================================
+# 输出与断点续训配置
+# ============================================================
+runtime:
+  # 实验总输出目录；data/result/model 三个目录会由它自动派生
+  save_root: ./save/default_exp
+
+  # 是否从 checkpoint 断点续训
+  resume: false
+
+  # 续训 checkpoint：latest 表示读取 save_root/model/checkpoints/latest.pth，也可以写具体路径
+  resume_checkpoint: latest
+
+
+
+# ============================================================
+# 模型主干配置
+# ============================================================
+model:
+  # 模型类型，目前使用 hybrid_switch_transformer
+  model_type: hybrid_switch_transformer
+
+  # 图像 backbone：cnn_stem / resnet18
+  backbone_type: cnn_stem
+
+  # dropout 概率
+  dropout: 0.2
+
+  # 客户端本地训练学习率
+  learning_rate: 0.0005
+
+  # Transformer token embedding 维度
+  embed_dim: 128
+
+  # Transformer 多头注意力 head 数
+  num_heads: 4
+
+  # Transformer MLP 扩张倍率
+  mlp_ratio: 4.0
+
+  # Transformer block 深度
+  depth: 4
+
+  # 兼容旧配置字段；为空时使用 depth
+  num_layers: null
+
+  # CNN stem 输出通道数，仅 cnn_stem backbone 使用
+  stem_channels: 64
+
+  # token pooling 后的空间网格大小
+  token_grid_size: 8
+
+  # 是否使用 cls token
+  use_cls_token: false
+
+
+# ============================================================
+# MoE / Router 配置
+# ============================================================
+moe:
+  # expert 数量
+  num_experts: 8
+
+  # 哪些 Transformer 层使用 MoE FFN，例如 "1,3"
+  moe_layers: "1,3"
+
+  # router 选择 top-k expert
+  top_k: 1
+
+  # router auxiliary loss 系数
+  router_aux_loss_coef: 0.01
+
+  # router z-loss 系数
+  router_z_loss_coef: 0.001
+
+  # router jitter noise，0 表示关闭
+  router_jitter_noise: 0.0
+
+  # expert capacity 系数
+  capacity_factor: 1.25
+
+  # 每个 expert 的最小 capacity
+  min_capacity: 4
+
+  # 超过 capacity 的 token 是否丢弃
+  drop_tokens: true

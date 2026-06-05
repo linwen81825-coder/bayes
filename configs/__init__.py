@@ -10,9 +10,7 @@ import yaml
 
 _CONFIG_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _CONFIG_DIR.parent
-DEFAULT_DATA_CFG_PATH = "configs/data.yaml"
-DEFAULT_TRAIN_CFG_PATH = "configs/train.yaml"
-DEFAULT_MODEL_CFG_PATH = "configs/model.yaml"
+DEFAULT_CONFIG_PATH = "configs/config.yaml"
 _REQUIRED_CONFIG_KEYS = (
     "data_name",
     "data_path",
@@ -88,22 +86,21 @@ def _load_yaml_mapping(config_path: str | Path) -> dict:
     return data
 
 
-def _raise_if_duplicate_keys(named_configs: list[tuple[str, dict]]) -> None:
-    duplicate_details = []
-    for index, (left_name, left_cfg) in enumerate(named_configs):
-        for right_name, right_cfg in named_configs[index + 1:]:
-            duplicate_keys = sorted(set(left_cfg) & set(right_cfg))
-            if duplicate_keys:
-                duplicate_details.append(
-                    f"{left_name} and {right_name}: {duplicate_keys}"
+def _flatten_grouped_config(config: dict) -> dict:
+    flattened = {}
+    for group_name, group_config in config.items():
+        if not isinstance(group_config, dict):
+            raise ValueError(
+                f"Top-level config section `{group_name}` must be a mapping."
+            )
+        for key, value in group_config.items():
+            if key in flattened:
+                raise ValueError(
+                    f"Duplicate config key after flatten: {key!r}. "
+                    f"Please keep keys unique across config sections."
                 )
-
-    if duplicate_details:
-        raise ValueError(
-            "Duplicate config keys found across YAML files. "
-            + "; ".join(duplicate_details)
-            + ". Please keep keys unique across data.yaml, train.yaml, and model.yaml."
-        )
+            flattened[key] = value
+    return flattened
 
 
 def _raise_if_missing_required_keys(merged_config: dict) -> None:
@@ -111,7 +108,7 @@ def _raise_if_missing_required_keys(merged_config: dict) -> None:
     if missing_keys:
         raise ValueError(
             f"Missing required config keys: {missing_keys}. "
-            "Please check configs/data.yaml, configs/train.yaml, and configs/model.yaml."
+            "Please check configs/config.yaml."
         )
 
 
@@ -143,39 +140,17 @@ def _derive_save_paths(merged_config: dict) -> None:
 
 
 def add_config_path_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Add the lightweight YAML-path CLI overrides used by the entrypoints."""
+    """Add the YAML config path CLI argument used by the entrypoints."""
 
-    parser.add_argument("--data_cfg", default=DEFAULT_DATA_CFG_PATH)
-    parser.add_argument("--train_cfg", default=DEFAULT_TRAIN_CFG_PATH)
-    parser.add_argument("--model_cfg", default=DEFAULT_MODEL_CFG_PATH)
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     return parser
 
 
-def load_args(
-    data_cfg_path: str = DEFAULT_DATA_CFG_PATH,
-    train_cfg_path: str = DEFAULT_TRAIN_CFG_PATH,
-    model_cfg_path: str = DEFAULT_MODEL_CFG_PATH,
-):
-    """Load flat YAML config files and return an args-like namespace."""
+def load_args(config_path: str = DEFAULT_CONFIG_PATH):
+    """Load grouped YAML config and return an args-like namespace."""
 
-    config_items = []
-    for config_path_str in [data_cfg_path, train_cfg_path, model_cfg_path]:
-        try:
-            resolved_path = _resolve_config_path(config_path_str)
-            config_items.append((resolved_path.name, _load_yaml_mapping(resolved_path)))
-        except FileNotFoundError:
-            raise
-        except ValueError:
-            raise
-        except Exception as exc:
-            config_path = _resolve_config_path(config_path_str)
-            raise RuntimeError(f"Failed to load YAML config from `{config_path}`.") from exc
-
-    _raise_if_duplicate_keys(config_items)
-
-    merged_config = {}
-    for _, config in config_items:
-        merged_config.update(config)
+    raw_config = _load_yaml_mapping(config_path)
+    merged_config = _flatten_grouped_config(raw_config)
 
     _raise_if_missing_required_keys(merged_config)
     _validate_aggregation_methods(merged_config)
@@ -186,9 +161,7 @@ def load_args(
 
 
 __all__ = [
-    "DEFAULT_DATA_CFG_PATH",
-    "DEFAULT_TRAIN_CFG_PATH",
-    "DEFAULT_MODEL_CFG_PATH",
+    "DEFAULT_CONFIG_PATH",
     "add_config_path_arguments",
     "load_args",
 ]
