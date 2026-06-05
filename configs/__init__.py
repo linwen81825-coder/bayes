@@ -115,7 +115,7 @@ def _raise_if_missing_required_keys(merged_config: dict) -> None:
 
 def _validate_aggregation_methods(merged_config: dict) -> None:
     non_expert_methods = {"sample_weighted", "uniform"}
-    expert_methods = {"sample_weighted", "uniform", "uoc_foga_expert_align"}
+    expert_methods = {"sample_weighted", "uniform", "uoc_foga_expert_align", "uoc_foga_pism_expert_align"}
 
     non_expert_method = merged_config.get("non_expert_agg_method")
     if non_expert_method not in non_expert_methods:

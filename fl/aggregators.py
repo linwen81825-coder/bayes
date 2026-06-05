@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 import torch
 from torch import nn
 
+from fl.pism import ExpertPISM, build_pism_feature_tensor, normalize_pism_inputs
 from fl.uoc_foga import (
     build_stratified_query_for_expert,
     cosine_delta_to_negative_grad,
@@ -526,6 +527,483 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         )
 
 
+class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
+    # PISM 版 UOC-FOGA：用 DeepSets 元网络从 client/expert 特征生成专家聚合权重。
+    def __init__(self, args):
+        super(UOCFOGAPISMExpertAlignAggregator, self).__init__(
+            args=args,
+            non_expert_method=args.non_expert_agg_method,
+        )
+        self.meta_net = ExpertPISM(
+            input_dim=getattr(args, "uoc_foga_pism_input_dim", 3),
+            hidden_size=getattr(args, "uoc_foga_pism_hidden_size", 64),
+            dropout=getattr(args, "uoc_foga_pism_dropout", 0.0),
+        )
+        self.meta_optimizer = torch.optim.Adam(
+            self.meta_net.parameters(),
+            lr=getattr(args, "uoc_foga_pism_lr", 1e-3),
+        )
+
+    def _add_pism_metric_defaults(self, metric):
+        metric.update({
+            "pism_used": False,
+            "pism_meta_loss": None,
+            "pism_weight_max": None,
+            "pism_weight_entropy": None,
+            "pism_input_mean": None,
+            "pism_input_std": None,
+            "pism_fallback_reason": None,
+        })
+        return metric
+
+    def _get_indexed_value(self, value, index):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.dim() == 0 or index >= value.size(0):
+                return None
+            return float(value[index].detach().cpu().item())
+        if isinstance(value, (list, tuple)):
+            if index >= len(value):
+                return None
+            return float(value[index])
+        if isinstance(value, dict):
+            if index in value:
+                return float(value[index])
+            key = str(index)
+            if key in value:
+                return float(value[key])
+        return None
+
+    def _get_expert_usage_from_stats(self, client_stat, layer_id, expert_id):
+        if not isinstance(client_stat, dict):
+            return 0.0
+
+        expert_index = int(expert_id)
+        layer_key = str(layer_id)
+        activations_by_layer = client_stat.get("expert_activations_by_layer")
+        if isinstance(activations_by_layer, dict):
+            value = activations_by_layer.get(layer_key, activations_by_layer.get(int(layer_id), None))
+            indexed_value = self._get_indexed_value(value, expert_index)
+            if indexed_value is not None:
+                return indexed_value
+
+        stats_by_layer = client_stat.get("expert_stats_by_layer")
+        if isinstance(stats_by_layer, dict):
+            layer_stats = stats_by_layer.get(layer_key, stats_by_layer.get(int(layer_id), None))
+            if isinstance(layer_stats, dict):
+                indexed_value = self._get_indexed_value(
+                    layer_stats.get("expert_activations"),
+                    expert_index,
+                )
+                if indexed_value is not None:
+                    return indexed_value
+
+        indexed_value = self._get_indexed_value(
+            client_stat.get("expert_activations"),
+            expert_index,
+        )
+        if indexed_value is not None:
+            return indexed_value
+        return 0.0
+
+    def _get_client_loss_from_stats(self, client_stat):
+        if not isinstance(client_stat, dict):
+            return 0.0
+        return float(client_stat.get("client_loss", client_stat.get("train_loss", 0.0)))
+
+    def _normalize_client_stats(self, client_stats, client_count):
+        if client_stats is None:
+            return [{} for _ in range(client_count)]
+        if isinstance(client_stats, dict):
+            normalized = []
+            for client_idx in range(client_count):
+                normalized.append(
+                    client_stats.get(client_idx, client_stats.get(str(client_idx), {}))
+                )
+            return normalized
+        normalized = list(client_stats)
+        if len(normalized) < client_count:
+            normalized.extend({} for _ in range(client_count - len(normalized)))
+        return normalized[:client_count]
+
+    def _fallback_expert(self, aggregated_state, global_state, client_updates, expert_keys, metric, reason):
+        metric["fallback_reason"] = reason
+        metric["pism_fallback_reason"] = reason
+        self._apply_uniform_delta_for_expert(
+            aggregated_state,
+            global_state,
+            client_updates,
+            expert_keys,
+        )
+        return None
+
+    def _build_pism_record_for_expert(
+        self,
+        aggregated_state,
+        global_state,
+        client_updates,
+        client_stats,
+        expert_keys,
+        layer_id,
+        expert_id,
+        global_model,
+        uoc_evidences,
+        no_evidence_fallback_reason,
+        device,
+    ):
+        num_classes = self._get_num_classes()
+        metric = self._add_pism_metric_defaults(self._make_empty_expert_metric(None))
+
+        if no_evidence_fallback_reason is not None:
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                no_evidence_fallback_reason,
+            )
+
+        query = build_stratified_query_for_expert(
+            uoc_evidences,
+            layer_id=layer_id,
+            expert_id=expert_id,
+            num_classes=num_classes,
+            query_per_class=getattr(self.args, "uoc_foga_query_per_class", 4),
+            min_query_samples=getattr(
+                self.args,
+                "uoc_foga_min_query_samples_per_expert",
+                16,
+            ),
+            min_query_classes=getattr(self.args, "uoc_foga_min_classes_per_expert", 2),
+            use_top1=True,
+            seed=getattr(self.args, "seed", None),
+        )
+        metric["query_size"] = int(query.get("query_size", 0))
+        metric["query_num_classes"] = int(query.get("query_num_classes", 0))
+        metric["query_has_residual"] = bool(query.get("has_residual", False))
+
+        if query.get("fallback_reason") is not None:
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                query["fallback_reason"],
+            )
+
+        if global_model is None or not hasattr(global_model, "forward_uoc_from_hidden"):
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                "missing_global_model_forward_uoc_from_hidden",
+            )
+
+        _, grad_state, grad_fallback = self._build_expert_params_and_grads(
+            global_model=global_model,
+            expert_keys=expert_keys,
+            query=query,
+            layer_id=layer_id,
+            expert_id=expert_id,
+            device=device,
+        )
+        if grad_fallback is not None:
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                grad_fallback,
+            )
+
+        client_scores = {}
+        valid_client_ids = []
+        scores = []
+        client_losses = []
+        expert_usages = []
+        delta_norms = []
+        for client_idx, client_state in enumerate(client_updates):
+            delta_state = extract_expert_delta_state(
+                client_state,
+                global_state,
+                expert_keys,
+                device=device,
+            )
+            score = cosine_delta_to_negative_grad(
+                delta_state,
+                grad_state,
+                device=device,
+            )
+            client_scores[client_idx] = score
+            if score is None:
+                continue
+
+            valid_client_ids.append(client_idx)
+            scores.append(float(score))
+            client_stat = client_stats[client_idx] if client_idx < len(client_stats) else {}
+            client_losses.append(self._get_client_loss_from_stats(client_stat))
+            expert_usages.append(
+                self._get_expert_usage_from_stats(client_stat, layer_id, expert_id)
+            )
+            delta_norms.append(l2_norm_state(delta_state, device=device))
+
+        score_summary = summarize_scores(client_scores)
+        metric.update(score_summary)
+        valid_clients = int(score_summary["valid_score_count"])
+        metric["valid_clients"] = valid_clients
+        min_valid_clients = int(getattr(self.args, "uoc_foga_min_valid_clients", 2))
+        if valid_clients < min_valid_clients:
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                "too_few_valid_clients",
+            )
+
+        pism_min_clients = int(getattr(self.args, "uoc_foga_pism_min_clients", 2))
+        if valid_clients < pism_min_clients:
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                "too_few_pism_clients",
+            )
+
+        features = build_pism_feature_tensor(
+            client_loss=client_losses,
+            expert_usage=expert_usages,
+            delta_norm=delta_norms,
+            device=device,
+        )
+        if bool(getattr(self.args, "uoc_foga_pism_renorm_inputs", True)):
+            features = normalize_pism_inputs(features)
+        if not torch.isfinite(features).all():
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                "pism_weights_nan",
+            )
+
+        metric["pism_input_mean"] = [
+            float(value) for value in features.detach().mean(dim=0).cpu().tolist()
+        ]
+        metric["pism_input_std"] = [
+            float(value) for value in features.detach().std(dim=0, unbiased=False).cpu().tolist()
+        ]
+        scores_tensor = torch.tensor(scores, device=device, dtype=torch.float32).detach()
+        record = {
+            "layer_id": str(layer_id),
+            "expert_id": str(expert_id),
+            "expert_keys": expert_keys,
+            "valid_client_ids": valid_client_ids,
+            "features": features,
+            "scores": scores_tensor,
+            "metric": metric,
+        }
+        return metric, record
+
+    def _apply_pism_weights_for_record(
+        self,
+        aggregated_state,
+        global_state,
+        client_updates,
+        record,
+        meta_loss_value,
+        device,
+    ):
+        metric = record["metric"]
+        tau = float(getattr(self.args, "uoc_foga_pism_tau", 1.0))
+        with torch.no_grad():
+            weights_tensor = self.meta_net(record["features"], tau=tau)
+        if not torch.isfinite(weights_tensor).all():
+            self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                record["expert_keys"],
+                metric,
+                "pism_weights_nan",
+            )
+            return
+
+        weight_sum = weights_tensor.sum()
+        if not torch.isfinite(weight_sum) or weight_sum.item() <= 0:
+            self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                record["expert_keys"],
+                metric,
+                "pism_weights_nan",
+            )
+            return
+
+        weights_tensor = weights_tensor / weight_sum
+        weights = {
+            client_idx: float(weight.item())
+            for client_idx, weight in zip(record["valid_client_ids"], weights_tensor)
+        }
+        if not self._apply_weighted_delta_for_expert(
+            aggregated_state,
+            global_state,
+            client_updates,
+            record["expert_keys"],
+            weights,
+            device,
+        ):
+            self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                record["expert_keys"],
+                metric,
+                "missing_client_expert_key",
+            )
+            return
+
+        weight_entropy = expert_weight_entropy(weights)
+        weight_max = max(weights.values()) if weights else None
+        metric["weight_max"] = weight_max
+        metric["weight_entropy"] = weight_entropy
+        metric["pism_used"] = True
+        metric["pism_meta_loss"] = meta_loss_value
+        metric["pism_weight_max"] = weight_max
+        metric["pism_weight_entropy"] = weight_entropy
+        metric["pism_fallback_reason"] = None
+        metric["fallback_reason"] = None
+
+    def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
+        if len(client_updates) == 0:
+            raise ValueError("UOCFOGAPISMExpertAlignAggregator requires at least one client update")
+        if len(client_updates) != len(client_weights):
+            raise ValueError("client_updates and client_weights must have the same length")
+
+        self._build_key_cache(client_updates[0].keys())
+        global_state = self._get_global_state(client_updates, global_model)
+        aggregated_state = {}
+        self._aggregate_non_expert_keys(aggregated_state, client_updates, client_weights)
+
+        uoc_evidences = self._resolve_uoc_evidences(kwargs)
+        no_evidence_fallback_reason = None
+        if not uoc_evidences:
+            no_evidence_fallback_reason = "no_uoc_evidence_passed_to_aggregator"
+
+        client_stats = self._normalize_client_stats(kwargs.get("client_stats"), len(client_updates))
+        device = self._get_model_device(global_model)
+        self.meta_net.to(device)
+
+        uoc_foga_stats = {}
+        per_expert_records = []
+        for (layer_id, expert_id), expert_keys in sorted(
+            self._expert_key_cache.items(),
+            key=lambda item: (int(item[0][0]), int(item[0][1])),
+        ):
+            layer_stats = uoc_foga_stats.setdefault(str(layer_id), {})
+            metric, record = self._build_pism_record_for_expert(
+                aggregated_state=aggregated_state,
+                global_state=global_state,
+                client_updates=client_updates,
+                client_stats=client_stats,
+                expert_keys=expert_keys,
+                layer_id=str(layer_id),
+                expert_id=str(expert_id),
+                global_model=global_model,
+                uoc_evidences=uoc_evidences,
+                no_evidence_fallback_reason=no_evidence_fallback_reason,
+                device=device,
+            )
+            layer_stats[str(expert_id)] = metric
+            if record is not None:
+                per_expert_records.append(record)
+
+        meta_loss_value = None
+        meta_loss_failed = False
+        if per_expert_records:
+            tau = float(getattr(self.args, "uoc_foga_pism_tau", 1.0))
+            meta_losses = []
+            for record in per_expert_records:
+                weights = self.meta_net(record["features"], tau=tau)
+                meta_losses.append(-(weights * record["scores"]).sum())
+            meta_loss = torch.stack(meta_losses).mean()
+            if not torch.isfinite(meta_loss):
+                meta_loss_failed = True
+                meta_loss_value = None
+            else:
+                self.meta_optimizer.zero_grad()
+                meta_loss.backward()
+                self.meta_optimizer.step()
+                meta_loss_value = float(meta_loss.detach().cpu().item())
+        else:
+            meta_loss_failed = True
+
+        if meta_loss_failed:
+            for record in per_expert_records:
+                self._fallback_expert(
+                    aggregated_state,
+                    global_state,
+                    client_updates,
+                    record["expert_keys"],
+                    record["metric"],
+                    "pism_meta_loss_nan" if per_expert_records else "pism_no_valid_records",
+                )
+        else:
+            for record in per_expert_records:
+                self._apply_pism_weights_for_record(
+                    aggregated_state,
+                    global_state,
+                    client_updates,
+                    record,
+                    meta_loss_value,
+                    device,
+                )
+
+        pism_meta_losses = [
+            expert_metric.get("pism_meta_loss")
+            for layer_stats in uoc_foga_stats.values()
+            for expert_metric in layer_stats.values()
+            if expert_metric.get("pism_meta_loss") is not None
+        ]
+        updated_experts = sum(
+            1
+            for layer_stats in uoc_foga_stats.values()
+            for expert_metric in layer_stats.values()
+            if expert_metric.get("pism_used")
+        )
+        fallback_experts = sum(
+            1
+            for layer_stats in uoc_foga_stats.values()
+            for expert_metric in layer_stats.values()
+            if expert_metric.get("fallback_reason") is not None
+        )
+        self.last_aggregation_metrics = {
+            "uoc_foga_stats": uoc_foga_stats,
+            "uoc_foga_pism_meta_loss_mean": (
+                sum(pism_meta_losses) / len(pism_meta_losses)
+                if pism_meta_losses
+                else None
+            ),
+            "uoc_foga_pism_updated_experts": updated_experts,
+            "uoc_foga_pism_fallback_experts": fallback_experts,
+        }
+        return collections.OrderedDict(
+            (key, aggregated_state[key])
+            for key in client_updates[0].keys()
+        )
+
+
 def build_aggregator(args):
     expert_method = getattr(args, "expert_agg_method", "sample_weighted")
     if expert_method == "uoc_foga_expert_align":
@@ -533,6 +1011,8 @@ def build_aggregator(args):
             args=args,
             non_expert_method=args.non_expert_agg_method,
         )
+    if expert_method == "uoc_foga_pism_expert_align":
+        return UOCFOGAPISMExpertAlignAggregator(args=args)
 
     return SplitParameterAggregator(
         non_expert_method=args.non_expert_agg_method,

@@ -78,6 +78,27 @@ uoc_foga:
   # 最少有效客户端数：正整数
   uoc_foga_min_valid_clients: 1
 
+  # PISM 输入维度：当前固定为 3
+  uoc_foga_pism_input_dim: 3
+
+  # PISM 隐层宽度：正整数
+  uoc_foga_pism_hidden_size: 64
+
+  # PISM dropout：0.0 - 1.0
+  uoc_foga_pism_dropout: 0.0
+
+  # PISM 学习率：正数
+  uoc_foga_pism_lr: 0.001
+
+  # PISM softmax 温度：正数
+  uoc_foga_pism_tau: 1.0
+
+  # 是否标准化 PISM 输入：true / false
+  uoc_foga_pism_renorm_inputs: true
+
+  # PISM 最少有效客户端数：正整数
+  uoc_foga_pism_min_clients: 1
+
 
 # ============================================================
 # 数据集与数据划分配置
