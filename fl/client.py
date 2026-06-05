@@ -67,15 +67,6 @@ class Client:
             meta=self.partition_meta,
         )
 
-
-    def renew_model(self):
-        # 每一轮本地训练前，客户端同步服务端 state_dict。
-        server_state_dict = torch.load(
-            self.args.model_save_path + f"/server.pth",
-            map_location="cpu",
-        )
-        self.model.load_state_dict(server_state_dict)
-
     def get_auxiliary_losses(self, result):
         zero = torch.tensor(0.0, device=self.device)
         router_aux_loss = result.get("router_aux_loss", result.get("aux_loss", zero))

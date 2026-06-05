@@ -24,13 +24,29 @@ def resolve_device(device: str) -> str:
     if device == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
 
-    if device.startswith("cuda"):
-        if torch.cuda.is_available():
-            return device
-        return "cpu"
-
     if device == "cpu":
         return "cpu"
+
+    if device == "cuda":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            return "cpu"
+
+        index_text = device.split(":", 1)[1]
+        try:
+            index = int(index_text)
+        except ValueError as exc:
+            raise ValueError(f"Unsupported CUDA device index: {index_text!r}") from exc
+
+        device_count = torch.cuda.device_count()
+        if index < 0 or index >= device_count:
+            raise ValueError(
+                f"CUDA device index {index} is unavailable; "
+                f"current available GPU count is {device_count}."
+            )
+        return device
 
     raise ValueError(f"Unsupported device: {device!r}")
 

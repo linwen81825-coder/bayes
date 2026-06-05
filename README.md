@@ -203,9 +203,11 @@ CSV 和日志文件名都会包含：
 
 项目里模型文件有两种格式：
 
-- `server.pth` / `save/model/{client_id}.pth`
-  - 纯模型参数，直接保存 `state_dict`
-  - 默认 `runtime.in_memory_client_updates=true` 时，不依赖客户端 pth 聚合；仅当设为 `false` 时，每个客户端会写出 `{client_id}.pth`
+- `server.pth`
+  - 服务端当前模型的纯 `state_dict`
+- `save/model/{client_id}.pth`
+  - 默认 `runtime.in_memory_client_updates=true` 时，不依赖每个客户端的 `{client_id}.pth` 做聚合
+  - 只有 `runtime.in_memory_client_updates=false` 的 pth fallback 模式下，才会写出 `save/model/{client_id}.pth`
 - `best_server.pth`
   - checkpoint dict，至少包含：
     - `model_state_dict`
