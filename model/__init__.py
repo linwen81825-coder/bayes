@@ -45,6 +45,7 @@ def build_model_from_args(args):
         min_capacity=args.min_capacity,
         drop_tokens=args.drop_tokens,
         top_k=args.top_k,
+        backbone_type=getattr(args, "backbone_type", "cnn_stem"),
         stem_channels=args.stem_channels,
         token_grid_size=args.token_grid_size,
         use_cls_token=args.use_cls_token,

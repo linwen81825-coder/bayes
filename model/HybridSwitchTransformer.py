@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torchvision.models import resnet18
 
 
 def make_group_norm(num_channels, max_groups=8):
@@ -11,6 +12,30 @@ def make_group_norm(num_channels, max_groups=8):
         if num_channels % num_groups == 0:
             return nn.GroupNorm(num_groups=num_groups, num_channels=num_channels)
     return nn.GroupNorm(num_groups=1, num_channels=num_channels)
+
+
+class ResNet18CIFARBackbone(nn.Module):
+    def __init__(self):
+        super(ResNet18CIFARBackbone, self).__init__()
+        backbone = resnet18(weights=None)
+        backbone.conv1 = nn.Conv2d(
+            3, 64, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        backbone.maxpool = nn.Identity()
+        self.features = nn.Sequential(
+            backbone.conv1,
+            backbone.bn1,
+            backbone.relu,
+            backbone.maxpool,
+            backbone.layer1,
+            backbone.layer2,
+            backbone.layer3,
+            backbone.layer4,
+        )
+        self.out_channels = 512
+
+    def forward(self, x):
+        return self.features(x)
 
 
 class DenseFFN(nn.Module):
@@ -242,6 +267,7 @@ class HybridSwitchTransformer(nn.Module):
         min_capacity=4,
         drop_tokens=True,
         top_k=1,
+        backbone_type="cnn_stem",
         stem_channels=64,
         token_grid_size=8,
         use_cls_token=False,
@@ -260,17 +286,26 @@ class HybridSwitchTransformer(nn.Module):
         self.use_cls_token = use_cls_token
         self.router_aux_loss_coef = router_aux_loss_coef
         self.router_z_loss_coef = router_z_loss_coef
+        self.backbone_type = backbone_type
 
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, stem_channels, kernel_size=3, stride=1, padding=1),
-            make_group_norm(stem_channels),
-            nn.GELU(),
-            nn.Conv2d(stem_channels, stem_channels, kernel_size=3, stride=2, padding=1),
-            make_group_norm(stem_channels),
-            nn.GELU(),
-        )
+        if backbone_type == "cnn_stem":
+            self.stem = nn.Sequential(
+                nn.Conv2d(3, stem_channels, kernel_size=3, stride=1, padding=1),
+                make_group_norm(stem_channels),
+                nn.GELU(),
+                nn.Conv2d(stem_channels, stem_channels, kernel_size=3, stride=2, padding=1),
+                make_group_norm(stem_channels),
+                nn.GELU(),
+            )
+            backbone_out_channels = stem_channels
+        elif backbone_type == "resnet18":
+            self.stem = ResNet18CIFARBackbone()
+            backbone_out_channels = self.stem.out_channels
+        else:
+            raise ValueError("backbone_type must be one of: cnn_stem, resnet18")
+
         self.token_pool = nn.AdaptiveAvgPool2d((token_grid_size, token_grid_size))
-        self.token_projection = nn.Conv2d(stem_channels, embed_dim, kernel_size=1)
+        self.token_projection = nn.Conv2d(backbone_out_channels, embed_dim, kernel_size=1)
         num_position_tokens = token_grid_size * token_grid_size + (1 if use_cls_token else 0)
         self.position_embedding = nn.Parameter(
             torch.zeros(1, num_position_tokens, embed_dim)

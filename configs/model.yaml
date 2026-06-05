@@ -1,4 +1,5 @@
 model_type: hybrid_switch_transformer
+backbone_type: cnn_stem
 num_experts: 8
 dropout: 0.2
 learning_rate: 0.0005

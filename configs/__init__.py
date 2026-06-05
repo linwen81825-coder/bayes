@@ -32,6 +32,7 @@ _REQUIRED_CONFIG_KEYS = (
     "save_root",
     "agg_method",
     "model_type",
+    "backbone_type",
     "num_experts",
     "dropout",
     "learning_rate",

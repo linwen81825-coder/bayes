@@ -30,6 +30,7 @@ conda activate fedwolf
   - 联邦训练轮数、设备、结果输出路径等
 - `configs/model.yaml`
   - 模型结构和优化器超参数等
+  - `backbone_type` 控制图像 backbone：`cnn_stem` 为原始轻量 CNN stem，`resnet18` 为 CIFAR 版 ResNet18 backbone，后面仍接当前 Switch Transformer / MoE experts
 
 项目入口会调用 `configs/__init__.py` 中的 `load_args()`，将三份 YAML 合并成一个扁平的 `args` 对象，因此项目内部仍然继续使用 `args.xxx` 访问配置。
 
