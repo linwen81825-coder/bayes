@@ -23,7 +23,6 @@ class Client:
         self.args = args
         self.client_id = client_id
         self.model_path = self.args.model_save_path + f"/{self.client_id}.pth"
-        self.loaded_from_initial_state = initial_state_dict is not None
         self.save_model_to_disk = save_model_to_disk
         # 内存模式下直接加载服务端传入的 state_dict，旧模式下仍从 pth 读取。
         self.model = self.load_client_model(initial_state_dict=initial_state_dict)
@@ -129,9 +128,6 @@ class Client:
 
     def train(self):
         # 本地训练保持普通监督学习；不同模型通过 forward 返回的 aux loss / stats 接入路由约束和日志。
-        if not self.loaded_from_initial_state:
-            self.renew_model()
-
         non_blocking = (
             str(self.device).startswith("cuda")
             and bool(getattr(self.args, "pin_memory", False))
@@ -224,15 +220,19 @@ class Client:
             }
             for layer_id, stats in local_layer_usage_total.items()
         }
-        return {
+        result = {
             "expert_activations": local_usage_total.detach().cpu(),
             "expert_stats_by_layer": layer_stats_cpu,
             "expert_activations_by_layer": {
                 layer_id: stats["expert_activations"]
                 for layer_id, stats in layer_stats_cpu.items()
             },
-            "model_state_dict": {
+        }
+
+        if not self.save_model_to_disk:
+            result["model_state_dict"] = {
                 key: value.detach().cpu().clone()
                 for key, value in self.model.state_dict().items()
-            },
-        }
+            }
+
+        return result

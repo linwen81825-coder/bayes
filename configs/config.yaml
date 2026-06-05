@@ -3,7 +3,7 @@
 # ============================================================
 federated:
   # 客户端数量
-  num_clients: 20
+  num_clients: 10
 
   # 服务端通信轮数
   server_epochs: 50
@@ -26,13 +26,29 @@ aggregation:
   expert_agg_method: sample_weighted
 
 
+# ============================================================
+# 输出与断点续训配置
+# ============================================================
+runtime:
+  # 实验总输出目录；data/result/model 三个目录会由它自动派生
+  save_root: ./save/default_exp
+
+  # 是否从 checkpoint 断点续训
+  resume: false
+
+  # 续训 checkpoint：latest 表示读取 save_root/model/checkpoints/latest.pth，也可以写具体路径
+  resume_checkpoint: latest
+
+  # 是否使用内存传递客户端模型更新，避免每轮客户端模型写 pth 后再由服务端读取
+  in_memory_client_updates: true
+
 
 # ============================================================
 # 数据集与数据划分配置
 # ============================================================
 data:
   # 数据集名称：支持 cifar10 / cifar100
-  data_name: cifar100
+  data_name: cifar10
 
   # 原始 CIFAR 数据保存目录
   data_path: ./data
@@ -60,24 +76,6 @@ data:
 
   # GPU 训练时建议开启 pin_memory，加快 CPU 到 GPU 的数据拷贝
   pin_memory: true
-
-
-
-# ============================================================
-# 输出与断点续训配置
-# ============================================================
-runtime:
-  # 实验总输出目录；data/result/model 三个目录会由它自动派生
-  save_root: ./save/default_exp
-
-  # 是否从 checkpoint 断点续训
-  resume: false
-
-  # 续训 checkpoint：latest 表示读取 save_root/model/checkpoints/latest.pth，也可以写具体路径
-  resume_checkpoint: latest
-
-  # 是否使用内存传递客户端模型更新，避免每轮客户端模型写 pth 后再由服务端读取
-  in_memory_client_updates: true
 
 
 

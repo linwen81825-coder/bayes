@@ -263,6 +263,10 @@ class Server:
                     progress_bar.refresh()
 
                     if use_in_memory_updates:
+                        if "model_state_dict" not in client_stats:
+                            raise KeyError(
+                                "in_memory_client_updates=True requires Client.train() to return model_state_dict"
+                            )
                         client_states.append(client_stats.pop("model_state_dict"))
 
                     client_expert_usage = client_stats["expert_activations"].float().cpu()
@@ -318,7 +322,6 @@ class Server:
                 self.save_server_model()
                 round_completed = c_T + 1
                 self.save_training_checkpoint(round_completed)
-                torch.cuda.empty_cache()
         finally:
             progress_bar.close()
 

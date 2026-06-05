@@ -33,7 +33,7 @@ def get_cifar_stats(data_name):
 
 
 def build_transforms(data_name):
-    """Use augmentation for client training and deterministic transforms for eval."""
+    """Use augmentation for client training and plain transforms for eval."""
 
     _, mean, std, _ = get_cifar_stats(data_name)
     train_transform = transforms.Compose([

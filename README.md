@@ -132,7 +132,6 @@ python train.py
 - `data.num_workers=2`、`pin_memory=true` 可提升 GPU 训练时数据加载和拷贝效率
 - `runtime.in_memory_client_updates=true` 会让客户端模型更新通过内存传递，避免每轮写 client pth 再读取；聚合结果不变
 - 如果需要调试旧 pth 流程，可以设置 `runtime.in_memory_client_updates=false`
-- 本次没有启用 AMP、TF32、cuDNN benchmark 等额外策略
 
 ## 数据协议
 
@@ -206,6 +205,7 @@ CSV 和日志文件名都会包含：
 
 - `server.pth` / `save/model/{client_id}.pth`
   - 纯模型参数，直接保存 `state_dict`
+  - 默认 `runtime.in_memory_client_updates=true` 时，不依赖客户端 pth 聚合；仅当设为 `false` 时，每个客户端会写出 `{client_id}.pth`
 - `best_server.pth`
   - checkpoint dict，至少包含：
     - `model_state_dict`
