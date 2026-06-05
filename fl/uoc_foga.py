@@ -296,6 +296,10 @@ def build_stratified_query_for_expert(
 
     has_residual = query_residual is not None
     if fallback_reason is not None:
+        # fallback 后清空 query tensor，防止后续误用不可靠的 D_query。
+        query_hidden = None
+        query_labels = None
+        query_gates = None
         query_residual = None
         has_residual = False
 
