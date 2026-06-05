@@ -31,6 +31,7 @@ _REQUIRED_CONFIG_KEYS = (
     "expert_agg_method",
     "resume",
     "resume_checkpoint",
+    "in_memory_client_updates",
     "model_type",
     "backbone_type",
     "num_experts",
@@ -122,6 +123,15 @@ def _validate_aggregation_methods(merged_config: dict) -> None:
             )
 
 
+def _validate_device_config(merged_config: dict) -> None:
+    device = str(merged_config["device"]).strip().lower()
+    is_cuda_device = device == "cuda" or (
+        device.startswith("cuda:") and device.removeprefix("cuda:").isdigit()
+    )
+    if device not in {"auto", "cpu"} and not is_cuda_device:
+        raise ValueError("device must be one of: auto, cpu, cuda, cuda:<index>")
+
+
 def _validate_checkpoint_config(merged_config: dict) -> None:
     resume = merged_config["resume"]
     if not isinstance(resume, bool):
@@ -130,6 +140,11 @@ def _validate_checkpoint_config(merged_config: dict) -> None:
     resume_checkpoint = merged_config["resume_checkpoint"]
     if not isinstance(resume_checkpoint, str) or not resume_checkpoint:
         raise ValueError("resume_checkpoint must be a non-empty string")
+
+
+def _validate_runtime_config(merged_config: dict) -> None:
+    if not isinstance(merged_config["in_memory_client_updates"], bool):
+        raise ValueError("in_memory_client_updates must be a boolean")
 
 
 def _derive_save_paths(merged_config: dict) -> None:
@@ -154,7 +169,9 @@ def load_args(config_path: str = DEFAULT_CONFIG_PATH):
 
     _raise_if_missing_required_keys(merged_config)
     _validate_aggregation_methods(merged_config)
+    _validate_device_config(merged_config)
     _validate_checkpoint_config(merged_config)
+    _validate_runtime_config(merged_config)
     _derive_save_paths(merged_config)
 
     return SimpleNamespace(**merged_config)

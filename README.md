@@ -126,6 +126,14 @@ python train.py
 - resume=true 时，进度条会从已完成 round 对应的位置继续
 - 详细训练日志仍然写入 save_root/result/ 下的日志文件，进度条不会写入日志文件
 
+最小提速相关默认项：
+- `federated.device` 支持 `auto` / `cuda` / `cuda:0` / `cpu`
+- `device: auto` 表示有 GPU 就用 GPU，没有 GPU 自动使用 CPU
+- `data.num_workers=2`、`pin_memory=true` 可提升 GPU 训练时数据加载和拷贝效率
+- `runtime.in_memory_client_updates=true` 会让客户端模型更新通过内存传递，避免每轮写 client pth 再读取；聚合结果不变
+- 如果需要调试旧 pth 流程，可以设置 `runtime.in_memory_client_updates=false`
+- 本次没有启用 AMP、TF32、cuDNN benchmark 等额外策略
+
 ## 数据协议
 
 当前项目使用的是 index-based partition 协议：

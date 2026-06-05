@@ -11,8 +11,8 @@ federated:
   # 每轮每个客户端本地训练 epoch 数
   client_epochs: 1
 
-  # 训练设备：cuda / cpu
-  device: cuda
+  # 训练设备：auto / cuda / cuda:0 / cpu；auto 表示有 GPU 就用 GPU，否则用 CPU
+  device: auto
 
 
 # ============================================================
@@ -55,11 +55,11 @@ data:
   # 数据划分类别统计文件名
   partition_stats_name: partition_stats.json
 
-  # DataLoader worker 数量
-  num_workers: 0
+  # DataLoader worker 数量；GPU 训练建议大于 0
+  num_workers: 2
 
-  # 是否启用 DataLoader pin_memory
-  pin_memory: false
+  # GPU 训练时建议开启 pin_memory，加快 CPU 到 GPU 的数据拷贝
+  pin_memory: true
 
 
 
@@ -75,6 +75,9 @@ runtime:
 
   # 续训 checkpoint：latest 表示读取 save_root/model/checkpoints/latest.pth，也可以写具体路径
   resume_checkpoint: latest
+
+  # 是否使用内存传递客户端模型更新，避免每轮客户端模型写 pth 后再由服务端读取
+  in_memory_client_updates: true
 
 
 

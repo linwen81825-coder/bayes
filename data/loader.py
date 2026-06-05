@@ -49,6 +49,11 @@ def build_transforms(data_name):
     return train_transform, eval_transform
 
 
+def _use_pin_memory(args) -> bool:
+    """仅在 CUDA 训练时启用 pin_memory。"""
+    return bool(getattr(args, "pin_memory", False)) and str(args.device).startswith("cuda")
+
+
 def load_partition_meta(args):
     meta_path = os.path.join(args.data_save_path, args.partition_meta_name)
     if not os.path.exists(meta_path):
@@ -239,7 +244,7 @@ def build_client_train_loader(args, client_id, meta=None):
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
+        pin_memory=_use_pin_memory(args),
     )
 
 
@@ -253,7 +258,7 @@ def build_global_eval_loader(args, split, meta=None):
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
+        pin_memory=_use_pin_memory(args),
     )
 
 

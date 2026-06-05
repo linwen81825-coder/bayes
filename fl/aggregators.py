@@ -43,6 +43,9 @@ class SplitParameterAggregator(Aggregator):
         if len(client_updates) != len(client_weights):
             raise ValueError("client_updates and client_weights must have the same length")
 
+        non_expert_weights = build_client_weights(self.non_expert_method, client_weights)
+        expert_weights = build_client_weights(self.expert_method, client_weights)
+
         aggregated_state = collections.OrderedDict()
         for key in client_updates[0].keys():
             first_value = client_updates[0][key].detach().cpu()
@@ -52,11 +55,10 @@ class SplitParameterAggregator(Aggregator):
                 continue
 
             if is_expert_parameter(key):
-                method = self.expert_method
+                normalized_weights = expert_weights
             else:
-                method = self.non_expert_method
+                normalized_weights = non_expert_weights
 
-            normalized_weights = build_client_weights(method, client_weights)
             aggregated_state[key] = torch.zeros_like(first_value)
             for update, weight in zip(client_updates, normalized_weights):
                 aggregated_state[key] += update[key].detach().cpu() * weight

@@ -19,6 +19,24 @@ def set_seed(seed:int):
     torch.backends.cudnn.deterministic = True
 
 
+def resolve_device(device: str) -> str:
+    """解析训练设备。auto 表示优先使用 GPU，没有 GPU 时回退 CPU。"""
+    device = str(device).strip().lower()
+
+    if device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    if device.startswith("cuda"):
+        if torch.cuda.is_available():
+            return device
+        return "cpu"
+
+    if device == "cpu":
+        return "cpu"
+
+    raise ValueError(f"Unsupported device: {device!r}")
+
+
 def capture_rng_state():
     """保存当前随机数状态，用于断点续训后尽量保持实验连续性。"""
     return {

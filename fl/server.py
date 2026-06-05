@@ -68,7 +68,8 @@ class Server:
         self.best_state_dict = None
         self.start_round = 0
         self.save_server_model()
-        self.sync_clients_model()
+        if not bool(getattr(self.args, "in_memory_client_updates", True)):
+            self.sync_clients_model()
 
     def init_resume_training_state(self):
         """断点续训：从 checkpoint 恢复服务端模型和训练状态。"""
@@ -87,7 +88,8 @@ class Server:
         restore_rng_state(checkpoint.get("rng_state"))
 
         self.save_server_model()
-        self.sync_clients_model()
+        if not bool(getattr(self.args, "in_memory_client_updates", True)):
+            self.sync_clients_model()
 
         self.logger.info(f"[Resume] Loaded checkpoint from {checkpoint_path}")
         self.logger.info(
@@ -191,13 +193,17 @@ class Server:
         # 保存当前服务端模型参数到 server.pth。
         torch.save(self.model.state_dict(), self.model_path)
 
-    def sync_clients_model(self):
-        server_state_dict = {
+    def get_cpu_state_dict(self):
+        """获取当前服务端模型的 CPU state_dict，用于分发给客户端。"""
+        return {
             key: value.detach().cpu().clone()
             for key, value in self.model.state_dict().items()
         }
+
+    def sync_clients_model(self):
+        server_state_dict = self.get_cpu_state_dict()
         for id in self.clientsID_list:
-            # 初始化时所有客户端文件都保存同一个服务端 state_dict。
+            # pth fallback 模式下，客户端文件保存同一个服务端 state_dict。
             model_path = os.path.join(self.args.model_save_path, f"{id}.pth")
             torch.save(server_state_dict, model_path)
 
@@ -227,9 +233,18 @@ class Server:
             # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
             for c_T in range(self.start_round, self.server_epochs):
                 self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
+                use_in_memory_updates = bool(getattr(self.args, "in_memory_client_updates", True))
+                if use_in_memory_updates:
+                    server_state_dict = self.get_cpu_state_dict()
+                else:
+                    server_state_dict = None
+                    self.save_server_model()
+                    self.sync_clients_model()
+
                 round_expert_usage_summary = torch.zeros(self.args.num_experts)
                 round_layer_stats = {}
                 round_client_expert_usages = []
+                client_states = []
                 for id in self.clientsID_list:
                     # 每个客户端执行本地训练，并返回本轮信息。
                     client_stats = Client(
@@ -238,12 +253,17 @@ class Server:
                         logger=self.logger,
                         c_T=c_T,
                         partition_meta=self.partition_meta,
+                        initial_state_dict=server_state_dict if use_in_memory_updates else None,
+                        save_model_to_disk=not use_in_memory_updates,
                     ).train()
                     progress_bar.update(1)
                     progress_bar.set_postfix_str(
                         f"round={c_T + 1}/{self.server_epochs}, client={id}"
                     )
                     progress_bar.refresh()
+
+                    if use_in_memory_updates:
+                        client_states.append(client_stats.pop("model_state_dict"))
 
                     client_expert_usage = client_stats["expert_activations"].float().cpu()
                     round_client_expert_usages.append(client_stats)
@@ -276,7 +296,7 @@ class Server:
                 self.logger.info(f"--client_expert_usage_summary : {client_usage_list}\n")
                 self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
                 # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
-                self.aggregation()
+                self.aggregation(client_states=client_states if use_in_memory_updates else None)
 
                 test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
                 self.logger.info(f"--server_global_test_loss : {test_loss:.4f} --server_global_test_acc : {test_acc:.4f}\n")
@@ -313,10 +333,15 @@ class Server:
         self.model.eval()
         running_loss = 0.0
         running_corrects = 0
+        non_blocking = (
+            str(self.device).startswith("cuda")
+            and bool(getattr(self.args, "pin_memory", False))
+        )
 
         with torch.no_grad():
             for inputs, labels in data_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                inputs = inputs.to(self.device, non_blocking=non_blocking)
+                labels = labels.to(self.device, non_blocking=non_blocking)
                 result = self.model(inputs)
                 outputs = result["logits"]
                 loss = self.criterion(outputs, labels)
@@ -367,19 +392,25 @@ class Server:
         # sample_weighted 聚合会使用客户端训练样本数作为权重来源。
         return get_client_train_size(self.args, client_id, meta=self.partition_meta)
 
-    def aggregation_by_method(self):
+    def aggregation_by_method(self, client_states=None):
         # 聚合器接口：
         # - 非专家参数使用 non_expert_agg_method；
         # - 专家参数使用 expert_agg_method。
-        client_states = []
         client_sizes = []
-        for id in self.clientsID_list:
-            client_state_dict = torch.load(
-                os.path.join(self.args.model_save_path, f"{id}.pth"),
-                map_location="cpu",
-            )
-            client_states.append(client_state_dict)
-            client_sizes.append(self.get_client_train_size(id))
+
+        if client_states is None:
+            loaded_client_states = []
+            for id in self.clientsID_list:
+                client_state_dict = torch.load(
+                    os.path.join(self.args.model_save_path, f"{id}.pth"),
+                    map_location="cpu",
+                )
+                loaded_client_states.append(client_state_dict)
+                client_sizes.append(self.get_client_train_size(id))
+            client_states = loaded_client_states
+        else:
+            for id in self.clientsID_list:
+                client_sizes.append(self.get_client_train_size(id))
 
         aggregated_state = self.aggregator.aggregate(
             client_updates=client_states,
@@ -393,5 +424,5 @@ class Server:
         )
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
 
-    def aggregation(self):
-        self.aggregation_by_method()
+    def aggregation(self, client_states=None):
+        self.aggregation_by_method(client_states=client_states)

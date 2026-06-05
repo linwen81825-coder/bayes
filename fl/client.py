@@ -10,11 +10,23 @@ from utils.utils import record_result
 class Client:
     # Client 表示联邦学习里的一个客户端。
     # 每个客户端有自己的数据和模型，服务端每一轮会让多个客户端分别训练。
-    def __init__(self, args: SimpleNamespace, client_id: int, logger, c_T: int, partition_meta=None):
+    def __init__(
+        self,
+        args: SimpleNamespace,
+        client_id: int,
+        logger,
+        c_T: int,
+        partition_meta=None,
+        initial_state_dict=None,
+        save_model_to_disk=True,
+    ):
         self.args = args
         self.client_id = client_id
-        # 从 save/model/{client_id}.pth 加载这个客户端自己的模型。
-        self.model = self.load_client_model()
+        self.model_path = self.args.model_save_path + f"/{self.client_id}.pth"
+        self.loaded_from_initial_state = initial_state_dict is not None
+        self.save_model_to_disk = save_model_to_disk
+        # 内存模式下直接加载服务端传入的 state_dict，旧模式下仍从 pth 读取。
+        self.model = self.load_client_model(initial_state_dict=initial_state_dict)
         self.device = self.args.device
         self.model.to(self.device)
         # c_T 表示当前是第几轮服务端通信轮次，主要用于记录日志。
@@ -34,10 +46,12 @@ class Client:
         self.router_aux_loss_coef = self.args.router_aux_loss_coef
         self.router_z_loss_coef = self.args.router_z_loss_coef
 
-    def load_client_model(self):
-        # 客户端模型路径，例如 ./save/model/1.pth。
-        self.model_path = self.args.model_save_path + f"/{self.client_id}.pth"
+    def load_client_model(self, initial_state_dict=None):
         model = build_model_from_args(self.args)
+        if initial_state_dict is not None:
+            model.load_state_dict(initial_state_dict)
+            return model
+
         state_dict = torch.load(self.model_path, map_location="cpu")
         model.load_state_dict(state_dict)
         return model
@@ -115,8 +129,13 @@ class Client:
 
     def train(self):
         # 本地训练保持普通监督学习；不同模型通过 forward 返回的 aux loss / stats 接入路由约束和日志。
-        self.renew_model()
+        if not self.loaded_from_initial_state:
+            self.renew_model()
 
+        non_blocking = (
+            str(self.device).startswith("cuda")
+            and bool(getattr(self.args, "pin_memory", False))
+        )
         last_avg_router_probs = torch.zeros(self.args.num_experts, device=self.device)
         local_usage_total = torch.zeros(self.args.num_experts, device=self.device)
         local_layer_usage_total = {}
@@ -133,7 +152,8 @@ class Client:
             router_prob_sum = torch.zeros(self.args.num_experts, device=self.device)
 
             for inputs, labels in self.train_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                inputs = inputs.to(self.device, non_blocking=non_blocking)
+                labels = labels.to(self.device, non_blocking=non_blocking)
                 self.optimizer.zero_grad()
 
                 result = self.model(inputs)
@@ -195,7 +215,8 @@ class Client:
             }
             record_result(record_dic=record_dic, args=self.args)
 
-        self.save_client_model()
+        if self.save_model_to_disk:
+            self.save_client_model()
         layer_stats_cpu = {
             layer_id: {
                 stat_key: (value.detach().cpu() if torch.is_tensor(value) else value)
@@ -209,5 +230,9 @@ class Client:
             "expert_activations_by_layer": {
                 layer_id: stats["expert_activations"]
                 for layer_id, stats in layer_stats_cpu.items()
+            },
+            "model_state_dict": {
+                key: value.detach().cpu().clone()
+                for key, value in self.model.state_dict().items()
             },
         }

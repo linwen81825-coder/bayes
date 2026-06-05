@@ -6,7 +6,7 @@ import warnings
 from configs import add_config_path_arguments, load_args
 from data.data import CIFARPartitionBuilder
 from fl.server import Server
-from utils.utils import get_experiment_stem, set_seed
+from utils.utils import get_experiment_stem, resolve_device, set_seed
 
 warnings.filterwarnings("ignore")
 
@@ -49,8 +49,10 @@ def main():
 
     # Read experiment settings from the YAML config file under `configs/`.
     args = load_args(config_path=cli_args.config)
+    args.device = resolve_device(args.device)
     set_seed(args.seed)
     logger = build_logger(args)
+    logger.info(f"[Runtime] device={args.device}")
 
     if args.resume:
         logger.info("[Resume] Enabled. Skip rebuilding data partition and use existing partition files.")
