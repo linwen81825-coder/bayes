@@ -114,6 +114,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         self._expert_key_cache = None
         self._non_expert_keys = None
         self._cached_key_signature = None
+        self.uoc_criterion = nn.CrossEntropyLoss()
 
     def _get_num_classes(self):
         num_classes = getattr(self.args, "num_classes", None)
@@ -301,8 +302,10 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         layer_id,
         expert_id,
         device,
+        named_parameters=None,
     ):
-        named_parameters = dict(global_model.named_parameters())
+        if named_parameters is None:
+            named_parameters = dict(global_model.named_parameters())
         param_keys = [
             key
             for key in expert_keys
@@ -325,7 +328,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             force_expert_id=expert_id,
             gate_mode=getattr(self.args, "uoc_foga_gate_mode", "one"),
         )
-        loss = nn.CrossEntropyLoss()(output["logits"], labels)
+        loss = self.uoc_criterion(output["logits"], labels)
         grads = torch.autograd.grad(
             loss,
             expert_params,
@@ -354,6 +357,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         uoc_evidences,
         no_evidence_fallback_reason,
         device,
+        named_parameters=None,
     ):
         num_classes = self._get_num_classes()
         metric = self._make_empty_expert_metric(None)
@@ -414,6 +418,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             layer_id=layer_id,
             expert_id=expert_id,
             device=device,
+            named_parameters=named_parameters,
         )
         if grad_fallback is not None:
             metric["fallback_reason"] = grad_fallback
@@ -508,6 +513,8 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             no_evidence_fallback_reason = "no_uoc_evidence_passed_to_aggregator"
 
         device = self._get_model_device(global_model)
+        # 每轮只构造一次参数字典，避免每个 expert 重复遍历 named_parameters。
+        named_parameters = dict(global_model.named_parameters()) if global_model is not None else None
         uoc_foga_stats = {}
         for (layer_id, expert_id), expert_keys in sorted(
             self._expert_key_cache.items(),
@@ -525,6 +532,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
                 uoc_evidences=uoc_evidences,
                 no_evidence_fallback_reason=no_evidence_fallback_reason,
                 device=device,
+                named_parameters=named_parameters,
             )
             layer_stats[str(expert_id)] = metric
 
@@ -706,6 +714,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         uoc_evidences,
         no_evidence_fallback_reason,
         device,
+        named_parameters=None,
     ):
         num_classes = self._get_num_classes()
         metric = self._add_pism_metric_defaults(self._make_empty_expert_metric(None))
@@ -766,6 +775,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             layer_id=layer_id,
             expert_id=expert_id,
             device=device,
+            named_parameters=named_parameters,
         )
         if grad_fallback is not None:
             return metric, self._fallback_expert(
@@ -957,6 +967,8 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
 
         client_stats = self._normalize_client_stats(kwargs.get("client_stats"), len(client_updates))
         device = self._get_model_device(global_model)
+        # 每轮只构造一次参数字典，供所有 expert 的 query 梯度复用。
+        named_parameters = dict(global_model.named_parameters()) if global_model is not None else None
         self.meta_net.to(device)
         self._move_meta_optimizer_state_to_device(device)
 
@@ -979,6 +991,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 uoc_evidences=uoc_evidences,
                 no_evidence_fallback_reason=no_evidence_fallback_reason,
                 device=device,
+                named_parameters=named_parameters,
             )
             layer_stats[str(expert_id)] = metric
             if record is not None:

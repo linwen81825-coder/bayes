@@ -1,11 +1,17 @@
 import os
+import time
 from types import SimpleNamespace
 
 import torch
 from torch import nn
 from tqdm import tqdm
 
-from data.loader import build_global_eval_loader, get_client_train_size, load_partition_meta
+from data.loader import (
+    build_client_train_loader,
+    build_global_eval_loader,
+    get_client_train_size,
+    load_partition_meta,
+)
 from fl.aggregators import build_aggregator
 from fl.client import Client
 from model import build_model_from_args
@@ -45,6 +51,26 @@ class Server:
             args=self.args,
             split="global_test",
             meta=self.partition_meta,
+        )
+        self.cache_client_train_loaders = bool(
+            getattr(self.args, "cache_client_train_loaders", False)
+        )
+        self.client_train_loader_cache = {}
+        if self.cache_client_train_loaders:
+            # 单进程顺序训练时缓存 DataLoader，可复用 persistent workers。
+            self.client_train_loader_cache = {
+                client_id: build_client_train_loader(
+                    args=self.args,
+                    client_id=client_id,
+                    meta=self.partition_meta,
+                )
+                for client_id in self.clientsID_list
+            }
+        self.logger.info(
+            f"--cache_client_train_loaders : {str(self.cache_client_train_loaders).lower()}\n"
+        )
+        self.logger.info(
+            f"--num_cached_client_loaders : {len(self.client_train_loader_cache)}\n"
         )
         self.num_experts = self.args.num_experts
         self.criterion = nn.CrossEntropyLoss()
@@ -230,6 +256,52 @@ class Server:
             model_path = os.path.join(self.args.model_save_path, f"{id}.pth")
             torch.save(server_state_dict, model_path)
 
+    def _summarize_uoc_foga_stats(self, uoc_foga_stats):
+        if not isinstance(uoc_foga_stats, dict):
+            return None
+
+        expert_metrics = [
+            metric
+            for layer_stats in uoc_foga_stats.values()
+            if isinstance(layer_stats, dict)
+            for metric in layer_stats.values()
+            if isinstance(metric, dict)
+        ]
+        total_experts = len(expert_metrics)
+        fallback_reason_counts = {}
+        updated_experts = 0
+        score_means = []
+        weight_entropies = []
+
+        for metric in expert_metrics:
+            fallback_reason = metric.get("fallback_reason")
+            reason = fallback_reason if fallback_reason is not None else "none"
+            fallback_reason_counts[str(reason)] = fallback_reason_counts.get(str(reason), 0) + 1
+            if fallback_reason is None:
+                updated_experts += 1
+            score_mean = metric.get("score_mean")
+            if score_mean is not None:
+                score_means.append(float(score_mean))
+            weight_entropy = metric.get("weight_entropy")
+            if weight_entropy is not None:
+                weight_entropies.append(float(weight_entropy))
+
+        return {
+            "uoc_foga_updated_experts": updated_experts,
+            "uoc_foga_fallback_experts": total_experts - updated_experts,
+            "uoc_foga_fallback_reason_counts": fallback_reason_counts,
+            "uoc_foga_weight_entropy_mean": (
+                sum(weight_entropies) / len(weight_entropies)
+                if weight_entropies
+                else None
+            ),
+            "uoc_foga_score_mean_mean": (
+                sum(score_means) / len(score_means)
+                if score_means
+                else None
+            ),
+        }
+
     def train(self):
         if self.start_round >= self.server_epochs:
             self.logger.info(
@@ -255,6 +327,7 @@ class Server:
         try:
             # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
             for c_T in range(self.start_round, self.server_epochs):
+                round_start_time = time.perf_counter()
                 self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
                 use_in_memory_updates = bool(getattr(self.args, "in_memory_client_updates", True))
                 if use_in_memory_updates:
@@ -270,7 +343,13 @@ class Server:
                 round_client_uoc_evidences = []
                 round_client_stats = []
                 client_states = []
+                client_train_start_time = time.perf_counter()
                 for id in self.clientsID_list:
+                    train_loader = (
+                        self.client_train_loader_cache.get(id)
+                        if self.cache_client_train_loaders
+                        else None
+                    )
                     # 每个客户端执行本地训练，并返回本轮信息。
                     client_stats = Client(
                         args=self.args,
@@ -280,6 +359,7 @@ class Server:
                         partition_meta=self.partition_meta,
                         initial_state_dict=server_state_dict if use_in_memory_updates else None,
                         save_model_to_disk=not use_in_memory_updates,
+                        train_loader=train_loader,
                     ).train()
                     progress_bar.update(1)
                     progress_bar.set_postfix_str(
@@ -327,6 +407,7 @@ class Server:
                         round_layer_stats[layer_id]["overflow_counts"] += stats["overflow_counts"].float().cpu()
                         round_layer_stats[layer_id]["capacity"] = stats.get("capacity", round_layer_stats[layer_id]["capacity"])
 
+                round_client_train_seconds = time.perf_counter() - client_train_start_time
                 usage_list = [int(v) for v in round_expert_usage_summary.tolist()]
                 self.logger.info(f"--round_expert_usage_summary : {usage_list}\n")
                 client_usage_list = [
@@ -354,33 +435,73 @@ class Server:
                 self.logger.info(f"--client_expert_usage_summary : {client_usage_list}\n")
                 self.logger.info(f"--round_expert_stats_by_layer : {layer_stats_log}\n")
                 self.logger.info(f"--client_uoc_evidence_counts : {client_uoc_evidence_counts}\n")
+
                 # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
+                aggregation_start_time = time.perf_counter()
                 self.aggregation(
                     client_states=client_states if use_in_memory_updates else None,
                     uoc_evidence=round_client_uoc_evidences,
                     client_stats=round_client_stats,
                 )
+                round_aggregation_seconds = time.perf_counter() - aggregation_start_time
 
-                test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
-                self.logger.info(f"--server_global_test_loss : {test_loss:.4f} --server_global_test_acc : {test_acc:.4f}\n")
-                is_best = self.update_best_model(test_acc=test_acc, test_loss=test_loss, round_id=c_T + 1)
-                record_server_result(
-                    {
-                        "phase": "test",
-                        "round": c_T + 1,
-                        "test_loss": test_loss,
-                        "test_acc": test_acc,
-                        "best_test_acc": self.best_test_acc,
-                        "best_test_loss": self.best_test_loss,
-                        "is_best": int(is_best),
-                    },
-                    self.args,
-                )
-
-                # 每轮结束保存当前服务端模型，供下一轮客户端同步和断点续训。
-                self.save_server_model()
                 round_completed = c_T + 1
-                self.save_training_checkpoint(round_completed)
+                eval_every = max(1, int(getattr(self.args, "eval_every", 1)))
+                should_eval = round_completed % eval_every == 0 or round_completed >= self.server_epochs
+                round_eval_seconds = None
+                if should_eval:
+                    eval_start_time = time.perf_counter()
+                    test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
+                    round_eval_seconds = time.perf_counter() - eval_start_time
+                    self.logger.info(f"--server_global_test_loss : {test_loss:.4f} --server_global_test_acc : {test_acc:.4f}\n")
+                    is_best = self.update_best_model(test_acc=test_acc, test_loss=test_loss, round_id=round_completed)
+                    record_server_result(
+                        {
+                            "phase": "test",
+                            "round": round_completed,
+                            "test_loss": test_loss,
+                            "test_acc": test_acc,
+                            "best_test_acc": self.best_test_acc,
+                            "best_test_loss": self.best_test_loss,
+                            "is_best": int(is_best),
+                        },
+                        self.args,
+                    )
+                else:
+                    self.logger.info(f"--server_global_test_skipped : true --eval_every : {eval_every}\n")
+                    if self.args.expert_agg_method in {"uoc_foga_expert_align", "uoc_foga_pism_expert_align"}:
+                        self.model.to("cpu")
+
+                save_server_each_round = bool(getattr(self.args, "save_server_model_each_round", False))
+                if (not use_in_memory_updates) or save_server_each_round:
+                    self.save_server_model()
+
+                round_checkpoint_seconds = None
+                checkpoint_every = max(1, int(getattr(self.args, "checkpoint_every", 1)))
+                should_save_checkpoint = (
+                    checkpoint_every <= 1
+                    or round_completed % checkpoint_every == 0
+                    or round_completed >= self.server_epochs
+                )
+                if should_save_checkpoint:
+                    checkpoint_start_time = time.perf_counter()
+                    self.save_training_checkpoint(round_completed)
+                    round_checkpoint_seconds = time.perf_counter() - checkpoint_start_time
+                else:
+                    self.logger.info(f"--checkpoint_skipped : true --checkpoint_every : {checkpoint_every}\n")
+
+                round_total_seconds = time.perf_counter() - round_start_time
+                self.logger.info(f"--round_client_train_seconds : {round_client_train_seconds:.4f}\n")
+                self.logger.info(f"--round_aggregation_seconds : {round_aggregation_seconds:.4f}\n")
+                if round_eval_seconds is None:
+                    self.logger.info("--round_eval_seconds : None\n")
+                else:
+                    self.logger.info(f"--round_eval_seconds : {round_eval_seconds:.4f}\n")
+                if round_checkpoint_seconds is None:
+                    self.logger.info("--round_checkpoint_seconds : None\n")
+                else:
+                    self.logger.info(f"--round_checkpoint_seconds : {round_checkpoint_seconds:.4f}\n")
+                self.logger.info(f"--round_total_seconds : {round_total_seconds:.4f}\n")
         finally:
             progress_bar.close()
 
@@ -400,7 +521,8 @@ class Server:
             and bool(getattr(self.args, "pin_memory", False))
         )
 
-        with torch.no_grad():
+        inference_context = getattr(torch, "inference_mode", torch.no_grad)
+        with inference_context():
             for inputs, labels in data_loader:
                 inputs = inputs.to(self.device, non_blocking=non_blocking)
                 labels = labels.to(self.device, non_blocking=non_blocking)
@@ -492,14 +614,25 @@ class Server:
             )
             self.model.load_state_dict(aggregated_state)
         finally:
-            if use_uoc_foga:
+            if use_uoc_foga and not bool(getattr(self.args, "keep_uoc_model_on_device_until_eval", True)):
                 self.model.to("cpu")
         aggregation_metrics = getattr(self.aggregator, "last_aggregation_metrics", {})
         uoc_foga_stats = aggregation_metrics.get("uoc_foga_stats")
-        if uoc_foga_stats is not None:
-            self.logger.info(f"--uoc_foga_stats : {uoc_foga_stats}\n")
-
         pism_summary = aggregation_metrics.get("uoc_foga_pism_summary", None)
+        if uoc_foga_stats is not None and bool(getattr(self.args, "uoc_foga_log_detail", False)):
+            self.logger.info(f"--uoc_foga_stats : {uoc_foga_stats}\n")
+        if uoc_foga_stats is not None and pism_summary is None:
+            uoc_summary = self._summarize_uoc_foga_stats(uoc_foga_stats)
+            if uoc_summary is not None:
+                for key in (
+                    "uoc_foga_updated_experts",
+                    "uoc_foga_fallback_experts",
+                    "uoc_foga_fallback_reason_counts",
+                    "uoc_foga_weight_entropy_mean",
+                    "uoc_foga_score_mean_mean",
+                ):
+                    self.logger.info(f"--{key} : {uoc_summary.get(key)}\n")
+
         if pism_summary is not None:
             # PISM summary 只打印轻量标量/字典，不输出 per-expert 大对象。
             for key in (

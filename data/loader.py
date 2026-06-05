@@ -54,6 +54,19 @@ def _use_pin_memory(args) -> bool:
     return bool(getattr(args, "pin_memory", False)) and str(args.device).startswith("cuda")
 
 
+def _build_loader_kwargs(args):
+    num_workers = int(getattr(args, "num_workers", 0))
+    loader_kwargs = {
+        "num_workers": num_workers,
+        "pin_memory": _use_pin_memory(args),
+    }
+    if num_workers > 0:
+        # 仅在 worker 模式下传入这些参数，避免 num_workers=0 时触发 PyTorch 报错。
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = int(getattr(args, "prefetch_factor", 2))
+    return loader_kwargs
+
+
 def load_partition_meta(args):
     meta_path = os.path.join(args.data_save_path, args.partition_meta_name)
     if not os.path.exists(meta_path):
@@ -243,8 +256,7 @@ def build_client_train_loader(args, client_id, meta=None):
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=_use_pin_memory(args),
+        **_build_loader_kwargs(args),
     )
 
 
@@ -257,8 +269,7 @@ def build_global_eval_loader(args, split, meta=None):
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=_use_pin_memory(args),
+        **_build_loader_kwargs(args),
     )
 
 

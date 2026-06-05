@@ -45,6 +45,27 @@ runtime:
   # 是否使用内存传递客户端模型更新，避免每轮客户端模型写 pth 后再由服务端读取
   in_memory_client_updates: true
 
+  # 全局测试评估频率：1 表示每轮评估
+  eval_every: 1
+
+  # 训练 checkpoint 保存频率：1 表示每轮保存
+  checkpoint_every: 1
+
+  # 内存更新模式下是否每轮额外保存 server.pth：true / false
+  save_server_model_each_round: false
+
+  # UOC 聚合后模型保留在训练设备直到评估结束：true / false
+  keep_uoc_model_on_device_until_eval: true
+
+  # client 端是否打印 expert usage 和分层 stats 详情：true / false
+  client_log_detail: false
+
+  # client 训练 CSV 记录频率：1 表示每轮记录，0 表示不记录
+  record_client_result_every: 1
+
+  # 是否缓存每个 client 的 train DataLoader：true / false
+  cache_client_train_loaders: false
+
 
 # ============================================================
 # UOC-FOGA 配置
@@ -77,6 +98,9 @@ uoc_foga:
 
   # 最少有效客户端数：正整数
   uoc_foga_min_valid_clients: 1
+
+  # 是否打印完整 per-expert UOC 详情：true / false
+  uoc_foga_log_detail: false
 
   # PISM 输入维度：当前固定为 3
   uoc_foga_pism_input_dim: 3
@@ -129,10 +153,13 @@ data:
   partition_stats_name: partition_stats.json
 
   # DataLoader worker 数量；GPU 训练建议大于 0
-  num_workers: 2
+  num_workers: 4
 
   # GPU 训练时建议开启 pin_memory，加快 CPU 到 GPU 的数据拷贝
   pin_memory: true
+
+  # 每个 worker 预取 batch 数；仅 num_workers > 0 时生效
+  prefetch_factor: 2
 
 
 
@@ -151,6 +178,12 @@ model:
 
   # 客户端本地训练学习率
   learning_rate: 0.0005
+
+  # 梯度裁剪阈值：1.0 保持旧行为，0 或负数表示跳过
+  grad_clip_norm: 1.0
+
+  # optimizer.zero_grad 是否使用 set_to_none=True：true / false
+  optimizer_zero_grad_set_to_none: true
 
   # Transformer token embedding 维度
   embed_dim: 128

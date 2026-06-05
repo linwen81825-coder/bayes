@@ -19,11 +19,13 @@ class Client:
         partition_meta=None,
         initial_state_dict=None,
         save_model_to_disk=True,
+        train_loader=None,
     ):
         self.args = args
         self.client_id = client_id
         self.model_path = self.args.model_save_path + f"/{self.client_id}.pth"
         self.save_model_to_disk = save_model_to_disk
+        self.logger = logger
         # 内存模式下直接加载服务端传入的 state_dict，旧模式下仍从 pth 读取。
         self.model = self.load_client_model(initial_state_dict=initial_state_dict)
         self.device = self.args.device
@@ -37,11 +39,10 @@ class Client:
 
         self.batch_size = self.args.batch_size
         self.partition_meta = partition_meta
-        self.train_loader = None
-        # 加载当前客户端的训练索引，并动态封装成 DataLoader。
-        self.get_dataloader()
-
-        self.logger = logger
+        self.train_loader = train_loader
+        if self.train_loader is None:
+            # 加载当前客户端的训练索引，并动态封装成 DataLoader。
+            self.get_dataloader()
         self.router_aux_loss_coef = self.args.router_aux_loss_coef
         self.router_z_loss_coef = self.args.router_z_loss_coef
 
@@ -238,6 +239,13 @@ class Client:
             and bool(getattr(self.args, "pin_memory", False))
         )
         uoc_evidence_by_layer = self._collect_uoc_evidence_before_train()
+        optimizer_zero_grad_set_to_none = bool(
+            getattr(self.args, "optimizer_zero_grad_set_to_none", True)
+        )
+        zero_grad_supports_set_to_none = True
+        grad_clip_norm = float(getattr(self.args, "grad_clip_norm", 1.0))
+        client_log_detail = bool(getattr(self.args, "client_log_detail", False))
+        record_every = int(getattr(self.args, "record_client_result_every", 1))
         last_avg_router_probs = torch.zeros(self.args.num_experts, device=self.device)
         local_usage_total = torch.zeros(self.args.num_experts, device=self.device)
         local_layer_usage_total = {}
@@ -259,14 +267,26 @@ class Client:
             for inputs, labels in self.train_loader:
                 inputs = inputs.to(self.device, non_blocking=non_blocking)
                 labels = labels.to(self.device, non_blocking=non_blocking)
-                self.optimizer.zero_grad()
+                if zero_grad_supports_set_to_none:
+                    try:
+                        self.optimizer.zero_grad(set_to_none=optimizer_zero_grad_set_to_none)
+                    except TypeError:
+                        # 兼容不支持 set_to_none 参数的旧版 PyTorch。
+                        zero_grad_supports_set_to_none = False
+                        self.optimizer.zero_grad()
+                else:
+                    self.optimizer.zero_grad()
 
                 result = self.model(inputs)
                 outputs = result["logits"]
                 extra_loss, router_aux_loss, router_z_loss = self.get_auxiliary_losses(result)
                 loss = self.criterion(outputs, labels) + extra_loss
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1)
+                if grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=grad_clip_norm,
+                    )
                 self.optimizer.step()
 
                 batch_size = inputs.size(0)
@@ -292,36 +312,54 @@ class Client:
             self.add_layer_stats(local_layer_usage_total, layer_usage_total)
             last_avg_router_probs = router_prob_sum / max(total_samples, 1)
 
-            usage_list = [int(v) for v in usage_total.detach().cpu().tolist()]
-            router_prob_list = [round(float(v), 4) for v in last_avg_router_probs.detach().cpu().tolist()]
-            self.logger.info(
+            base_log = (
                 f"--client: {self.client_id} --epoch:{epoch+1}/{self.client_epochs} "
                 f"--train_loss :{train_loss:.4f} --train_acc :{train_acc:.4f} "
                 f"--router_aux_loss : {avg_aux_loss:.4f} "
-                f"--router_z_loss : {avg_z_loss:.4f} "
-                f"--expert_usage : {usage_list} --avg_router_probs : {router_prob_list}"
+                f"--router_z_loss : {avg_z_loss:.4f}"
             )
-            if layer_usage_total:
-                layer_usage_log = {
-                    layer_id: {
-                        "expert_activations": [int(v) for v in stats["expert_activations"].detach().cpu().tolist()],
-                        "overflow_counts": [int(v) for v in stats["overflow_counts"].detach().cpu().tolist()],
-                        "capacity": int(stats["capacity"]),
+            if client_log_detail:
+                usage_list = [int(v) for v in usage_total.detach().cpu().tolist()]
+                router_prob_list = [
+                    round(float(v), 4)
+                    for v in last_avg_router_probs.detach().cpu().tolist()
+                ]
+                self.logger.info(
+                    f"{base_log} --expert_usage : {usage_list} "
+                    f"--avg_router_probs : {router_prob_list}"
+                )
+                if layer_usage_total:
+                    layer_usage_log = {
+                        layer_id: {
+                            "expert_activations": [
+                                int(v)
+                                for v in stats["expert_activations"].detach().cpu().tolist()
+                            ],
+                            "overflow_counts": [
+                                int(v)
+                                for v in stats["overflow_counts"].detach().cpu().tolist()
+                            ],
+                            "capacity": int(stats["capacity"]),
+                        }
+                        for layer_id, stats in layer_usage_total.items()
                     }
-                    for layer_id, stats in layer_usage_total.items()
-                }
-                self.logger.info(f"--client: {self.client_id} --layer_expert_stats : {layer_usage_log}")
+                    self.logger.info(
+                        f"--client: {self.client_id} --layer_expert_stats : {layer_usage_log}"
+                    )
+            else:
+                self.logger.info(base_log)
 
-            record_dic = {
-                'T': self.c_T,
-                'client_epoch': epoch+1,
-                'client_id': self.client_id,
-                "train_loss": train_loss,
-                "train_acc": train_acc.item(),
-                "router_aux_loss": avg_aux_loss,
-                "router_z_loss": avg_z_loss,
-            }
-            record_result(record_dic=record_dic, args=self.args)
+            if record_every > 0 and ((self.c_T + 1) % record_every == 0):
+                record_dic = {
+                    'T': self.c_T,
+                    'client_epoch': epoch+1,
+                    'client_id': self.client_id,
+                    "train_loss": train_loss,
+                    "train_acc": train_acc.item(),
+                    "router_aux_loss": avg_aux_loss,
+                    "router_z_loss": avg_z_loss,
+                }
+                record_result(record_dic=record_dic, args=self.args)
 
         if self.save_model_to_disk:
             self.save_client_model()
