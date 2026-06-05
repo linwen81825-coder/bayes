@@ -119,6 +119,13 @@ python train.py
 python train.py
 ```
 
+训练时控制台会显示实验级 tqdm 动态总进度条：
+- 总步数 = server_epochs × num_clients
+- 每完成一个客户端本地训练，进度条更新并刷新一次
+- 进度条会显示动态条形进度、已用时间、预计剩余时间和平均每个 client 耗时
+- resume=true 时，进度条会从已完成 round 对应的位置继续
+- 详细训练日志仍然写入 save_root/result/ 下的日志文件，进度条不会写入日志文件
+
 ## 数据协议
 
 当前项目使用的是 index-based partition 协议：
