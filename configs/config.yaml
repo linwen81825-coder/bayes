@@ -50,32 +50,32 @@ runtime:
 # UOC-FOGA 配置
 # ============================================================
 uoc_foga:
-  # 开启客户端本地训练前 evidence 采集
+  # 是否采集 UOC evidence：true / false
   uoc_foga_enabled: true
 
-  # 每个客户端采少量样本，smoke 不要太大
+  # 每客户端采样数：正整数
   uoc_foga_samples_per_client: 16
 
-  # 每个 expert 的 query set 中，每类最多取 2 个样本
+  # 每类 query 样本上限：正整数
   uoc_foga_query_per_class: 2
 
-  # smoke 阶段阈值放低，避免所有 expert 都因为 query 太少 fallback
+  # 每 expert 最少 query 样本/类别数：正整数
   uoc_foga_min_query_samples_per_expert: 2
   uoc_foga_min_classes_per_expert: 1
 
-  # 使用 top1 expert id 构造 per-expert query pool
+  # 用 top1 路由构造 query：true（当前仅支持 true）
   uoc_foga_use_top1: true
 
-  # 必须在本地训练前采集 round-start global model 的 evidence
+  # 本地训练前采集：true / false
   uoc_foga_collect_before_train: true
 
-  # server 端计算 g_query 时强制 hidden 经过目标 expert，不乘 router gate
+  # 强制 expert 的 gate 模式：one（当前仅支持 one）
   uoc_foga_gate_mode: one
 
-  # score -> weight：q=max(score,0)
+  # score 转权重方式：relu（当前仅支持 relu）
   uoc_foga_score_mode: relu
 
-  # smoke 允许 1 个有效客户端也跑，正式实验建议改回 2
+  # 最少有效客户端数：正整数
   uoc_foga_min_valid_clients: 1
 
 
