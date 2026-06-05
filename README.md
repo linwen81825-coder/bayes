@@ -35,34 +35,26 @@ conda activate fedwolf
 
 这三份 YAML 的顶层都必须是 key-value mapping；空文件会按空配置处理。
 三份 YAML 配置文件会在启动时读取并合并。为避免歧义，顶层 key 必须全局唯一；如果出现重复 key，`load_args()` 会直接报错，而不是静默覆盖。
-默认假设从项目根目录运行 `python -m data.data` 和 `python train.py`；除非显式传入绝对路径，否则会读取项目根目录下的 `configs/data.yaml`、`configs/train.yaml` 和 `configs/model.yaml`。
+默认假设从项目根目录运行 `python train.py`；除非显式传入绝对路径，否则会读取项目根目录下的 `configs/data.yaml`、`configs/train.yaml` 和 `configs/model.yaml`。`train.py` 会在训练前自动重建并覆盖数据划分文件。
 
 ## 实验切换方式
 
 - 切 CIFAR10 / CIFAR100：修改 `configs/data.yaml` 中的 `data_name`
 - 改 `alpha`：修改 `configs/data.yaml` 中的 `alpha`
 - 切聚合方法：修改 `configs/train.yaml` 中的 `agg_method`
-- 改完 YAML 后，如果变动涉及数据划分（例如 `data_name`、`alpha`、`num_clients`、`global_val_ratio`），先运行 `python -m data.data`，再运行 `python train.py`
-- 如果只改训练或模型配置，且不影响数据划分，可以直接重新训练；否则先重建 partition
+- 改完 YAML 后，直接运行 `python train.py`；训练入口会自动重建 partition
+- 每次训练都会覆盖已有的 `partition_meta.pt` 和 `partition_stats.json`
 - 如果想切换另一套 YAML，也可以使用轻量命令行入口：
 
 ```bash
-python -m data.data
 python train.py
 
-python -m data.data --data_cfg configs/exp/cifar10.yaml --train_cfg configs/exp/train_fedavg.yaml --model_cfg configs/model.yaml
 python train.py --data_cfg configs/exp/cifar10.yaml --train_cfg configs/exp/train_fedavg.yaml --model_cfg configs/model.yaml
 ```
 
 ## 运行顺序
 
-先按需要修改上述 YAML 文件，再生成数据划分：
-
-```bash
-python -m data.data
-```
-
-再启动训练：
+按需要修改上述 YAML 文件后，直接启动训练；`train.py` 会在训练前自动重建并覆盖数据划分文件：
 
 ```bash
 python train.py
@@ -86,11 +78,7 @@ python train.py
 
 动态构造 `Dataset` / `DataLoader`。
 
-如果训练时报原始 CIFAR 缺失，请检查 `configs/data.yaml` 中的 `data_path`，或者重新运行：
-
-```bash
-python -m data.data
-```
+如果训练时报原始 CIFAR 缺失，请检查 `configs/data.yaml` 中的 `data_path`，然后重新运行 `python train.py`。
 
 ## 训练与评估协议
 

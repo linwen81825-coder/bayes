@@ -4,6 +4,7 @@ import os
 import warnings
 
 from configs import add_config_path_arguments, load_args
+from data.data import CIFARPartitionBuilder
 from fl.server import Server
 from utils.utils import get_experiment_stem, set_seed
 
@@ -55,6 +56,11 @@ def main():
     set_seed(args.seed)
     logger = build_logger(args)
 
+    logger.info("[Partition] Rebuilding data partition before training...")
+    CIFARPartitionBuilder(args=args).build()
+    logger.info("[Partition] Data partition rebuilt successfully.")
+
+    set_seed(args.seed)
     # 项目主入口：创建服务端对象，然后启动联邦训练流程。
     Server(args=args, logger=logger).train()
 

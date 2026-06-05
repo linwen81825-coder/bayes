@@ -1,4 +1,3 @@
-import argparse
 import json
 import os
 from collections import Counter
@@ -7,9 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from configs import add_config_path_arguments, load_args
 from data.loader import get_cifar_stats
-from utils.utils import set_seed
 
 
 class CIFARPartitionBuilder:
@@ -205,16 +202,3 @@ class CIFARPartitionBuilder:
         print(f"Saved partition meta to {meta_path}")
         print(f"Saved partition stats to {stats_path}")
 
-if __name__ == '__main__':
-    cli_parser = argparse.ArgumentParser(description="Build CIFAR partitions from YAML configuration files.")
-    add_config_path_arguments(cli_parser)
-    cli_args = cli_parser.parse_args()
-
-    # Load partition settings from YAML config files under `configs/`.
-    args = load_args(
-        data_cfg_path=cli_args.data_cfg,
-        train_cfg_path=cli_args.train_cfg,
-        model_cfg_path=cli_args.model_cfg,
-    )
-    set_seed(args.seed)
-    CIFARPartitionBuilder(args=args).build()
