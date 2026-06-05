@@ -17,7 +17,6 @@ _REQUIRED_CONFIG_KEYS = (
     "data_name",
     "data_path",
     "global_val_ratio",
-    "data_save_path",
     "batch_size",
     "min_datasize",
     "alpha",
@@ -30,9 +29,8 @@ _REQUIRED_CONFIG_KEYS = (
     "server_epochs",
     "client_epochs",
     "device",
-    "save_result",
+    "save_root",
     "agg_method",
-    "model_save_path",
     "model_type",
     "num_experts",
     "dropout",
@@ -114,6 +112,13 @@ def _raise_if_missing_required_keys(merged_config: dict) -> None:
         )
 
 
+def _derive_save_paths(merged_config: dict) -> None:
+    save_root = Path(str(merged_config["save_root"]))
+    merged_config["data_save_path"] = str(save_root / "data")
+    merged_config["save_result"] = str(save_root / "result")
+    merged_config["model_save_path"] = str(save_root / "model")
+
+
 def add_config_path_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add the lightweight YAML-path CLI overrides used by the entrypoints."""
 
@@ -150,6 +155,7 @@ def load_args(
         merged_config.update(config)
 
     _raise_if_missing_required_keys(merged_config)
+    _derive_save_paths(merged_config)
 
     return SimpleNamespace(**merged_config)
 
