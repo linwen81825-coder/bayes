@@ -22,8 +22,11 @@ aggregation:
   # 非专家参数聚合方法：sample_weighted / uniform
   non_expert_agg_method: sample_weighted
 
-  # 专家参数聚合方法：sample_weighted / uniform
-  expert_agg_method: sample_weighted
+  # 专家参数聚合方法：
+  # - sample_weighted
+  # - uniform
+  # - uoc_foga_expert_align
+  expert_agg_method: uoc_foga_expert_align
 
 
 # ============================================================
@@ -41,6 +44,39 @@ runtime:
 
   # 是否使用内存传递客户端模型更新，避免每轮客户端模型写 pth 后再由服务端读取
   in_memory_client_updates: true
+
+
+# ============================================================
+# UOC-FOGA 配置
+# ============================================================
+uoc_foga:
+  # 开启客户端本地训练前 evidence 采集
+  uoc_foga_enabled: true
+
+  # 每个客户端采少量样本，smoke 不要太大
+  uoc_foga_samples_per_client: 16
+
+  # 每个 expert 的 query set 中，每类最多取 2 个样本
+  uoc_foga_query_per_class: 2
+
+  # smoke 阶段阈值放低，避免所有 expert 都因为 query 太少 fallback
+  uoc_foga_min_query_samples_per_expert: 2
+  uoc_foga_min_classes_per_expert: 1
+
+  # 使用 top1 expert id 构造 per-expert query pool
+  uoc_foga_use_top1: true
+
+  # 必须在本地训练前采集 round-start global model 的 evidence
+  uoc_foga_collect_before_train: true
+
+  # server 端计算 g_query 时强制 hidden 经过目标 expert，不乘 router gate
+  uoc_foga_gate_mode: one
+
+  # score -> weight：q=max(score,0)
+  uoc_foga_score_mode: relu
+
+  # smoke 允许 1 个有效客户端也跑，正式实验建议改回 2
+  uoc_foga_min_valid_clients: 1
 
 
 # ============================================================

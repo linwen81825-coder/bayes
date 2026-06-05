@@ -114,13 +114,22 @@ def _raise_if_missing_required_keys(merged_config: dict) -> None:
 
 
 def _validate_aggregation_methods(merged_config: dict) -> None:
-    allowed_methods = {"sample_weighted", "uniform"}
-    for key in ["non_expert_agg_method", "expert_agg_method"]:
-        value = merged_config.get(key)
-        if value not in allowed_methods:
-            raise ValueError(
-                f"{key} must be one of {sorted(allowed_methods)}, got {value!r}"
-            )
+    non_expert_methods = {"sample_weighted", "uniform"}
+    expert_methods = {"sample_weighted", "uniform", "uoc_foga_expert_align"}
+
+    non_expert_method = merged_config.get("non_expert_agg_method")
+    if non_expert_method not in non_expert_methods:
+        raise ValueError(
+            "non_expert_agg_method must be one of "
+            f"{sorted(non_expert_methods)}, got {non_expert_method!r}"
+        )
+
+    expert_method = merged_config.get("expert_agg_method")
+    if expert_method not in expert_methods:
+        raise ValueError(
+            "expert_agg_method must be one of "
+            f"{sorted(expert_methods)}, got {expert_method!r}"
+        )
 
 
 def _validate_device_config(merged_config: dict) -> None:

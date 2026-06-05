@@ -527,8 +527,8 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
 
 
 def build_aggregator(args):
-    agg_method = getattr(args, "agg_method", None)
-    if agg_method == "uoc_foga_expert_align":
+    expert_method = getattr(args, "expert_agg_method", "sample_weighted")
+    if expert_method == "uoc_foga_expert_align":
         return UOCFOGAExpertAlignAggregator(
             args=args,
             non_expert_method=args.non_expert_agg_method,
@@ -536,5 +536,5 @@ def build_aggregator(args):
 
     return SplitParameterAggregator(
         non_expert_method=args.non_expert_agg_method,
-        expert_method=args.expert_agg_method,
+        expert_method=expert_method,
     )

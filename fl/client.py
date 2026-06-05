@@ -118,7 +118,7 @@ class Client:
             total_stats[layer_key]["capacity"] = stats.get("capacity", total_stats[layer_key]["capacity"])
 
     def _should_collect_uoc_evidence_before_train(self):
-        agg_method = getattr(self.args, "agg_method", None)
+        expert_method = getattr(self.args, "expert_agg_method", "")
         uoc_foga_enabled = bool(getattr(self.args, "uoc_foga_enabled", False))
         uoc_foga_collect_before_train = bool(
             getattr(self.args, "uoc_foga_collect_before_train", True)
@@ -126,8 +126,9 @@ class Client:
         if not uoc_foga_collect_before_train:
             return False
 
+        # UOC evidence 由 expert_agg_method 或手动开关触发，不再依赖 agg_method。
         return (
-            agg_method in ["uoc_foga_expert_align", "uoc_foga_pism_expert_align"]
+            expert_method in ["uoc_foga_expert_align", "uoc_foga_pism_expert_align"]
             or uoc_foga_enabled
         )
 
