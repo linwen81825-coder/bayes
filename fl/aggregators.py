@@ -294,6 +294,42 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             "fallback_reason": fallback_reason,
         }
 
+    def _get_query_select_kwargs(self):
+        return {
+            "query_select_mode": getattr(
+                self.args,
+                "uoc_foga_query_select_mode",
+                "class_balanced_random",
+            ),
+            "min_expert_token_ratio": float(
+                getattr(self.args, "uoc_foga_min_expert_token_ratio", 0.0)
+            ),
+            "max_samples_per_client_per_class": int(
+                getattr(self.args, "uoc_foga_max_samples_per_client_per_class", 0)
+            ),
+            "fallback_to_random": bool(
+                getattr(self.args, "uoc_foga_query_fallback_to_random", True)
+            ),
+        }
+
+    def _copy_query_stats_to_metric(self, metric, query):
+        for key in (
+            "query_select_mode",
+            "token_ratio_threshold",
+            "pool_size_before_filter",
+            "pool_size_after_token_ratio_filter",
+            "selected_by_entropy",
+            "fallback_to_random_used",
+            "entropy_missing",
+            "expert_token_ratio_mean",
+            "expert_token_ratio_min",
+            "expert_token_ratio_max",
+            "query_entropy_mean",
+            "max_samples_per_client_per_class",
+        ):
+            if key in query:
+                metric[key] = query[key]
+
     def _build_expert_params_and_grads(
         self,
         global_model,
@@ -386,10 +422,12 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             min_query_classes=getattr(self.args, "uoc_foga_min_classes_per_expert", 2),
             use_top1=True,
             seed=getattr(self.args, "seed", None),
+            **self._get_query_select_kwargs(),
         )
         metric["query_size"] = int(query.get("query_size", 0))
         metric["query_num_classes"] = int(query.get("query_num_classes", 0))
         metric["query_has_residual"] = bool(query.get("has_residual", False))
+        self._copy_query_stats_to_metric(metric, query)
 
         if query.get("fallback_reason") is not None:
             metric["fallback_reason"] = query["fallback_reason"]
@@ -743,10 +781,12 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             min_query_classes=getattr(self.args, "uoc_foga_min_classes_per_expert", 2),
             use_top1=True,
             seed=getattr(self.args, "seed", None),
+            **self._get_query_select_kwargs(),
         )
         metric["query_size"] = int(query.get("query_size", 0))
         metric["query_num_classes"] = int(query.get("query_num_classes", 0))
         metric["query_has_residual"] = bool(query.get("has_residual", False))
+        self._copy_query_stats_to_metric(metric, query)
 
         if query.get("fallback_reason") is not None:
             return metric, self._fallback_expert(

@@ -26,6 +26,7 @@ aggregation:
   # - sample_weighted
   # - uniform
   # - uoc_foga_expert_align
+  # - uoc_foga_pism_expert_align
   expert_agg_method: uoc_foga_expert_align
 
 
@@ -102,6 +103,18 @@ uoc_foga:
   # 是否打印完整 per-expert UOC 详情：true / false
   uoc_foga_log_detail: false
 
+  # query 筛选模式：class_balanced_random 保持旧行为，expert_ratio_entropy 启用增强筛选
+  uoc_foga_query_select_mode: class_balanced_random
+
+  # expert token 命中比例阈值；旧模式默认不额外过滤
+  uoc_foga_min_expert_token_ratio: 0.0
+
+  # 每个 class 内每个 client 最多保留多少样本；0 表示不限制
+  uoc_foga_max_samples_per_client_per_class: 0
+
+  # 增强筛选后 query 不足时是否回退到旧随机 class-balanced
+  uoc_foga_query_fallback_to_random: true
+
   # PISM 输入维度：当前固定为 3
   uoc_foga_pism_input_dim: 3
 
@@ -112,7 +125,7 @@ uoc_foga:
   uoc_foga_pism_dropout: 0.0
 
   # PISM 学习率：正数
-  uoc_foga_pism_lr: 0.001
+  uoc_foga_pism_lr: 0.003
 
   # PISM softmax 温度：正数
   uoc_foga_pism_tau: 1.0
@@ -171,7 +184,7 @@ model:
   model_type: hybrid_switch_transformer
 
   # 图像 backbone：cnn_stem / resnet18
-  backbone_type: cnn_stem
+  backbone_type: resnet18
 
   # dropout 概率
   dropout: 0.2

@@ -185,6 +185,9 @@ class Client:
                         # residual 用于 server 端精确恢复当前 MoE block 输出：
                         # x_after_block = residual + forced_expert(hidden)。
                         residual = residual[: hidden.size(0)].detach()
+                    entropy = layer_evidence.get("entropy")
+                    if entropy is not None:
+                        entropy = entropy[: hidden.size(0)].detach()
                     layer_labels = labels[: hidden.size(0)].detach()
 
                     if layer_key not in evidence_chunks_by_layer:
@@ -196,6 +199,8 @@ class Client:
                         }
                     if residual is not None and "residual" not in evidence_chunks_by_layer[layer_key]:
                         evidence_chunks_by_layer[layer_key]["residual"] = []
+                    if entropy is not None and "entropy" not in evidence_chunks_by_layer[layer_key]:
+                        evidence_chunks_by_layer[layer_key]["entropy"] = []
 
                     evidence_chunks_by_layer[layer_key]["hidden"].append(hidden.cpu())
                     evidence_chunks_by_layer[layer_key]["labels"].append(layer_labels.cpu())
@@ -207,6 +212,8 @@ class Client:
                     )
                     if residual is not None:
                         evidence_chunks_by_layer[layer_key]["residual"].append(residual.cpu())
+                    if entropy is not None:
+                        evidence_chunks_by_layer[layer_key]["entropy"].append(entropy.cpu())
 
                 collected_samples += batch_sample_count
 

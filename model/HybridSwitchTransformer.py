@@ -468,6 +468,18 @@ class HybridSwitchTransformer(nn.Module):
                 )
                 uoc_evidence.update(block_uoc_info)
 
+            tokens = self.norm(tokens)
+            pooled = tokens[:, 0] if self.cls_token is not None else tokens.mean(dim=1)
+            logits = self.classifier(pooled)
+            probs = torch.softmax(logits.float(), dim=-1)
+            # entropy 只作为 query 筛选信号，不参与训练 loss。
+            entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=-1).detach()
+            for layer_evidence in uoc_evidence.values():
+                hidden = layer_evidence.get("hidden")
+                if hidden is None:
+                    continue
+                layer_evidence["entropy"] = entropy[: hidden.size(0)].detach()
+
         return uoc_evidence
 
     def forward_uoc_from_hidden(

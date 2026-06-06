@@ -272,6 +272,11 @@ class Server:
         updated_experts = 0
         score_means = []
         weight_entropies = []
+        query_modes = []
+        query_fallback_to_random_count = 0
+        query_token_ratio_means = []
+        query_entropy_means = []
+        query_pool_after_ratio_filter_sizes = []
 
         for metric in expert_metrics:
             fallback_reason = metric.get("fallback_reason")
@@ -286,6 +291,26 @@ class Server:
             if weight_entropy is not None:
                 weight_entropies.append(float(weight_entropy))
 
+            query_mode = metric.get("query_select_mode")
+            if query_mode is not None:
+                query_modes.append(str(query_mode))
+            if bool(metric.get("fallback_to_random_used", False)):
+                query_fallback_to_random_count += 1
+            token_ratio_mean = metric.get("expert_token_ratio_mean")
+            if token_ratio_mean is not None:
+                query_token_ratio_means.append(float(token_ratio_mean))
+            query_entropy_mean = metric.get("query_entropy_mean")
+            if query_entropy_mean is not None:
+                query_entropy_means.append(float(query_entropy_mean))
+            pool_after_ratio_filter_size = metric.get("pool_size_after_token_ratio_filter")
+            if pool_after_ratio_filter_size is not None:
+                query_pool_after_ratio_filter_sizes.append(float(pool_after_ratio_filter_size))
+
+        query_select_mode = (
+            query_modes[0]
+            if query_modes
+            else getattr(self.args, "uoc_foga_query_select_mode", "class_balanced_random")
+        )
         return {
             "uoc_foga_updated_experts": updated_experts,
             "uoc_foga_fallback_experts": total_experts - updated_experts,
@@ -298,6 +323,23 @@ class Server:
             "uoc_foga_score_mean_mean": (
                 sum(score_means) / len(score_means)
                 if score_means
+                else None
+            ),
+            "uoc_foga_query_select_mode": query_select_mode,
+            "uoc_foga_query_fallback_to_random_count": query_fallback_to_random_count,
+            "uoc_foga_query_token_ratio_mean_mean": (
+                sum(query_token_ratio_means) / len(query_token_ratio_means)
+                if query_token_ratio_means
+                else None
+            ),
+            "uoc_foga_query_entropy_mean_mean": (
+                sum(query_entropy_means) / len(query_entropy_means)
+                if query_entropy_means
+                else None
+            ),
+            "uoc_foga_query_pool_after_ratio_filter_mean": (
+                sum(query_pool_after_ratio_filter_sizes) / len(query_pool_after_ratio_filter_sizes)
+                if query_pool_after_ratio_filter_sizes
                 else None
             ),
         }
@@ -621,16 +663,26 @@ class Server:
         pism_summary = aggregation_metrics.get("uoc_foga_pism_summary", None)
         if uoc_foga_stats is not None and bool(getattr(self.args, "uoc_foga_log_detail", False)):
             self.logger.info(f"--uoc_foga_stats : {uoc_foga_stats}\n")
-        if uoc_foga_stats is not None and pism_summary is None:
+        if uoc_foga_stats is not None:
             uoc_summary = self._summarize_uoc_foga_stats(uoc_foga_stats)
             if uoc_summary is not None:
-                for key in (
-                    "uoc_foga_updated_experts",
-                    "uoc_foga_fallback_experts",
-                    "uoc_foga_fallback_reason_counts",
-                    "uoc_foga_weight_entropy_mean",
-                    "uoc_foga_score_mean_mean",
-                ):
+                base_summary_keys = ()
+                if pism_summary is None:
+                    base_summary_keys = (
+                        "uoc_foga_updated_experts",
+                        "uoc_foga_fallback_experts",
+                        "uoc_foga_fallback_reason_counts",
+                        "uoc_foga_weight_entropy_mean",
+                        "uoc_foga_score_mean_mean",
+                    )
+                query_summary_keys = (
+                    "uoc_foga_query_select_mode",
+                    "uoc_foga_query_fallback_to_random_count",
+                    "uoc_foga_query_token_ratio_mean_mean",
+                    "uoc_foga_query_entropy_mean_mean",
+                    "uoc_foga_query_pool_after_ratio_filter_mean",
+                )
+                for key in base_summary_keys + query_summary_keys:
                     self.logger.info(f"--{key} : {uoc_summary.get(key)}\n")
 
         if pism_summary is not None:
