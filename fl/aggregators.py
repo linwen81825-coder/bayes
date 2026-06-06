@@ -619,6 +619,20 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         self._validate_pism_tau_schedule()
         self.pism_renorm_inputs = bool(getattr(args, "uoc_foga_pism_renorm_inputs", True))
         self.pism_min_clients = int(getattr(args, "uoc_foga_pism_min_clients", 2))
+        # meta_steps 表示每轮同一批 PISM records 上的 optimizer step 次数，不会重复构造 query / g_query。
+        raw_meta_steps = getattr(args, "uoc_foga_pism_meta_steps", 1)
+        try:
+            self.pism_meta_steps = int(raw_meta_steps)
+        except (TypeError, ValueError):
+            raise ValueError("uoc_foga_pism_meta_steps must be a positive integer")
+        if isinstance(raw_meta_steps, bool):
+            raise ValueError("uoc_foga_pism_meta_steps must be a positive integer")
+        if isinstance(raw_meta_steps, float) and not raw_meta_steps.is_integer():
+            raise ValueError("uoc_foga_pism_meta_steps must be a positive integer")
+        if isinstance(raw_meta_steps, str) and raw_meta_steps.strip() != str(self.pism_meta_steps):
+            raise ValueError("uoc_foga_pism_meta_steps must be a positive integer")
+        if self.pism_meta_steps <= 0:
+            raise ValueError("uoc_foga_pism_meta_steps must be a positive integer")
         self.pism_update_steps = 0
         self.meta_net = ExpertPISM(
             input_dim=self.pism_input_dim,
@@ -687,6 +701,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "PISM tau schedule mismatch. Please set resume=false when changing tau schedule."
             )
 
+    def _validate_checkpoint_meta_steps(self, pism_config):
+        saved_meta_steps = int(pism_config.get("meta_steps", 1))
+        if saved_meta_steps != self.pism_meta_steps:
+            raise ValueError(
+                "PISM meta_steps mismatch. Please set resume=false when changing uoc_foga_pism_meta_steps."
+            )
+
     def get_checkpoint_state(self):
         return {
             "type": "uoc_foga_pism_expert_align",
@@ -703,6 +724,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "tau_init": self.pism_tau_init,
                 "tau_min": self.pism_tau_min,
                 "tau_decay": self.pism_tau_decay,
+                "meta_steps": self.pism_meta_steps,
                 "renorm_inputs": self.pism_renorm_inputs,
                 "min_clients": self.pism_min_clients,
             },
@@ -721,6 +743,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         if not isinstance(pism_config, dict):
             pism_config = {}
         self._validate_checkpoint_tau_schedule(pism_config)
+        self._validate_checkpoint_meta_steps(pism_config)
 
         if "meta_net" in state:
             self.meta_net.load_state_dict(state["meta_net"])
@@ -1134,21 +1157,32 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
 
         meta_loss_value = None
         meta_loss_failed = False
+        successful_meta_losses = []
+        successful_meta_steps = 0
         if per_expert_records:
-            meta_losses = []
-            for record in per_expert_records:
-                weights = self.meta_net(record["features"], tau=current_tau)
-                meta_losses.append(-(weights * record["scores"]).sum())
-            meta_loss = torch.stack(meta_losses).mean()
-            if not torch.isfinite(meta_loss):
-                meta_loss_failed = True
-                meta_loss_value = None
-            else:
+            for _ in range(self.pism_meta_steps):
+                meta_losses = []
+                for record in per_expert_records:
+                    weights = self.meta_net(record["features"], tau=current_tau)
+                    meta_losses.append(-(weights * record["scores"]).sum())
+                meta_loss = torch.stack(meta_losses).mean()
+
+                if not torch.isfinite(meta_loss):
+                    if successful_meta_steps == 0:
+                        meta_loss_failed = True
+                    break
+
                 self.meta_optimizer.zero_grad()
                 meta_loss.backward()
                 self.meta_optimizer.step()
                 self.pism_update_steps += 1
-                meta_loss_value = float(meta_loss.detach().cpu().item())
+                successful_meta_steps += 1
+                successful_meta_losses.append(float(meta_loss.detach().cpu().item()))
+
+            if successful_meta_steps > 0:
+                meta_loss_value = sum(successful_meta_losses) / len(successful_meta_losses)
+            else:
+                meta_loss_value = None
         else:
             meta_loss_failed = True
 
@@ -1240,6 +1274,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 else 0.0
             ),
             "uoc_foga_pism_update_steps": int(self.pism_update_steps),
+            "uoc_foga_pism_meta_steps": int(self.pism_meta_steps),
+            "uoc_foga_pism_meta_steps_successful": int(successful_meta_steps),
+            "uoc_foga_pism_meta_steps_requested": int(self.pism_meta_steps),
             "uoc_foga_pism_tau_schedule": self.pism_tau_schedule,
             "uoc_foga_pism_tau": float(current_tau),
             "uoc_foga_pism_tau_init": float(self.pism_tau_init),

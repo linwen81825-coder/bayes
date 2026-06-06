@@ -107,13 +107,13 @@ uoc_foga:
   uoc_foga_log_detail: false
 
   # query 筛选模式：class_balanced_random 保持旧行为，expert_ratio_entropy 启用增强筛选
-  uoc_foga_query_select_mode: class_balanced_random
+  uoc_foga_query_select_mode: expert_ratio_entropy
 
   # expert token 命中比例阈值；旧模式默认不额外过滤
-  uoc_foga_min_expert_token_ratio: 0.0
+  uoc_foga_min_expert_token_ratio: 0.05
 
   # 每个 class 内每个 client 最多保留多少样本；0 表示不限制
-  uoc_foga_max_samples_per_client_per_class: 0
+  uoc_foga_max_samples_per_client_per_class: 2
 
   # 增强筛选后 query 不足时是否回退到旧随机 class-balanced
   uoc_foga_query_fallback_to_random: true
@@ -144,6 +144,9 @@ uoc_foga:
 
   # PISM tau 指数衰减系数：(0, 1]
   uoc_foga_pism_tau_decay: 1.0
+
+  # 每轮同一批 PISM records 上的 meta optimizer step 次数：正整数
+  uoc_foga_pism_meta_steps: 1
 
   # 是否标准化 PISM 输入：true / false
   uoc_foga_pism_renorm_inputs: true
