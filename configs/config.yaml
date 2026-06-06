@@ -27,7 +27,7 @@ aggregation:
   # - uniform
   # - uoc_foga_expert_align
   # - uoc_foga_pism_expert_align
-  expert_agg_method: uoc_foga_expert_align
+  expert_agg_method: uoc_foga_pism_expert_align
 
 
 # ============================================================
@@ -96,6 +96,9 @@ uoc_foga:
 
   # score 转权重方式：relu（当前仅支持 relu）
   uoc_foga_score_mode: relu
+
+  # score 计算度量：cosine 保持旧行为，dot 使用内积
+  uoc_foga_score_metric: cosine
 
   # 最少有效客户端数：正整数
   uoc_foga_min_valid_clients: 1

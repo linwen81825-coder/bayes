@@ -271,6 +271,7 @@ class Server:
         fallback_reason_counts = {}
         updated_experts = 0
         score_means = []
+        score_metrics = []
         weight_entropies = []
         query_modes = []
         query_fallback_to_random_count = 0
@@ -287,6 +288,9 @@ class Server:
             score_mean = metric.get("score_mean")
             if score_mean is not None:
                 score_means.append(float(score_mean))
+            score_metric = metric.get("score_metric")
+            if score_metric is not None:
+                score_metrics.append(str(score_metric))
             weight_entropy = metric.get("weight_entropy")
             if weight_entropy is not None:
                 weight_entropies.append(float(weight_entropy))
@@ -311,6 +315,11 @@ class Server:
             if query_modes
             else getattr(self.args, "uoc_foga_query_select_mode", "class_balanced_random")
         )
+        score_metric = (
+            score_metrics[0]
+            if score_metrics
+            else getattr(self.args, "uoc_foga_score_metric", "cosine")
+        )
         return {
             "uoc_foga_updated_experts": updated_experts,
             "uoc_foga_fallback_experts": total_experts - updated_experts,
@@ -325,6 +334,7 @@ class Server:
                 if score_means
                 else None
             ),
+            "uoc_foga_score_metric": score_metric,
             "uoc_foga_query_select_mode": query_select_mode,
             "uoc_foga_query_fallback_to_random_count": query_fallback_to_random_count,
             "uoc_foga_query_token_ratio_mean_mean": (
@@ -676,6 +686,7 @@ class Server:
                         "uoc_foga_score_mean_mean",
                     )
                 query_summary_keys = (
+                    "uoc_foga_score_metric",
                     "uoc_foga_query_select_mode",
                     "uoc_foga_query_fallback_to_random_count",
                     "uoc_foga_query_token_ratio_mean_mean",

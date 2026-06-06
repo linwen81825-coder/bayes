@@ -29,25 +29,54 @@ def flatten_float_tensors(tensor_dict, device=None):
     return torch.cat(flattened_tensors, dim=0)
 
 
-def cosine_delta_to_negative_grad(delta_state, grad_state, eps=1e-12, device=None):
+def delta_to_negative_grad_score(
+    delta_state,
+    grad_state,
+    metric="cosine",
+    eps=1e-12,
+    device=None,
+):
+    # cosine 只比较方向；dot 同时受到方向和更新/梯度幅度影响。
     delta_vector = flatten_float_tensors(delta_state, device=device)
     grad_vector = flatten_float_tensors(grad_state, device=device)
     if delta_vector is None or grad_vector is None:
         return None
     if delta_vector.shape != grad_vector.shape:
         return None
+    if delta_vector.numel() == 0 or grad_vector.numel() == 0:
+        return None
     if delta_vector.device != grad_vector.device:
         grad_vector = grad_vector.to(delta_vector.device)
 
     delta_vector = delta_vector.float()
     grad_vector = grad_vector.float()
-    delta_norm = torch.linalg.vector_norm(delta_vector)
-    grad_norm = torch.linalg.vector_norm(grad_vector)
-    if delta_norm.item() <= eps or grad_norm.item() <= eps:
-        return None
+    raw_dot = torch.dot(delta_vector, -grad_vector)
 
-    score = torch.dot(delta_vector, -grad_vector) / (delta_norm * grad_norm)
-    return float(score.item())
+    if metric == "dot":
+        if not torch.isfinite(raw_dot):
+            return None
+        return float(raw_dot.item())
+
+    if metric == "cosine":
+        delta_norm = torch.linalg.vector_norm(delta_vector)
+        grad_norm = torch.linalg.vector_norm(grad_vector)
+        if delta_norm.item() <= eps or grad_norm.item() <= eps:
+            return None
+
+        score = raw_dot / (delta_norm * grad_norm)
+        return float(score.item())
+
+    raise ValueError(f"Unknown UOC-FOGA score metric: {metric!r}")
+
+
+def cosine_delta_to_negative_grad(delta_state, grad_state, eps=1e-12, device=None):
+    return delta_to_negative_grad_score(
+        delta_state,
+        grad_state,
+        metric="cosine",
+        eps=eps,
+        device=device,
+    )
 
 
 def l2_norm_state(tensor_dict, eps=1e-12, device=None):
@@ -728,14 +757,19 @@ def summarize_scores(client_scores):
             "score_min": None,
             "score_max": None,
             "score_pos_frac": None,
+            "score_abs_mean": None,
+            "score_abs_max": None,
             "valid_score_count": 0,
         }
 
+    abs_scores = [abs(score) for score in scores]
     return {
         "score_mean": sum(scores) / len(scores),
         "score_min": min(scores),
         "score_max": max(scores),
         "score_pos_frac": sum(1 for score in scores if score > 0.0) / len(scores),
+        "score_abs_mean": sum(abs_scores) / len(abs_scores),
+        "score_abs_max": max(abs_scores),
         "valid_score_count": len(scores),
     }
 

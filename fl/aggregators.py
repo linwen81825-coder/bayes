@@ -7,7 +7,7 @@ from torch import nn
 from fl.pism import ExpertPISM, build_pism_feature_tensor, normalize_pism_inputs
 from fl.uoc_foga import (
     build_stratified_query_for_expert,
-    cosine_delta_to_negative_grad,
+    delta_to_negative_grad_score,
     expert_weight_entropy,
     extract_expert_delta_state,
     l2_norm_state,
@@ -289,10 +289,19 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             "score_min": None,
             "score_max": None,
             "score_pos_frac": None,
+            "score_abs_mean": None,
+            "score_abs_max": None,
+            "score_metric": self._get_score_metric(),
             "weight_max": None,
             "weight_entropy": None,
             "fallback_reason": fallback_reason,
         }
+
+    def _get_score_metric(self):
+        score_metric = getattr(self.args, "uoc_foga_score_metric", "cosine")
+        if score_metric not in {"cosine", "dot"}:
+            raise ValueError(f"Unknown UOC-FOGA score metric: {score_metric!r}")
+        return score_metric
 
     def _get_query_select_kwargs(self):
         return {
@@ -468,6 +477,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             )
             return metric
 
+        score_metric = metric["score_metric"]
         client_scores = {}
         for client_idx, client_state in enumerate(client_updates):
             delta_state = extract_expert_delta_state(
@@ -476,9 +486,10 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
                 expert_keys,
                 device=device,
             )
-            score = cosine_delta_to_negative_grad(
+            score = delta_to_negative_grad_score(
                 delta_state,
                 grad_state,
+                metric=score_metric,
                 device=device,
             )
             client_scores[client_idx] = score
@@ -827,6 +838,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 grad_fallback,
             )
 
+        score_metric = metric["score_metric"]
         client_scores = {}
         valid_client_ids = []
         scores = []
@@ -840,9 +852,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 expert_keys,
                 device=device,
             )
-            score = cosine_delta_to_negative_grad(
+            score = delta_to_negative_grad_score(
                 delta_state,
                 grad_state,
+                metric=score_metric,
                 device=device,
             )
             client_scores[client_idx] = score
