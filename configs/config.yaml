@@ -133,6 +133,18 @@ uoc_foga:
   # PISM softmax 温度：正数
   uoc_foga_pism_tau: 1.0
 
+  # PISM tau 调度：constant 保持旧行为，source_exp 启用源码风格指数退火
+  uoc_foga_pism_tau_schedule: constant
+
+  # PISM tau 退火初始值：正数
+  uoc_foga_pism_tau_init: 1.0
+
+  # PISM tau 退火下限：正数且不大于 tau_init
+  uoc_foga_pism_tau_min: 1.0
+
+  # PISM tau 指数衰减系数：(0, 1]
+  uoc_foga_pism_tau_decay: 1.0
+
   # 是否标准化 PISM 输入：true / false
   uoc_foga_pism_renorm_inputs: true
 

@@ -489,15 +489,16 @@ class Server:
                 self.logger.info(f"--client_uoc_evidence_counts : {client_uoc_evidence_counts}\n")
 
                 # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
+                round_completed = c_T + 1
                 aggregation_start_time = time.perf_counter()
                 self.aggregation(
                     client_states=client_states if use_in_memory_updates else None,
                     uoc_evidence=round_client_uoc_evidences,
                     client_stats=round_client_stats,
+                    round_index=round_completed,
                 )
                 round_aggregation_seconds = time.perf_counter() - aggregation_start_time
 
-                round_completed = c_T + 1
                 eval_every = max(1, int(getattr(self.args, "eval_every", 1)))
                 should_eval = round_completed % eval_every == 0 or round_completed >= self.server_epochs
                 round_eval_seconds = None
@@ -628,7 +629,7 @@ class Server:
         # sample_weighted 聚合会使用客户端训练样本数作为权重来源。
         return get_client_train_size(self.args, client_id, meta=self.partition_meta)
 
-    def aggregation_by_method(self, client_states=None, uoc_evidence=None, client_stats=None):
+    def aggregation_by_method(self, client_states=None, uoc_evidence=None, client_stats=None, round_index=None):
         # 聚合器接口：
         # - 非专家参数使用 non_expert_agg_method；
         # - 专家参数使用 expert_agg_method。
@@ -663,6 +664,7 @@ class Server:
                 global_model=self.model,
                 uoc_evidence=uoc_evidence,
                 client_stats=client_stats,
+                round_index=round_index,
             )
             self.model.load_state_dict(aggregated_state)
         finally:
@@ -707,6 +709,11 @@ class Server:
                 "uoc_foga_pism_weight_max_mean",
                 "uoc_foga_pism_used_frac",
                 "uoc_foga_pism_update_steps",
+                "uoc_foga_pism_tau_schedule",
+                "uoc_foga_pism_tau",
+                "uoc_foga_pism_tau_init",
+                "uoc_foga_pism_tau_min",
+                "uoc_foga_pism_tau_decay",
             ):
                 self.logger.info(f"--{key} : {pism_summary.get(key)}\n")
         self.logger.info(
@@ -715,9 +722,10 @@ class Server:
         )
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
 
-    def aggregation(self, client_states=None, uoc_evidence=None, client_stats=None):
+    def aggregation(self, client_states=None, uoc_evidence=None, client_stats=None, round_index=None):
         self.aggregation_by_method(
             client_states=client_states,
             uoc_evidence=uoc_evidence,
             client_stats=client_stats,
+            round_index=round_index,
         )

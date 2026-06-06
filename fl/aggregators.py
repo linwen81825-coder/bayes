@@ -604,6 +604,19 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         self.pism_dropout = float(getattr(args, "uoc_foga_pism_dropout", 0.0))
         self.pism_lr = float(getattr(args, "uoc_foga_pism_lr", 1e-3))
         self.pism_tau = float(getattr(args, "uoc_foga_pism_tau", 1.0))
+        self.pism_tau_schedule = str(
+            getattr(args, "uoc_foga_pism_tau_schedule", "constant")
+        ).lower()
+        self.pism_tau_init = float(
+            getattr(args, "uoc_foga_pism_tau_init", self.pism_tau)
+        )
+        self.pism_tau_min = float(
+            getattr(args, "uoc_foga_pism_tau_min", self.pism_tau)
+        )
+        self.pism_tau_decay = float(
+            getattr(args, "uoc_foga_pism_tau_decay", 1.0)
+        )
+        self._validate_pism_tau_schedule()
         self.pism_renorm_inputs = bool(getattr(args, "uoc_foga_pism_renorm_inputs", True))
         self.pism_min_clients = int(getattr(args, "uoc_foga_pism_min_clients", 2))
         self.pism_update_steps = 0
@@ -617,6 +630,63 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             lr=self.pism_lr,
         )
 
+    def _validate_pism_tau_schedule(self):
+        if self.pism_tau_schedule not in {"constant", "source_exp"}:
+            raise ValueError(
+                "uoc_foga_pism_tau_schedule must be 'constant' or 'source_exp'"
+            )
+        if self.pism_tau <= 0.0:
+            raise ValueError("uoc_foga_pism_tau must be > 0")
+        if self.pism_tau_init <= 0.0:
+            raise ValueError("uoc_foga_pism_tau_init must be > 0")
+        if self.pism_tau_min <= 0.0:
+            raise ValueError("uoc_foga_pism_tau_min must be > 0")
+        if self.pism_tau_decay <= 0.0 or self.pism_tau_decay > 1.0:
+            raise ValueError("uoc_foga_pism_tau_decay must be in (0, 1]")
+        if self.pism_tau_min > self.pism_tau_init:
+            raise ValueError("uoc_foga_pism_tau_min must be <= uoc_foga_pism_tau_init")
+
+    def _get_current_pism_tau(self, round_index=None):
+        # tau 越大权重越平滑，tau 越小权重越尖锐；退火表示前期平滑、后期逐渐尖锐。
+        if self.pism_tau_schedule == "constant":
+            return float(self.pism_tau)
+
+        if self.pism_tau_schedule == "source_exp":
+            if round_index is None:
+                round_index = int(self.pism_update_steps) + 1
+            round_index = max(1, int(round_index))
+            exponent = round_index - 1
+            tau = self.pism_tau_init * (self.pism_tau_decay ** exponent)
+            return float(max(self.pism_tau_min, tau))
+
+        raise ValueError(f"Unknown PISM tau schedule: {self.pism_tau_schedule!r}")
+
+    def _get_checkpoint_tau_schedule_config(self, pism_config):
+        saved_tau = float(pism_config.get("tau", self.pism_tau))
+        return {
+            "tau_schedule": str(pism_config.get("tau_schedule", "constant")).lower(),
+            "tau_init": float(pism_config.get("tau_init", saved_tau)),
+            "tau_min": float(pism_config.get("tau_min", saved_tau)),
+            "tau_decay": float(pism_config.get("tau_decay", 1.0)),
+        }
+
+    def _validate_checkpoint_tau_schedule(self, pism_config):
+        saved_config = self._get_checkpoint_tau_schedule_config(pism_config)
+        current_config = {
+            "tau_schedule": self.pism_tau_schedule,
+            "tau_init": self.pism_tau_init,
+            "tau_min": self.pism_tau_min,
+            "tau_decay": self.pism_tau_decay,
+        }
+        mismatch = saved_config["tau_schedule"] != current_config["tau_schedule"]
+        for key in ("tau_init", "tau_min", "tau_decay"):
+            if abs(float(saved_config[key]) - float(current_config[key])) > 1e-12:
+                mismatch = True
+        if mismatch:
+            raise ValueError(
+                "PISM tau schedule mismatch. Please set resume=false when changing tau schedule."
+            )
+
     def get_checkpoint_state(self):
         return {
             "type": "uoc_foga_pism_expert_align",
@@ -629,6 +699,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "dropout": self.pism_dropout,
                 "lr": self.pism_lr,
                 "tau": self.pism_tau,
+                "tau_schedule": self.pism_tau_schedule,
+                "tau_init": self.pism_tau_init,
+                "tau_min": self.pism_tau_min,
+                "tau_decay": self.pism_tau_decay,
                 "renorm_inputs": self.pism_renorm_inputs,
                 "min_clients": self.pism_min_clients,
             },
@@ -642,6 +716,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         if state.get("type") != "uoc_foga_pism_expert_align":
             print("aggregator checkpoint type mismatch")
             return
+
+        pism_config = state.get("pism_config", {})
+        if not isinstance(pism_config, dict):
+            pism_config = {}
+        self._validate_checkpoint_tau_schedule(pism_config)
 
         if "meta_net" in state:
             self.meta_net.load_state_dict(state["meta_net"])
@@ -940,11 +1019,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         record,
         meta_loss_value,
         device,
+        current_tau,
     ):
         metric = record["metric"]
-        tau = self.pism_tau
         with torch.no_grad():
-            weights_tensor = self.meta_net(record["features"], tau=tau)
+            weights_tensor = self.meta_net(record["features"], tau=current_tau)
         if not torch.isfinite(weights_tensor).all():
             self._fallback_expert(
                 aggregated_state,
@@ -1008,6 +1087,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         if len(client_updates) != len(client_weights):
             raise ValueError("client_updates and client_weights must have the same length")
 
+        round_index = kwargs.get("round_index", None)
+        current_tau = self._get_current_pism_tau(round_index=round_index)
+
         self._build_key_cache(client_updates[0].keys())
         global_state = self._get_global_state(client_updates, global_model)
         aggregated_state = {}
@@ -1053,10 +1135,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         meta_loss_value = None
         meta_loss_failed = False
         if per_expert_records:
-            tau = self.pism_tau
             meta_losses = []
             for record in per_expert_records:
-                weights = self.meta_net(record["features"], tau=tau)
+                weights = self.meta_net(record["features"], tau=current_tau)
                 meta_losses.append(-(weights * record["scores"]).sum())
             meta_loss = torch.stack(meta_losses).mean()
             if not torch.isfinite(meta_loss):
@@ -1090,6 +1171,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                     record,
                     meta_loss_value,
                     device,
+                    current_tau,
                 )
 
         # 只汇总轻量 Python 标量，便于 server 日志观察 PISM 趋势。
@@ -1158,6 +1240,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 else 0.0
             ),
             "uoc_foga_pism_update_steps": int(self.pism_update_steps),
+            "uoc_foga_pism_tau_schedule": self.pism_tau_schedule,
+            "uoc_foga_pism_tau": float(current_tau),
+            "uoc_foga_pism_tau_init": float(self.pism_tau_init),
+            "uoc_foga_pism_tau_min": float(self.pism_tau_min),
+            "uoc_foga_pism_tau_decay": float(self.pism_tau_decay),
         }
         self.last_aggregation_metrics = {
             "uoc_foga_stats": uoc_foga_stats,
