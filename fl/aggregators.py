@@ -1125,10 +1125,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 raise ValueError(
                     "grad_dot PISM requires uoc_foga_pism_input_dim: 2"
                 )
-        elif self.score_metric == "cosine":
+        elif self.score_metric in {"cosine", "delta_consensus"}:
             if self.pism_input_dim not in {3, 5}:
                 raise ValueError(
-                    "cosine PISM requires uoc_foga_pism_input_dim: 3 or 5"
+                    f"{self.score_metric} PISM requires uoc_foga_pism_input_dim: 3 or 5"
                 )
         elif self.pism_input_dim != 5:
             raise ValueError(
@@ -1194,12 +1194,12 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "log1p_client_grad_sample_count",
             ]
         feature_names = self._generic_pism_feature_names()
-        if self.score_metric == "cosine" and self.pism_input_dim == 3:
+        if self.score_metric in {"cosine", "delta_consensus"} and self.pism_input_dim == 3:
             return [feature_names[0], feature_names[1], feature_names[3]]
         return feature_names
 
     def _select_pism_features_for_config(self, features):
-        if self.score_metric == "cosine" and self.pism_input_dim == 3:
+        if self.score_metric in {"cosine", "delta_consensus"} and self.pism_input_dim == 3:
             # 3 维保持旧版语义：[client_loss, log1p(usage), log1p(delta_norm)]。
             return features[..., [0, 1, 3]]
         return features
