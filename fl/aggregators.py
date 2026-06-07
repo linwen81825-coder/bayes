@@ -83,6 +83,11 @@ class SplitParameterAggregator(Aggregator):
 
         non_expert_weights = build_client_weights(self.non_expert_method, client_weights)
         expert_weights = build_client_weights(self.expert_method, client_weights)
+        expert_client_weights = {
+            str(client_idx): float(weight)
+            for client_idx, weight in enumerate(expert_weights)
+        }
+        expert_weights_by_layer = {}
 
         aggregated_state = collections.OrderedDict()
         for key in client_updates[0].keys():
@@ -91,6 +96,13 @@ class SplitParameterAggregator(Aggregator):
                 # 非浮点 buffer 通常不能加权平均，沿用第一个客户端的值。
                 aggregated_state[key] = first_value.clone()
                 continue
+
+            parsed_expert_key = parse_expert_parameter_key(key)
+            if parsed_expert_key is not None:
+                layer_id, expert_id = parsed_expert_key
+                expert_weights_by_layer.setdefault(str(layer_id), {})[str(expert_id)] = dict(
+                    expert_client_weights
+                )
 
             if is_expert_parameter(key):
                 normalized_weights = expert_weights
@@ -101,7 +113,14 @@ class SplitParameterAggregator(Aggregator):
             for update, weight in zip(client_updates, normalized_weights):
                 aggregated_state[key] += update[key].detach().cpu() * weight
 
-        self.last_aggregation_metrics = {}
+        self.last_aggregation_metrics = {
+            "expert_aggregation_weights": {
+                "weight_source": self.expert_method,
+                "shared_across_experts": True,
+                "client_weights": expert_client_weights,
+                "by_layer": expert_weights_by_layer,
+            }
+        }
         return aggregated_state
 
 
@@ -294,7 +313,47 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             "score_metric": self._get_score_metric(),
             "weight_max": None,
             "weight_entropy": None,
+            "aggregation_weights": None,
+            "aggregation_weight_source": None,
             "fallback_reason": fallback_reason,
+        }
+
+    def _uniform_weight_dict(self, num_clients):
+        if num_clients <= 0:
+            return {}
+        weight = 1.0 / float(num_clients)
+        return {str(client_idx): float(weight) for client_idx in range(num_clients)}
+
+    def _client_weight_dict(self, weights, num_clients=None):
+        result = {}
+        for client_idx, weight in weights.items():
+            result[str(client_idx)] = float(weight)
+        return result
+
+    def _mark_uniform_fallback_weights(self, metric, client_updates):
+        metric["aggregation_weights"] = self._uniform_weight_dict(len(client_updates))
+        metric["aggregation_weight_source"] = "uniform_fallback"
+
+    def _build_expert_aggregation_weights_summary(self, uoc_foga_stats, weight_source):
+        by_layer = {}
+        for layer_id, layer_stats in uoc_foga_stats.items():
+            if not isinstance(layer_stats, dict):
+                continue
+            layer_weights = {}
+            for expert_id, metric in layer_stats.items():
+                if not isinstance(metric, dict):
+                    continue
+                layer_weights[str(expert_id)] = {
+                    "weights": metric.get("aggregation_weights") or {},
+                    "source": metric.get("aggregation_weight_source"),
+                    "fallback_reason": metric.get("fallback_reason"),
+                }
+            by_layer[str(layer_id)] = layer_weights
+
+        return {
+            "weight_source": weight_source,
+            "shared_across_experts": False,
+            "by_layer": by_layer,
         }
 
     def _get_score_metric(self):
@@ -409,6 +468,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
 
         if no_evidence_fallback_reason is not None:
             metric["fallback_reason"] = no_evidence_fallback_reason
+            self._mark_uniform_fallback_weights(metric, client_updates)
             self._apply_uniform_delta_for_expert(
                 aggregated_state,
                 global_state,
@@ -440,6 +500,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
 
         if query.get("fallback_reason") is not None:
             metric["fallback_reason"] = query["fallback_reason"]
+            self._mark_uniform_fallback_weights(metric, client_updates)
             self._apply_uniform_delta_for_expert(
                 aggregated_state,
                 global_state,
@@ -450,6 +511,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
 
         if global_model is None or not hasattr(global_model, "forward_uoc_from_hidden"):
             metric["fallback_reason"] = "missing_global_model_forward_uoc_from_hidden"
+            self._mark_uniform_fallback_weights(metric, client_updates)
             self._apply_uniform_delta_for_expert(
                 aggregated_state,
                 global_state,
@@ -469,6 +531,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         )
         if grad_fallback is not None:
             metric["fallback_reason"] = grad_fallback
+            self._mark_uniform_fallback_weights(metric, client_updates)
             self._apply_uniform_delta_for_expert(
                 aggregated_state,
                 global_state,
@@ -501,6 +564,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         min_valid_clients = int(getattr(self.args, "uoc_foga_min_valid_clients", 2))
         if valid_clients < min_valid_clients:
             metric["fallback_reason"] = "too_few_valid_clients"
+            self._mark_uniform_fallback_weights(metric, client_updates)
             self._apply_uniform_delta_for_expert(
                 aggregated_state,
                 global_state,
@@ -515,6 +579,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         )
         if score_fallback is not None:
             metric["fallback_reason"] = score_fallback
+            self._mark_uniform_fallback_weights(metric, client_updates)
             self._apply_uniform_delta_for_expert(
                 aggregated_state,
                 global_state,
@@ -532,6 +597,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             device,
         ):
             metric["fallback_reason"] = "missing_client_expert_key"
+            self._mark_uniform_fallback_weights(metric, client_updates)
             self._apply_uniform_delta_for_expert(
                 aggregated_state,
                 global_state,
@@ -542,6 +608,8 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
 
         metric["weight_max"] = max(weights.values()) if weights else None
         metric["weight_entropy"] = expert_weight_entropy(weights)
+        metric["aggregation_weights"] = self._client_weight_dict(weights)
+        metric["aggregation_weight_source"] = "uoc_foga_score"
         metric["fallback_reason"] = None
         return metric
 
@@ -585,7 +653,13 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             )
             layer_stats[str(expert_id)] = metric
 
-        self.last_aggregation_metrics = {"uoc_foga_stats": uoc_foga_stats}
+        self.last_aggregation_metrics = {
+            "uoc_foga_stats": uoc_foga_stats,
+            "expert_aggregation_weights": self._build_expert_aggregation_weights_summary(
+                uoc_foga_stats,
+                weight_source="uoc_foga",
+            ),
+        }
         return collections.OrderedDict(
             (key, aggregated_state[key])
             for key in client_updates[0].keys()
@@ -844,6 +918,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
     def _fallback_expert(self, aggregated_state, global_state, client_updates, expert_keys, metric, reason):
         metric["fallback_reason"] = reason
         metric["pism_fallback_reason"] = reason
+        self._mark_uniform_fallback_weights(metric, client_updates)
         self._apply_uniform_delta_for_expert(
             aggregated_state,
             global_state,
@@ -1097,6 +1172,8 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         weight_max = max(weights.values()) if weights else None
         metric["weight_max"] = weight_max
         metric["weight_entropy"] = weight_entropy
+        metric["aggregation_weights"] = self._client_weight_dict(weights)
+        metric["aggregation_weight_source"] = "pism"
         metric["pism_used"] = True
         metric["pism_meta_loss"] = meta_loss_value
         metric["pism_weight_max"] = weight_max
@@ -1286,6 +1363,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         self.last_aggregation_metrics = {
             "uoc_foga_stats": uoc_foga_stats,
             "uoc_foga_pism_summary": pism_summary,
+            "expert_aggregation_weights": self._build_expert_aggregation_weights_summary(
+                uoc_foga_stats,
+                weight_source="pism",
+            ),
             "uoc_foga_pism_meta_loss_mean": pism_summary["uoc_foga_pism_meta_loss_mean"],
             "uoc_foga_pism_updated_experts": updated_experts,
             "uoc_foga_pism_fallback_experts": fallback_experts,

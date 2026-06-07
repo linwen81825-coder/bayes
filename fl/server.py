@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from types import SimpleNamespace
@@ -671,6 +672,12 @@ class Server:
             if use_uoc_foga and not bool(getattr(self.args, "keep_uoc_model_on_device_until_eval", True)):
                 self.model.to("cpu")
         aggregation_metrics = getattr(self.aggregator, "last_aggregation_metrics", {})
+        expert_aggregation_weights = aggregation_metrics.get("expert_aggregation_weights")
+        if expert_aggregation_weights is not None:
+            self.logger.info(
+                "--expert_aggregation_weights : "
+                f"{json.dumps(expert_aggregation_weights, ensure_ascii=False, sort_keys=True)}\n"
+            )
         uoc_foga_stats = aggregation_metrics.get("uoc_foga_stats")
         pism_summary = aggregation_metrics.get("uoc_foga_pism_summary", None)
         if uoc_foga_stats is not None and bool(getattr(self.args, "uoc_foga_log_detail", False)):
