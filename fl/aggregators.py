@@ -11,8 +11,10 @@ from fl.pism import (
     normalize_pism_inputs,
 )
 from fl.uoc_foga import (
+    average_delta_states,
     build_client_grad_query_for_expert,
     build_stratified_query_for_expert,
+    cosine_delta_to_delta,
     delta_to_negative_grad_score,
     dot_grad_to_grad,
     expert_weight_entropy,
@@ -417,7 +419,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
 
     def _get_score_metric(self):
         score_metric = getattr(self.args, "uoc_foga_score_metric", "cosine")
-        if score_metric not in {"cosine", "dot", "grad_dot"}:
+        if score_metric not in {"cosine", "dot", "grad_dot", "delta_consensus"}:
             raise ValueError(f"Unknown UOC-FOGA score metric: {score_metric!r}")
         return score_metric
 
@@ -456,6 +458,79 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         ):
             if key in query:
                 metric[key] = query[key]
+
+    def _build_delta_consensus_scores(
+        self,
+        client_updates,
+        global_state,
+        expert_keys,
+        device,
+    ):
+        client_scores = {client_idx: None for client_idx in range(len(client_updates))}
+        delta_states = {}
+        for client_idx, client_state in enumerate(client_updates):
+            delta_state = extract_expert_delta_state(
+                client_state,
+                global_state,
+                expert_keys,
+                device=device,
+            )
+            if l2_norm_state(delta_state, device=device) <= 1e-12:
+                continue
+            delta_states[client_idx] = delta_state
+
+        if len(delta_states) < 2:
+            return client_scores, delta_states, [], [], "too_few_delta_clients"
+
+        scores = []
+        ref_client_counts = []
+        delta_items = list(delta_states.items())
+        for client_idx, delta_state in delta_items:
+            ref_states = [
+                other_delta_state
+                for other_client_idx, other_delta_state in delta_items
+                if other_client_idx != client_idx
+            ]
+            ref_delta_state = average_delta_states(ref_states, device=device)
+            if ref_delta_state is None:
+                continue
+            score = cosine_delta_to_delta(
+                delta_state,
+                ref_delta_state,
+                device=device,
+            )
+            if score is None:
+                continue
+            client_scores[client_idx] = float(score)
+            scores.append(float(score))
+            ref_client_counts.append(len(ref_states))
+
+        if not scores:
+            return client_scores, delta_states, scores, ref_client_counts, "no_valid_delta_consensus_scores"
+        return client_scores, delta_states, scores, ref_client_counts, None
+
+    def _add_delta_consensus_metric_stats(self, metric, scores, ref_client_counts):
+        if metric.get("score_metric") != "delta_consensus":
+            return metric
+
+        scores = [float(value) for value in scores if value is not None]
+        ref_client_counts = [
+            float(value) for value in ref_client_counts if value is not None
+        ]
+        metric["delta_consensus_valid_scores"] = len(scores)
+        metric["delta_consensus_positive_frac"] = (
+            sum(1 for value in scores if value > 0.0) / len(scores)
+            if scores
+            else None
+        )
+        metric["delta_consensus_score_mean"] = self._mean_float_values(scores)
+        metric["delta_consensus_score_std"] = self._std_float_values(scores)
+        metric["delta_consensus_score_min"] = min(scores) if scores else None
+        metric["delta_consensus_score_max"] = max(scores) if scores else None
+        metric["delta_consensus_ref_clients_mean"] = self._mean_float_values(
+            ref_client_counts
+        )
+        return metric
 
     def _get_client_grad_query_kwargs(self):
         return {
@@ -690,6 +765,91 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             return None, None, "query_grad_too_small"
         return param_keys, grad_state, None
 
+    def _aggregate_expert_with_delta_consensus(
+        self,
+        aggregated_state,
+        global_state,
+        client_updates,
+        expert_keys,
+        metric,
+        device,
+    ):
+        client_scores, _, scores, ref_client_counts, score_fallback = (
+            self._build_delta_consensus_scores(
+                client_updates=client_updates,
+                global_state=global_state,
+                expert_keys=expert_keys,
+                device=device,
+            )
+        )
+        self._add_delta_consensus_metric_stats(metric, scores, ref_client_counts)
+        if score_fallback is not None:
+            metric["fallback_reason"] = score_fallback
+            self._mark_uniform_fallback_weights(metric, client_updates)
+            self._apply_uniform_delta_for_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+            )
+            return metric
+
+        score_summary = summarize_scores(client_scores)
+        metric.update(score_summary)
+        valid_clients = int(score_summary["valid_score_count"])
+        metric["valid_clients"] = valid_clients
+        min_valid_clients = int(getattr(self.args, "uoc_foga_min_valid_clients", 2))
+        if valid_clients < min_valid_clients:
+            metric["fallback_reason"] = "too_few_valid_clients"
+            self._mark_uniform_fallback_weights(metric, client_updates)
+            self._apply_uniform_delta_for_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+            )
+            return metric
+
+        weights, weight_fallback = positive_score_to_weights(
+            client_scores,
+            mode=getattr(self.args, "uoc_foga_score_mode", "relu"),
+        )
+        if weight_fallback is not None:
+            metric["fallback_reason"] = weight_fallback
+            self._mark_uniform_fallback_weights(metric, client_updates)
+            self._apply_uniform_delta_for_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+            )
+            return metric
+
+        if not self._apply_weighted_delta_for_expert(
+            aggregated_state,
+            global_state,
+            client_updates,
+            expert_keys,
+            weights,
+            device,
+        ):
+            metric["fallback_reason"] = "missing_client_expert_key"
+            self._mark_uniform_fallback_weights(metric, client_updates)
+            self._apply_uniform_delta_for_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+            )
+            return metric
+
+        metric["weight_max"] = max(weights.values()) if weights else None
+        metric["weight_entropy"] = expert_weight_entropy(weights)
+        metric["aggregation_weights"] = self._client_weight_dict(weights)
+        metric["aggregation_weight_source"] = "uoc_foga_score"
+        metric["fallback_reason"] = None
+        return metric
+
     def _aggregate_expert_with_uoc_foga(
         self,
         aggregated_state,
@@ -706,6 +866,16 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
     ):
         num_classes = self._get_num_classes()
         metric = self._make_empty_expert_metric(None)
+
+        if metric["score_metric"] == "delta_consensus":
+            return self._aggregate_expert_with_delta_consensus(
+                aggregated_state=aggregated_state,
+                global_state=global_state,
+                client_updates=client_updates,
+                expert_keys=expert_keys,
+                metric=metric,
+                device=device,
+            )
 
         if no_evidence_fallback_reason is not None:
             metric["fallback_reason"] = no_evidence_fallback_reason
@@ -955,6 +1125,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 raise ValueError(
                     "grad_dot PISM requires uoc_foga_pism_input_dim: 2"
                 )
+        elif self.score_metric == "cosine":
+            if self.pism_input_dim not in {3, 5}:
+                raise ValueError(
+                    "cosine PISM requires uoc_foga_pism_input_dim: 3 or 5"
+                )
         elif self.pism_input_dim != 5:
             raise ValueError(
                 "当前版本非 grad_dot PISM features 是 5 维，需要设置 uoc_foga_pism_input_dim: 5."
@@ -1002,6 +1177,32 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             self.meta_net.parameters(),
             lr=self.pism_lr,
         )
+
+    def _generic_pism_feature_names(self):
+        return [
+            "client_loss",
+            "log1p_expert_usage",
+            "expert_usage_ratio",
+            "log1p_delta_norm",
+            "log1p_delta_norm_per_sqrt_usage",
+        ]
+
+    def _pism_input_names_for_config(self):
+        if self.score_metric == "grad_dot":
+            return [
+                "expert_client_loss",
+                "log1p_client_grad_sample_count",
+            ]
+        feature_names = self._generic_pism_feature_names()
+        if self.score_metric == "cosine" and self.pism_input_dim == 3:
+            return [feature_names[0], feature_names[1], feature_names[3]]
+        return feature_names
+
+    def _select_pism_features_for_config(self, features):
+        if self.score_metric == "cosine" and self.pism_input_dim == 3:
+            # 3 维保持旧版语义：[client_loss, log1p(usage), log1p(delta_norm)]。
+            return features[..., [0, 1, 3]]
+        return features
 
     def _validate_pism_tau_schedule(self):
         if self.pism_tau_schedule not in {"constant", "source_exp"}:
@@ -1135,13 +1336,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "pism_weight_entropy": None,
             "pism_input_mean": None,
             "pism_input_std": None,
-            "pism_input_names": [
-                "client_loss",
-                "log1p_expert_usage",
-                "expert_usage_ratio",
-                "log1p_delta_norm",
-                "log1p_delta_norm_per_sqrt_usage",
-            ],
+            "pism_input_names": self._pism_input_names_for_config(),
             "pism_fallback_reason": None,
         })
         return metric
@@ -1284,6 +1479,129 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         )
         return None
 
+    def _build_delta_consensus_pism_record_for_expert(
+        self,
+        aggregated_state,
+        global_state,
+        client_updates,
+        client_stats,
+        expert_keys,
+        layer_id,
+        expert_id,
+        metric,
+        device,
+    ):
+        client_scores, delta_states, scores_for_stats, ref_client_counts, score_fallback = (
+            self._build_delta_consensus_scores(
+                client_updates=client_updates,
+                global_state=global_state,
+                expert_keys=expert_keys,
+                device=device,
+            )
+        )
+        self._add_delta_consensus_metric_stats(
+            metric,
+            scores_for_stats,
+            ref_client_counts,
+        )
+        if score_fallback is not None:
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                score_fallback,
+            )
+
+        score_summary = summarize_scores(client_scores)
+        metric.update(score_summary)
+        valid_clients = int(score_summary["valid_score_count"])
+        metric["valid_clients"] = valid_clients
+        if valid_clients < 2 or valid_clients < self.pism_min_clients:
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                "too_few_pism_clients",
+            )
+
+        valid_client_ids = []
+        scores = []
+        client_losses = []
+        expert_usages = []
+        total_layer_usages = []
+        delta_norms = []
+        for client_idx, score in client_scores.items():
+            if score is None:
+                continue
+            delta_state = delta_states.get(client_idx)
+            if delta_state is None:
+                continue
+
+            valid_client_ids.append(client_idx)
+            scores.append(float(score))
+            client_stat = client_stats[client_idx] if client_idx < len(client_stats) else {}
+            expert_usage = self._get_expert_usage_from_stats(client_stat, layer_id, expert_id)
+            total_layer_usage = self._get_total_expert_usage_from_stats(client_stat, layer_id)
+            if total_layer_usage < expert_usage:
+                total_layer_usage = expert_usage
+            client_losses.append(self._get_client_loss_from_stats(client_stat))
+            expert_usages.append(expert_usage)
+            total_layer_usages.append(total_layer_usage)
+            delta_norms.append(l2_norm_state(delta_state, device=device))
+
+        if len(valid_client_ids) < 2 or len(valid_client_ids) < self.pism_min_clients:
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                "too_few_pism_clients",
+            )
+
+        features = build_pism_feature_tensor(
+            client_loss=client_losses,
+            expert_usage=expert_usages,
+            delta_norm=delta_norms,
+            total_layer_usage=total_layer_usages,
+            device=device,
+        )
+        features = self._select_pism_features_for_config(features)
+        metric["pism_input_names"] = self._pism_input_names_for_config()
+        if self.pism_renorm_inputs:
+            features = normalize_pism_inputs(features)
+        if not torch.isfinite(features).all():
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                "pism_weights_nan",
+            )
+
+        metric["pism_input_mean"] = [
+            float(value) for value in features.detach().mean(dim=0).cpu().tolist()
+        ]
+        metric["pism_input_std"] = [
+            float(value) for value in features.detach().std(dim=0, unbiased=False).cpu().tolist()
+        ]
+        scores_tensor = torch.tensor(scores, device=device, dtype=torch.float32).detach()
+        record = {
+            "layer_id": str(layer_id),
+            "expert_id": str(expert_id),
+            "expert_keys": expert_keys,
+            "valid_client_ids": valid_client_ids,
+            "features": features,
+            "scores": scores_tensor,
+            "metric": metric,
+        }
+        return metric, record
+
     def _build_pism_record_for_expert(
         self,
         aggregated_state,
@@ -1301,6 +1619,19 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
     ):
         num_classes = self._get_num_classes()
         metric = self._add_pism_metric_defaults(self._make_empty_expert_metric(None))
+
+        if metric["score_metric"] == "delta_consensus":
+            return self._build_delta_consensus_pism_record_for_expert(
+                aggregated_state=aggregated_state,
+                global_state=global_state,
+                client_updates=client_updates,
+                client_stats=client_stats,
+                expert_keys=expert_keys,
+                layer_id=layer_id,
+                expert_id=expert_id,
+                metric=metric,
+                device=device,
+            )
 
         if no_evidence_fallback_reason is not None:
             return metric, self._fallback_expert(
@@ -1492,6 +1823,8 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 total_layer_usage=total_layer_usages,
                 device=device,
             )
+            features = self._select_pism_features_for_config(features)
+            metric["pism_input_names"] = self._pism_input_names_for_config()
         if self.pism_renorm_inputs:
             features = normalize_pism_inputs(features)
         if not torch.isfinite(features).all():

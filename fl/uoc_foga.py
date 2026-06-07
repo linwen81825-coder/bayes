@@ -69,6 +69,106 @@ def delta_to_negative_grad_score(
     raise ValueError(f"Unknown UOC-FOGA score metric: {metric!r}")
 
 
+def average_delta_states(delta_states, device=None):
+    """
+    对多个 expert delta_state 做逐 key uniform 平均。
+
+    只使用所有 delta_state 共同拥有、shape 一致的浮点 Tensor key。
+    """
+    if not isinstance(delta_states, (list, tuple)) or not delta_states:
+        return None
+    if any(not isinstance(delta_state, dict) for delta_state in delta_states):
+        return None
+
+    common_keys = set(delta_states[0].keys())
+    for delta_state in delta_states[1:]:
+        common_keys &= set(delta_state.keys())
+
+    averaged_state = {}
+    for key in sorted(common_keys):
+        tensors = []
+        expected_shape = None
+        valid_key = True
+        for delta_state in delta_states:
+            tensor = delta_state.get(key)
+            if tensor is None or not torch.is_tensor(tensor):
+                valid_key = False
+                break
+            if not torch.is_floating_point(tensor):
+                valid_key = False
+                break
+            tensor = tensor.detach()
+            if device is not None:
+                tensor = tensor.to(device)
+            if expected_shape is None:
+                expected_shape = tuple(tensor.shape)
+            elif tuple(tensor.shape) != expected_shape:
+                valid_key = False
+                break
+            tensors.append(tensor.float())
+
+        if not valid_key or not tensors:
+            continue
+        averaged = torch.stack(tensors, dim=0).mean(dim=0)
+        averaged_state[key] = averaged.detach()
+
+    if not averaged_state:
+        return None
+    return averaged_state
+
+
+def cosine_delta_to_delta(delta_state, ref_delta_state, eps=1e-12, device=None):
+    """
+    计算当前 expert delta 与参考 delta 的 cosine 相似度。
+    """
+    if not isinstance(delta_state, dict) or not isinstance(ref_delta_state, dict):
+        return None
+
+    delta_chunks = []
+    ref_chunks = []
+    common_keys = set(delta_state.keys()) & set(ref_delta_state.keys())
+    for key in sorted(common_keys):
+        delta_tensor = delta_state.get(key)
+        ref_tensor = ref_delta_state.get(key)
+        if delta_tensor is None or ref_tensor is None:
+            continue
+        if not torch.is_tensor(delta_tensor) or not torch.is_tensor(ref_tensor):
+            continue
+        if not torch.is_floating_point(delta_tensor) or not torch.is_floating_point(ref_tensor):
+            continue
+
+        delta_vec = delta_tensor.detach()
+        ref_vec = ref_tensor.detach()
+        if device is not None:
+            delta_vec = delta_vec.to(device)
+            ref_vec = ref_vec.to(device)
+        delta_vec = delta_vec.reshape(-1)
+        ref_vec = ref_vec.reshape(-1)
+        if delta_vec.shape != ref_vec.shape:
+            continue
+
+        delta_chunks.append(delta_vec.float())
+        ref_chunks.append(ref_vec.float())
+
+    if not delta_chunks:
+        return None
+
+    delta_vec = torch.cat(delta_chunks, dim=0)
+    ref_vec = torch.cat(ref_chunks, dim=0)
+    if delta_vec.numel() == 0 or ref_vec.numel() == 0:
+        return None
+
+    delta_norm = torch.linalg.vector_norm(delta_vec)
+    ref_norm = torch.linalg.vector_norm(ref_vec)
+    if delta_norm.item() <= eps or ref_norm.item() <= eps:
+        return None
+
+    score = torch.dot(delta_vec, ref_vec) / (delta_norm * ref_norm)
+    if not torch.isfinite(score):
+        return None
+    return float(score.item())
+
+
 def dot_grad_to_grad(query_grad_state, client_grad_state, device=None):
     """
     计算源码风格 FOGA 梯度内积分数：

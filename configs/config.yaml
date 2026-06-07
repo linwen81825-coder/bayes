@@ -97,7 +97,7 @@ uoc_foga:
   # score 转权重方式：relu（当前仅支持 relu）
   uoc_foga_score_mode: relu
 
-  # score 计算度量：cosine 保持旧行为，dot 使用内积，grad_dot 使用源码风格梯度内积
+  # score 计算度量：cosine 保持旧行为，dot 使用内积，grad_dot 使用源码风格梯度内积，delta_consensus 使用 leave-one-out delta 共识方向
   uoc_foga_score_metric: grad_dot
 
   # 最少有效客户端数：正整数
@@ -127,7 +127,7 @@ uoc_foga:
   uoc_foga_client_grad_max_samples_per_client_per_class: 8
   uoc_foga_client_grad_fallback_to_random: true
 
-  # grad_dot PISM 输入：
+  # grad_dot PISM 输入：2/3/5
   # [
   #   expert_client_loss,
   #   log1p(client_grad_sample_count)

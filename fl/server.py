@@ -289,6 +289,12 @@ class Server:
         grad_dot_client_set_size_max_values = []
         cos_delta_neg_gclient_items = []
         cos_delta_neg_gclient_positive_count_estimates = []
+        delta_consensus_valid_score_counts = []
+        delta_consensus_positive_count_estimates = []
+        delta_consensus_score_items = []
+        delta_consensus_score_min_values = []
+        delta_consensus_score_max_values = []
+        delta_consensus_ref_client_items = []
 
         for metric in expert_metrics:
             fallback_reason = metric.get("fallback_reason")
@@ -366,6 +372,35 @@ class Server:
                         float(cos_positive_frac) * grad_dot_valid_count
                     )
 
+            delta_consensus_valid_count = metric.get("delta_consensus_valid_scores")
+            if delta_consensus_valid_count is not None:
+                delta_consensus_valid_count = int(delta_consensus_valid_count)
+                delta_consensus_valid_score_counts.append(delta_consensus_valid_count)
+                delta_positive_frac = metric.get("delta_consensus_positive_frac")
+                if delta_positive_frac is not None and delta_consensus_valid_count > 0:
+                    delta_consensus_positive_count_estimates.append(
+                        float(delta_positive_frac) * delta_consensus_valid_count
+                    )
+                delta_score_mean = metric.get("delta_consensus_score_mean")
+                if delta_score_mean is not None and delta_consensus_valid_count > 0:
+                    delta_consensus_score_items.append((
+                        float(delta_score_mean),
+                        float(metric.get("delta_consensus_score_std") or 0.0),
+                        delta_consensus_valid_count,
+                    ))
+                delta_score_min = metric.get("delta_consensus_score_min")
+                if delta_score_min is not None:
+                    delta_consensus_score_min_values.append(float(delta_score_min))
+                delta_score_max = metric.get("delta_consensus_score_max")
+                if delta_score_max is not None:
+                    delta_consensus_score_max_values.append(float(delta_score_max))
+                ref_clients_mean = metric.get("delta_consensus_ref_clients_mean")
+                if ref_clients_mean is not None and delta_consensus_valid_count > 0:
+                    delta_consensus_ref_client_items.append((
+                        float(ref_clients_mean),
+                        delta_consensus_valid_count,
+                    ))
+
         query_select_mode = (
             query_modes[0]
             if query_modes
@@ -409,6 +444,31 @@ class Server:
                     mean_value * count
                     for mean_value, count in cos_delta_neg_gclient_items
                 ) / cos_weight_total
+
+        total_delta_consensus_valid_scores = sum(delta_consensus_valid_score_counts)
+        delta_consensus_score_mean = None
+        delta_consensus_score_std = None
+        if delta_consensus_score_items:
+            delta_weight_total = sum(item[2] for item in delta_consensus_score_items)
+            if delta_weight_total > 0:
+                delta_consensus_score_mean = sum(
+                    mean_value * count
+                    for mean_value, _, count in delta_consensus_score_items
+                ) / delta_weight_total
+                delta_consensus_variance = sum(
+                    count * (std_value ** 2 + (mean_value - delta_consensus_score_mean) ** 2)
+                    for mean_value, std_value, count in delta_consensus_score_items
+                ) / delta_weight_total
+                delta_consensus_score_std = float(delta_consensus_variance ** 0.5)
+
+        delta_consensus_ref_clients_mean = None
+        if delta_consensus_ref_client_items:
+            ref_weight_total = sum(count for _, count in delta_consensus_ref_client_items)
+            if ref_weight_total > 0:
+                delta_consensus_ref_clients_mean = sum(
+                    mean_value * count
+                    for mean_value, count in delta_consensus_ref_client_items
+                ) / ref_weight_total
 
         return {
             "uoc_foga_updated_experts": updated_experts,
@@ -469,6 +529,25 @@ class Server:
                 if total_grad_dot_valid_scores > 0 and cos_delta_neg_gclient_positive_count_estimates
                 else None
             ),
+            "delta_consensus_valid_scores": total_delta_consensus_valid_scores,
+            "delta_consensus_positive_frac": (
+                sum(delta_consensus_positive_count_estimates) / total_delta_consensus_valid_scores
+                if total_delta_consensus_valid_scores > 0 and delta_consensus_positive_count_estimates
+                else None
+            ),
+            "delta_consensus_score_mean": delta_consensus_score_mean,
+            "delta_consensus_score_std": delta_consensus_score_std,
+            "delta_consensus_score_min": (
+                min(delta_consensus_score_min_values)
+                if delta_consensus_score_min_values
+                else None
+            ),
+            "delta_consensus_score_max": (
+                max(delta_consensus_score_max_values)
+                if delta_consensus_score_max_values
+                else None
+            ),
+            "delta_consensus_ref_clients_mean": delta_consensus_ref_clients_mean,
         }
 
     def train(self):
@@ -833,7 +912,23 @@ class Server:
                         "cos_delta_neg_gclient_mean",
                         "cos_delta_neg_gclient_positive_frac",
                     )
-                for key in base_summary_keys + query_summary_keys + grad_dot_summary_keys:
+                delta_consensus_summary_keys = ()
+                if uoc_summary.get("uoc_foga_score_metric") == "delta_consensus":
+                    delta_consensus_summary_keys = (
+                        "delta_consensus_valid_scores",
+                        "delta_consensus_positive_frac",
+                        "delta_consensus_score_mean",
+                        "delta_consensus_score_std",
+                        "delta_consensus_score_min",
+                        "delta_consensus_score_max",
+                        "delta_consensus_ref_clients_mean",
+                    )
+                for key in (
+                    base_summary_keys
+                    + query_summary_keys
+                    + grad_dot_summary_keys
+                    + delta_consensus_summary_keys
+                ):
                     self.logger.info(f"--{key} : {uoc_summary.get(key)}\n")
 
         if pism_summary is not None:
