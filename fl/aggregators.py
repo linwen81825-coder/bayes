@@ -141,6 +141,58 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         self._non_expert_keys = None
         self._cached_key_signature = None
         self.uoc_criterion = nn.CrossEntropyLoss()
+        global_query_per_class = int(getattr(args, "uoc_foga_query_per_class", 4))
+        global_min_query_samples = int(
+            getattr(args, "uoc_foga_min_query_samples_per_expert", 16)
+        )
+        global_max_samples_per_client_per_class = int(
+            getattr(args, "uoc_foga_max_samples_per_client_per_class", 0)
+        )
+        self.uoc_foga_client_grad_query_per_class = int(getattr(
+            args,
+            "uoc_foga_client_grad_query_per_class",
+            global_query_per_class,
+        ))
+        self.uoc_foga_client_grad_min_samples_per_expert = int(getattr(
+            args,
+            "uoc_foga_client_grad_min_samples_per_expert",
+            max(1, global_min_query_samples // 2),
+        ))
+        self.uoc_foga_client_grad_min_classes_per_expert = int(getattr(
+            args,
+            "uoc_foga_client_grad_min_classes_per_expert",
+            1,
+        ))
+        self.uoc_foga_client_grad_min_expert_token_ratio = float(getattr(
+            args,
+            "uoc_foga_client_grad_min_expert_token_ratio",
+            0.0,
+        ))
+        self.uoc_foga_client_grad_max_samples_per_client_per_class = int(getattr(
+            args,
+            "uoc_foga_client_grad_max_samples_per_client_per_class",
+            global_max_samples_per_client_per_class,
+        ))
+        self.uoc_foga_client_grad_fallback_to_random = bool(getattr(
+            args,
+            "uoc_foga_client_grad_fallback_to_random",
+            True,
+        ))
+        self._validate_client_grad_query_config()
+
+    def _validate_client_grad_query_config(self):
+        if self.uoc_foga_client_grad_query_per_class < 1:
+            raise ValueError("uoc_foga_client_grad_query_per_class must be >= 1")
+        if self.uoc_foga_client_grad_min_samples_per_expert < 1:
+            raise ValueError("uoc_foga_client_grad_min_samples_per_expert must be >= 1")
+        if self.uoc_foga_client_grad_min_classes_per_expert < 1:
+            raise ValueError("uoc_foga_client_grad_min_classes_per_expert must be >= 1")
+        if self.uoc_foga_client_grad_min_expert_token_ratio < 0.0:
+            raise ValueError("uoc_foga_client_grad_min_expert_token_ratio must be >= 0")
+        if self.uoc_foga_client_grad_max_samples_per_client_per_class < 0:
+            raise ValueError(
+                "uoc_foga_client_grad_max_samples_per_client_per_class must be >= 0"
+            )
 
     def _get_num_classes(self):
         num_classes = getattr(self.args, "num_classes", None)
@@ -407,27 +459,19 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
 
     def _get_client_grad_query_kwargs(self):
         return {
-            "query_per_class": getattr(self.args, "uoc_foga_query_per_class", 4),
-            "min_query_samples": getattr(
-                self.args,
-                "uoc_foga_min_query_samples_per_expert",
-                16,
-            ),
-            "min_classes": getattr(self.args, "uoc_foga_min_classes_per_expert", 2),
+            "query_per_class": self.uoc_foga_client_grad_query_per_class,
+            "min_query_samples": self.uoc_foga_client_grad_min_samples_per_expert,
+            "min_classes": self.uoc_foga_client_grad_min_classes_per_expert,
             "query_select_mode": getattr(
                 self.args,
                 "uoc_foga_query_select_mode",
                 "class_balanced_random",
             ),
-            "min_expert_token_ratio": float(
-                getattr(self.args, "uoc_foga_min_expert_token_ratio", 0.0)
+            "min_expert_token_ratio": self.uoc_foga_client_grad_min_expert_token_ratio,
+            "max_samples_per_client_per_class": (
+                self.uoc_foga_client_grad_max_samples_per_client_per_class
             ),
-            "max_samples_per_client_per_class": int(
-                getattr(self.args, "uoc_foga_max_samples_per_client_per_class", 0)
-            ),
-            "fallback_to_random": bool(
-                getattr(self.args, "uoc_foga_query_fallback_to_random", True)
-            ),
+            "fallback_to_random": self.uoc_foga_client_grad_fallback_to_random,
         }
 
     def _get_client_evidence_for_index(self, uoc_evidences, client_idx):
@@ -1731,6 +1775,24 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "uoc_foga_pism_tau_init": float(self.pism_tau_init),
             "uoc_foga_pism_tau_min": float(self.pism_tau_min),
             "uoc_foga_pism_tau_decay": float(self.pism_tau_decay),
+            "uoc_foga_client_grad_query_per_class": int(
+                self.uoc_foga_client_grad_query_per_class
+            ),
+            "uoc_foga_client_grad_min_samples_per_expert": int(
+                self.uoc_foga_client_grad_min_samples_per_expert
+            ),
+            "uoc_foga_client_grad_min_classes_per_expert": int(
+                self.uoc_foga_client_grad_min_classes_per_expert
+            ),
+            "uoc_foga_client_grad_min_expert_token_ratio": float(
+                self.uoc_foga_client_grad_min_expert_token_ratio
+            ),
+            "uoc_foga_client_grad_max_samples_per_client_per_class": int(
+                self.uoc_foga_client_grad_max_samples_per_client_per_class
+            ),
+            "uoc_foga_client_grad_fallback_to_random": bool(
+                self.uoc_foga_client_grad_fallback_to_random
+            ),
         }
         self.last_aggregation_metrics = {
             "uoc_foga_stats": uoc_foga_stats,

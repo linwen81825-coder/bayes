@@ -76,14 +76,14 @@ uoc_foga:
   uoc_foga_enabled: true
 
   # 每客户端采样数：正整数
-  uoc_foga_samples_per_client: 16
+  uoc_foga_samples_per_client: 128
 
-  # 每类 query 样本上限：正整数
-  uoc_foga_query_per_class: 2
+  # 全局 query set 每类 query 样本上限：正整数
+  uoc_foga_query_per_class: 4
 
-  # 每 expert 最少 query 样本/类别数：正整数
-  uoc_foga_min_query_samples_per_expert: 2
-  uoc_foga_min_classes_per_expert: 1
+  # 全局 query set 每 expert 最少 query 样本/类别数：正整数
+  uoc_foga_min_query_samples_per_expert: 8
+  uoc_foga_min_classes_per_expert: 2
 
   # 用 top1 路由构造 query：true（当前仅支持 true）
   uoc_foga_use_top1: true
@@ -98,10 +98,10 @@ uoc_foga:
   uoc_foga_score_mode: relu
 
   # score 计算度量：cosine 保持旧行为，dot 使用内积，grad_dot 使用源码风格梯度内积
-  uoc_foga_score_metric: cosine
+  uoc_foga_score_metric: grad_dot
 
   # 最少有效客户端数：正整数
-  uoc_foga_min_valid_clients: 1
+  uoc_foga_min_valid_clients: 2
 
   # 是否打印完整 per-expert UOC 详情：true / false
   uoc_foga_log_detail: false
@@ -118,6 +118,15 @@ uoc_foga:
   # 增强筛选后 query 不足时是否回退到旧随机 class-balanced
   uoc_foga_query_fallback_to_random: true
 
+  # grad_dot 的 client-grad set 单独采样参数。
+  # 这些参数只影响 g_client 的 D_client,i,l,e 构造，不影响全局 query set。
+  uoc_foga_client_grad_query_per_class: 8
+  uoc_foga_client_grad_min_samples_per_expert: 4
+  uoc_foga_client_grad_min_classes_per_expert: 1
+  uoc_foga_client_grad_min_expert_token_ratio: 0.0
+  uoc_foga_client_grad_max_samples_per_client_per_class: 8
+  uoc_foga_client_grad_fallback_to_random: true
+
   # grad_dot PISM 输入：
   # [
   #   expert_client_loss,
@@ -132,10 +141,10 @@ uoc_foga:
   uoc_foga_pism_dropout: 0.0
 
   # PISM 学习率：正数
-  uoc_foga_pism_lr: 0.003
+  uoc_foga_pism_lr: 0.001
 
   # PISM softmax 温度：正数
-  uoc_foga_pism_tau: 1.0
+  uoc_foga_pism_tau: 2.0
 
   # PISM tau 调度：constant 保持旧行为，source_exp 启用源码风格指数退火
   uoc_foga_pism_tau_schedule: constant
@@ -156,7 +165,7 @@ uoc_foga:
   uoc_foga_pism_renorm_inputs: true
 
   # PISM 最少有效客户端数：正整数
-  uoc_foga_pism_min_clients: 1
+  uoc_foga_pism_min_clients: 2
 
 
 # ============================================================

@@ -855,6 +855,12 @@ class Server:
                 "uoc_foga_pism_tau_init",
                 "uoc_foga_pism_tau_min",
                 "uoc_foga_pism_tau_decay",
+                "uoc_foga_client_grad_query_per_class",
+                "uoc_foga_client_grad_min_samples_per_expert",
+                "uoc_foga_client_grad_min_classes_per_expert",
+                "uoc_foga_client_grad_min_expert_token_ratio",
+                "uoc_foga_client_grad_max_samples_per_client_per_class",
+                "uoc_foga_client_grad_fallback_to_random",
             ):
                 self.logger.info(f"--{key} : {pism_summary.get(key)}\n")
         self.logger.info(
