@@ -6,8 +6,10 @@ from torch import nn
 
 from fl.pism import ExpertPISM, build_pism_feature_tensor, normalize_pism_inputs
 from fl.uoc_foga import (
+    build_client_grad_query_for_expert,
     build_stratified_query_for_expert,
     delta_to_negative_grad_score,
+    dot_grad_to_grad,
     expert_weight_entropy,
     extract_expert_delta_state,
     l2_norm_state,
@@ -358,7 +360,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
 
     def _get_score_metric(self):
         score_metric = getattr(self.args, "uoc_foga_score_metric", "cosine")
-        if score_metric not in {"cosine", "dot"}:
+        if score_metric not in {"cosine", "dot", "grad_dot"}:
             raise ValueError(f"Unknown UOC-FOGA score metric: {score_metric!r}")
         return score_metric
 
@@ -397,6 +399,196 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         ):
             if key in query:
                 metric[key] = query[key]
+
+    def _get_client_grad_query_kwargs(self):
+        return {
+            "query_per_class": getattr(self.args, "uoc_foga_query_per_class", 4),
+            "min_query_samples": getattr(
+                self.args,
+                "uoc_foga_min_query_samples_per_expert",
+                16,
+            ),
+            "min_classes": getattr(self.args, "uoc_foga_min_classes_per_expert", 2),
+            "query_select_mode": getattr(
+                self.args,
+                "uoc_foga_query_select_mode",
+                "class_balanced_random",
+            ),
+            "min_expert_token_ratio": float(
+                getattr(self.args, "uoc_foga_min_expert_token_ratio", 0.0)
+            ),
+            "max_samples_per_client_per_class": int(
+                getattr(self.args, "uoc_foga_max_samples_per_client_per_class", 0)
+            ),
+            "fallback_to_random": bool(
+                getattr(self.args, "uoc_foga_query_fallback_to_random", True)
+            ),
+        }
+
+    def _get_client_evidence_for_index(self, uoc_evidences, client_idx):
+        if not isinstance(uoc_evidences, (list, tuple)):
+            return None
+        if client_idx < 0 or client_idx >= len(uoc_evidences):
+            return None
+        return uoc_evidences[client_idx]
+
+    def _compute_client_expert_grad_state(
+        self,
+        global_model,
+        client_query,
+        layer_id,
+        expert_id,
+        expert_param_keys,
+        expert_params,
+        device,
+    ):
+        if global_model is None or not isinstance(client_query, dict):
+            return None
+        hidden = client_query.get("hidden")
+        labels = client_query.get("labels")
+        if hidden is None or labels is None:
+            return None
+        if not torch.is_tensor(hidden) or not torch.is_tensor(labels):
+            return None
+        if hidden.dim() == 0 or labels.dim() == 0 or hidden.size(0) == 0:
+            return None
+        if not expert_param_keys or not expert_params:
+            return None
+
+        hidden = hidden.to(device)
+        labels = labels.to(device).long()
+        residual = client_query.get("residual")
+        if residual is not None:
+            if not torch.is_tensor(residual):
+                residual = None
+            else:
+                residual = residual.to(device)
+        sample_count = int(client_query.get("sample_count", labels.size(0)))
+        if sample_count <= 0:
+            return None
+
+        try:
+            output = global_model.forward_uoc_from_hidden(
+                hidden=hidden,
+                residual=residual,
+                layer_id=layer_id,
+                force_expert_id=expert_id,
+                gate_mode=getattr(self.args, "uoc_foga_gate_mode", "one"),
+            )
+            loss = self.uoc_criterion(output["logits"], labels)
+            if not torch.isfinite(loss):
+                return None
+            grads = torch.autograd.grad(
+                loss,
+                expert_params,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            return None
+
+        client_grad_state = {
+            key: grad.detach()
+            for key, grad in zip(expert_param_keys, grads)
+            if grad is not None
+        }
+        if not client_grad_state:
+            return None
+        return float(loss.detach().cpu().item()), client_grad_state, sample_count
+
+    def _compute_client_grad_dot_score(
+        self,
+        global_model,
+        uoc_evidences,
+        client_idx,
+        delta_state,
+        query_grad_state,
+        layer_id,
+        expert_id,
+        expert_param_keys,
+        expert_params,
+        device,
+    ):
+        client_evidence = self._get_client_evidence_for_index(uoc_evidences, client_idx)
+        if client_evidence is None:
+            return None, None, None
+
+        client_query = build_client_grad_query_for_expert(
+            client_evidence=client_evidence,
+            layer_id=layer_id,
+            expert_id=expert_id,
+            **self._get_client_grad_query_kwargs(),
+        )
+        if client_query is None:
+            return None, None, None
+
+        result = self._compute_client_expert_grad_state(
+            global_model=global_model,
+            client_query=client_query,
+            layer_id=layer_id,
+            expert_id=expert_id,
+            expert_param_keys=expert_param_keys,
+            expert_params=expert_params,
+            device=device,
+        )
+        if result is None:
+            return None, None, None
+
+        _, client_grad_state, sample_count = result
+        score = dot_grad_to_grad(query_grad_state, client_grad_state, device=device)
+        if score is None:
+            return None, None, None
+        cos_delta_neg_gclient = delta_to_negative_grad_score(
+            delta_state,
+            client_grad_state,
+            metric="cosine",
+            device=device,
+        )
+        return score, sample_count, cos_delta_neg_gclient
+
+    def _mean_float_values(self, values):
+        values = [float(value) for value in values if value is not None]
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    def _std_float_values(self, values):
+        values = [float(value) for value in values if value is not None]
+        if not values:
+            return None
+        mean_value = sum(values) / len(values)
+        variance = sum((value - mean_value) ** 2 for value in values) / len(values)
+        return float(variance ** 0.5)
+
+    def _add_grad_dot_metric_stats(self, metric, scores, client_set_sizes, cos_delta_values):
+        if metric.get("score_metric") != "grad_dot":
+            return metric
+
+        scores = [float(value) for value in scores if value is not None]
+        client_set_sizes = [float(value) for value in client_set_sizes if value is not None]
+        cos_delta_values = [float(value) for value in cos_delta_values if value is not None]
+
+        metric["grad_dot_valid_scores"] = len(scores)
+        metric["grad_dot_positive_frac"] = (
+            sum(1 for value in scores if value > 0.0) / len(scores)
+            if scores
+            else None
+        )
+        metric["grad_dot_score_mean"] = self._mean_float_values(scores)
+        metric["grad_dot_score_std"] = self._std_float_values(scores)
+        metric["grad_dot_score_min"] = min(scores) if scores else None
+        metric["grad_dot_score_max"] = max(scores) if scores else None
+        metric["grad_dot_client_set_size_mean"] = self._mean_float_values(client_set_sizes)
+        metric["grad_dot_client_set_size_min"] = min(client_set_sizes) if client_set_sizes else None
+        metric["grad_dot_client_set_size_max"] = max(client_set_sizes) if client_set_sizes else None
+        metric["cos_delta_neg_gclient_mean"] = self._mean_float_values(cos_delta_values)
+        metric["cos_delta_neg_gclient_positive_frac"] = (
+            sum(1 for value in cos_delta_values if value > 0.0) / len(cos_delta_values)
+            if cos_delta_values
+            else None
+        )
+        return metric
 
     def _build_expert_params_and_grads(
         self,
@@ -520,7 +712,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             )
             return metric
 
-        _, grad_state, grad_fallback = self._build_expert_params_and_grads(
+        param_keys, grad_state, grad_fallback = self._build_expert_params_and_grads(
             global_model=global_model,
             expert_keys=expert_keys,
             query=query,
@@ -541,7 +733,16 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             return metric
 
         score_metric = metric["score_metric"]
+        expert_params = None
+        if score_metric == "grad_dot":
+            if named_parameters is None:
+                named_parameters = dict(global_model.named_parameters())
+            expert_params = [named_parameters[key] for key in param_keys]
+
         client_scores = {}
+        grad_dot_scores = []
+        grad_dot_client_set_sizes = []
+        cos_delta_neg_gclient_values = []
         for client_idx, client_state in enumerate(client_updates):
             delta_state = extract_expert_delta_state(
                 client_state,
@@ -549,14 +750,39 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
                 expert_keys,
                 device=device,
             )
-            score = delta_to_negative_grad_score(
-                delta_state,
-                grad_state,
-                metric=score_metric,
-                device=device,
-            )
+            if score_metric == "grad_dot":
+                score, client_set_size, cos_delta_neg_gclient = self._compute_client_grad_dot_score(
+                    global_model=global_model,
+                    uoc_evidences=uoc_evidences,
+                    client_idx=client_idx,
+                    delta_state=delta_state,
+                    query_grad_state=grad_state,
+                    layer_id=layer_id,
+                    expert_id=expert_id,
+                    expert_param_keys=param_keys,
+                    expert_params=expert_params,
+                    device=device,
+                )
+                if score is not None:
+                    grad_dot_scores.append(float(score))
+                    grad_dot_client_set_sizes.append(client_set_size)
+                    if cos_delta_neg_gclient is not None:
+                        cos_delta_neg_gclient_values.append(float(cos_delta_neg_gclient))
+            else:
+                score = delta_to_negative_grad_score(
+                    delta_state,
+                    grad_state,
+                    metric=score_metric,
+                    device=device,
+                )
             client_scores[client_idx] = score
 
+        self._add_grad_dot_metric_stats(
+            metric,
+            grad_dot_scores,
+            grad_dot_client_set_sizes,
+            cos_delta_neg_gclient_values,
+        )
         score_summary = summarize_scores(client_scores)
         metric.update(score_summary)
         valid_clients = int(score_summary["valid_score_count"])
@@ -1072,7 +1298,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "missing_global_model_forward_uoc_from_hidden",
             )
 
-        _, grad_state, grad_fallback = self._build_expert_params_and_grads(
+        param_keys, grad_state, grad_fallback = self._build_expert_params_and_grads(
             global_model=global_model,
             expert_keys=expert_keys,
             query=query,
@@ -1092,7 +1318,16 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             )
 
         score_metric = metric["score_metric"]
+        expert_params = None
+        if score_metric == "grad_dot":
+            if named_parameters is None:
+                named_parameters = dict(global_model.named_parameters())
+            expert_params = [named_parameters[key] for key in param_keys]
+
         client_scores = {}
+        grad_dot_scores = []
+        grad_dot_client_set_sizes = []
+        cos_delta_neg_gclient_values = []
         valid_client_ids = []
         scores = []
         client_losses = []
@@ -1106,12 +1341,31 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 expert_keys,
                 device=device,
             )
-            score = delta_to_negative_grad_score(
-                delta_state,
-                grad_state,
-                metric=score_metric,
-                device=device,
-            )
+            if score_metric == "grad_dot":
+                score, client_set_size, cos_delta_neg_gclient = self._compute_client_grad_dot_score(
+                    global_model=global_model,
+                    uoc_evidences=uoc_evidences,
+                    client_idx=client_idx,
+                    delta_state=delta_state,
+                    query_grad_state=grad_state,
+                    layer_id=layer_id,
+                    expert_id=expert_id,
+                    expert_param_keys=param_keys,
+                    expert_params=expert_params,
+                    device=device,
+                )
+                if score is not None:
+                    grad_dot_scores.append(float(score))
+                    grad_dot_client_set_sizes.append(client_set_size)
+                    if cos_delta_neg_gclient is not None:
+                        cos_delta_neg_gclient_values.append(float(cos_delta_neg_gclient))
+            else:
+                score = delta_to_negative_grad_score(
+                    delta_state,
+                    grad_state,
+                    metric=score_metric,
+                    device=device,
+                )
             client_scores[client_idx] = score
             if score is None:
                 continue
@@ -1128,6 +1382,12 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             total_layer_usages.append(total_layer_usage)
             delta_norms.append(l2_norm_state(delta_state, device=device))
 
+        self._add_grad_dot_metric_stats(
+            metric,
+            grad_dot_scores,
+            grad_dot_client_set_sizes,
+            cos_delta_neg_gclient_values,
+        )
         score_summary = summarize_scores(client_scores)
         metric.update(score_summary)
         valid_clients = int(score_summary["valid_score_count"])

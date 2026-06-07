@@ -279,6 +279,16 @@ class Server:
         query_token_ratio_means = []
         query_entropy_means = []
         query_pool_after_ratio_filter_sizes = []
+        grad_dot_valid_score_counts = []
+        grad_dot_positive_count_estimates = []
+        grad_dot_score_items = []
+        grad_dot_score_min_values = []
+        grad_dot_score_max_values = []
+        grad_dot_client_set_size_items = []
+        grad_dot_client_set_size_min_values = []
+        grad_dot_client_set_size_max_values = []
+        cos_delta_neg_gclient_items = []
+        cos_delta_neg_gclient_positive_count_estimates = []
 
         for metric in expert_metrics:
             fallback_reason = metric.get("fallback_reason")
@@ -311,6 +321,51 @@ class Server:
             if pool_after_ratio_filter_size is not None:
                 query_pool_after_ratio_filter_sizes.append(float(pool_after_ratio_filter_size))
 
+            grad_dot_valid_count = metric.get("grad_dot_valid_scores")
+            if grad_dot_valid_count is not None:
+                grad_dot_valid_count = int(grad_dot_valid_count)
+                grad_dot_valid_score_counts.append(grad_dot_valid_count)
+                grad_dot_positive_frac = metric.get("grad_dot_positive_frac")
+                if grad_dot_positive_frac is not None and grad_dot_valid_count > 0:
+                    grad_dot_positive_count_estimates.append(
+                        float(grad_dot_positive_frac) * grad_dot_valid_count
+                    )
+                grad_dot_score_mean = metric.get("grad_dot_score_mean")
+                if grad_dot_score_mean is not None and grad_dot_valid_count > 0:
+                    grad_dot_score_items.append((
+                        float(grad_dot_score_mean),
+                        float(metric.get("grad_dot_score_std") or 0.0),
+                        grad_dot_valid_count,
+                    ))
+                grad_dot_score_min = metric.get("grad_dot_score_min")
+                if grad_dot_score_min is not None:
+                    grad_dot_score_min_values.append(float(grad_dot_score_min))
+                grad_dot_score_max = metric.get("grad_dot_score_max")
+                if grad_dot_score_max is not None:
+                    grad_dot_score_max_values.append(float(grad_dot_score_max))
+
+                client_set_size_mean = metric.get("grad_dot_client_set_size_mean")
+                if client_set_size_mean is not None and grad_dot_valid_count > 0:
+                    grad_dot_client_set_size_items.append((
+                        float(client_set_size_mean),
+                        grad_dot_valid_count,
+                    ))
+                client_set_size_min = metric.get("grad_dot_client_set_size_min")
+                if client_set_size_min is not None:
+                    grad_dot_client_set_size_min_values.append(float(client_set_size_min))
+                client_set_size_max = metric.get("grad_dot_client_set_size_max")
+                if client_set_size_max is not None:
+                    grad_dot_client_set_size_max_values.append(float(client_set_size_max))
+
+                cos_mean = metric.get("cos_delta_neg_gclient_mean")
+                if cos_mean is not None and grad_dot_valid_count > 0:
+                    cos_delta_neg_gclient_items.append((float(cos_mean), grad_dot_valid_count))
+                cos_positive_frac = metric.get("cos_delta_neg_gclient_positive_frac")
+                if cos_positive_frac is not None and grad_dot_valid_count > 0:
+                    cos_delta_neg_gclient_positive_count_estimates.append(
+                        float(cos_positive_frac) * grad_dot_valid_count
+                    )
+
         query_select_mode = (
             query_modes[0]
             if query_modes
@@ -321,6 +376,40 @@ class Server:
             if score_metrics
             else getattr(self.args, "uoc_foga_score_metric", "cosine")
         )
+        total_grad_dot_valid_scores = sum(grad_dot_valid_score_counts)
+        grad_dot_score_mean = None
+        grad_dot_score_std = None
+        if grad_dot_score_items:
+            score_weight_total = sum(item[2] for item in grad_dot_score_items)
+            if score_weight_total > 0:
+                grad_dot_score_mean = sum(
+                    mean_value * count
+                    for mean_value, _, count in grad_dot_score_items
+                ) / score_weight_total
+                grad_dot_variance = sum(
+                    count * (std_value ** 2 + (mean_value - grad_dot_score_mean) ** 2)
+                    for mean_value, std_value, count in grad_dot_score_items
+                ) / score_weight_total
+                grad_dot_score_std = float(grad_dot_variance ** 0.5)
+
+        grad_dot_client_set_size_mean = None
+        if grad_dot_client_set_size_items:
+            set_size_weight_total = sum(count for _, count in grad_dot_client_set_size_items)
+            if set_size_weight_total > 0:
+                grad_dot_client_set_size_mean = sum(
+                    mean_value * count
+                    for mean_value, count in grad_dot_client_set_size_items
+                ) / set_size_weight_total
+
+        cos_delta_neg_gclient_mean = None
+        if cos_delta_neg_gclient_items:
+            cos_weight_total = sum(count for _, count in cos_delta_neg_gclient_items)
+            if cos_weight_total > 0:
+                cos_delta_neg_gclient_mean = sum(
+                    mean_value * count
+                    for mean_value, count in cos_delta_neg_gclient_items
+                ) / cos_weight_total
+
         return {
             "uoc_foga_updated_experts": updated_experts,
             "uoc_foga_fallback_experts": total_experts - updated_experts,
@@ -351,6 +440,33 @@ class Server:
             "uoc_foga_query_pool_after_ratio_filter_mean": (
                 sum(query_pool_after_ratio_filter_sizes) / len(query_pool_after_ratio_filter_sizes)
                 if query_pool_after_ratio_filter_sizes
+                else None
+            ),
+            "grad_dot_valid_scores": total_grad_dot_valid_scores,
+            "grad_dot_positive_frac": (
+                sum(grad_dot_positive_count_estimates) / total_grad_dot_valid_scores
+                if total_grad_dot_valid_scores > 0 and grad_dot_positive_count_estimates
+                else None
+            ),
+            "grad_dot_score_mean": grad_dot_score_mean,
+            "grad_dot_score_std": grad_dot_score_std,
+            "grad_dot_score_min": min(grad_dot_score_min_values) if grad_dot_score_min_values else None,
+            "grad_dot_score_max": max(grad_dot_score_max_values) if grad_dot_score_max_values else None,
+            "grad_dot_client_set_size_mean": grad_dot_client_set_size_mean,
+            "grad_dot_client_set_size_min": (
+                min(grad_dot_client_set_size_min_values)
+                if grad_dot_client_set_size_min_values
+                else None
+            ),
+            "grad_dot_client_set_size_max": (
+                max(grad_dot_client_set_size_max_values)
+                if grad_dot_client_set_size_max_values
+                else None
+            ),
+            "cos_delta_neg_gclient_mean": cos_delta_neg_gclient_mean,
+            "cos_delta_neg_gclient_positive_frac": (
+                sum(cos_delta_neg_gclient_positive_count_estimates) / total_grad_dot_valid_scores
+                if total_grad_dot_valid_scores > 0 and cos_delta_neg_gclient_positive_count_estimates
                 else None
             ),
         }
@@ -702,7 +818,22 @@ class Server:
                     "uoc_foga_query_entropy_mean_mean",
                     "uoc_foga_query_pool_after_ratio_filter_mean",
                 )
-                for key in base_summary_keys + query_summary_keys:
+                grad_dot_summary_keys = ()
+                if uoc_summary.get("uoc_foga_score_metric") == "grad_dot":
+                    grad_dot_summary_keys = (
+                        "grad_dot_valid_scores",
+                        "grad_dot_positive_frac",
+                        "grad_dot_score_mean",
+                        "grad_dot_score_std",
+                        "grad_dot_score_min",
+                        "grad_dot_score_max",
+                        "grad_dot_client_set_size_mean",
+                        "grad_dot_client_set_size_min",
+                        "grad_dot_client_set_size_max",
+                        "cos_delta_neg_gclient_mean",
+                        "cos_delta_neg_gclient_positive_frac",
+                    )
+                for key in base_summary_keys + query_summary_keys + grad_dot_summary_keys:
                     self.logger.info(f"--{key} : {uoc_summary.get(key)}\n")
 
         if pism_summary is not None:

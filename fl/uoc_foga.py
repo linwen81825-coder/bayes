@@ -69,6 +69,57 @@ def delta_to_negative_grad_score(
     raise ValueError(f"Unknown UOC-FOGA score metric: {metric!r}")
 
 
+def dot_grad_to_grad(query_grad_state, client_grad_state, device=None):
+    """
+    计算源码风格 FOGA 梯度内积分数：
+        score = <g_query, g_client>
+
+    注意：
+    - 不加负号。
+    - query_grad_state 和 client_grad_state 都是 dict。
+    - 只使用两个 dict 共同拥有的参数 key。
+    - 按 key 排序后 flatten 拼接。
+    - 如果没有有效 tensor，返回 None。
+    - 返回 Python float。
+    """
+    if not isinstance(query_grad_state, dict) or not isinstance(client_grad_state, dict):
+        return None
+
+    query_chunks = []
+    client_chunks = []
+    common_keys = set(query_grad_state.keys()) & set(client_grad_state.keys())
+    for key in sorted(common_keys):
+        query_tensor = query_grad_state.get(key)
+        client_tensor = client_grad_state.get(key)
+        if query_tensor is None or client_tensor is None:
+            continue
+        if not torch.is_tensor(query_tensor) or not torch.is_tensor(client_tensor):
+            continue
+
+        query_vec = query_tensor.detach()
+        client_vec = client_tensor.detach()
+        if device is not None:
+            query_vec = query_vec.to(device)
+            client_vec = client_vec.to(device)
+        query_vec = query_vec.reshape(-1)
+        client_vec = client_vec.reshape(-1)
+        if query_vec.shape != client_vec.shape:
+            continue
+
+        query_chunks.append(query_vec.float())
+        client_chunks.append(client_vec.float())
+
+    if not query_chunks:
+        return None
+
+    query_vec = torch.cat(query_chunks, dim=0)
+    client_vec = torch.cat(client_chunks, dim=0)
+    score = torch.dot(query_vec, client_vec)
+    if not torch.isfinite(score):
+        return None
+    return float(score.item())
+
+
 def cosine_delta_to_negative_grad(delta_state, grad_state, eps=1e-12, device=None):
     return delta_to_negative_grad_score(
         delta_state,
@@ -545,6 +596,116 @@ def _build_expert_ratio_entropy_query_from_pool(
         },
         stats,
     )
+
+
+def build_client_grad_query_for_expert(
+    client_evidence,
+    layer_id,
+    expert_id,
+    query_per_class,
+    min_query_samples,
+    min_classes,
+    query_select_mode=None,
+    min_expert_token_ratio=0.0,
+    max_samples_per_client_per_class=0,
+    fallback_to_random=True,
+):
+    """
+    从单个 client 的 UOC evidence 中，为某个 layer/expert 构造 D_client,i,l,e。
+    这个 set 后续用于计算：
+        g_client,i,l,e = ∇ CE(D_client,i,l,e; θ_global)
+
+    第一版允许 D_client 和全局 D_query 有重叠，不处理 sample_id 排除。
+    """
+    layer_evidence = _get_layer_evidence(client_evidence, layer_id)
+    if not isinstance(layer_evidence, dict):
+        return None
+
+    client_id = 0
+    if isinstance(client_evidence, dict) and "client_id" in client_evidence:
+        client_id = client_evidence["client_id"]
+    if "client_id" in layer_evidence:
+        client_id = layer_evidence["client_id"]
+
+    selected = _select_expert_samples(layer_evidence, expert_id, client_id=client_id)
+    if selected is None:
+        return None
+
+    pool_hidden = selected["hidden"]
+    pool_labels = selected["labels"].long()
+    pool_gates = selected["gates"]
+    pool_residual = selected["residual"]
+    if pool_hidden is None or pool_labels is None or pool_hidden.size(0) == 0:
+        return None
+
+    query_per_class = int(query_per_class)
+    min_query_samples = int(min_query_samples)
+    min_classes = int(min_classes)
+    max_samples_per_client_per_class = int(max_samples_per_client_per_class)
+    if query_per_class <= 0:
+        return None
+
+    inferred_num_classes = int(pool_labels.max().item()) + 1 if pool_labels.numel() > 0 else 0
+    num_classes = max(inferred_num_classes, min_classes, 1)
+    select_mode = query_select_mode or "class_balanced_random"
+    effective_query_per_class = query_per_class
+    if max_samples_per_client_per_class > 0:
+        effective_query_per_class = min(
+            effective_query_per_class,
+            max_samples_per_client_per_class,
+        )
+
+    if select_mode == "class_balanced_random":
+        result = _build_random_class_balanced_query_from_pool(
+            pool_hidden=pool_hidden,
+            pool_labels=pool_labels,
+            pool_gates=pool_gates,
+            pool_residual=pool_residual,
+            num_classes=num_classes,
+            query_per_class=effective_query_per_class,
+            min_query_samples=min_query_samples,
+            min_query_classes=min_classes,
+            seed=None,
+        )
+    elif select_mode == "expert_ratio_entropy":
+        result = _build_expert_ratio_entropy_query_from_pool(
+            pool_hidden=pool_hidden,
+            pool_labels=pool_labels,
+            pool_gates=pool_gates,
+            pool_residual=pool_residual,
+            pool_client_ids=selected["client_ids"],
+            pool_entropy=selected["entropy"],
+            pool_expert_token_ratio=selected["expert_token_ratio"],
+            pool_expert_token_count=selected["expert_token_count"],
+            num_classes=num_classes,
+            query_per_class=effective_query_per_class,
+            min_query_samples=min_query_samples,
+            min_query_classes=min_classes,
+            min_expert_token_ratio=min_expert_token_ratio,
+            max_samples_per_client_per_class=max_samples_per_client_per_class,
+            fallback_to_random=bool(fallback_to_random),
+            seed=None,
+        )
+    else:
+        raise ValueError(f"Unknown client grad query select mode: {select_mode!r}")
+
+    hidden = result.get("hidden")
+    labels = result.get("labels")
+    if hidden is None or labels is None or hidden.size(0) == 0:
+        return None
+
+    sample_count = int(labels.size(0))
+    num_selected_classes = int(torch.unique(labels.long()).numel())
+    if sample_count < min_query_samples or num_selected_classes < min_classes:
+        return None
+
+    return {
+        "hidden": hidden,
+        "residual": result.get("residual"),
+        "labels": labels.long(),
+        "sample_count": sample_count,
+        "num_classes": num_selected_classes,
+    }
 
 
 def build_stratified_query_for_expert(

@@ -166,7 +166,7 @@ data:
   data_path: ./data
 
   # DataLoader 每个 batch 的样本数
-  batch_size: 32
+  batch_size: 64
 
   # 每个客户端至少分到的样本数
   min_datasize: 32
