@@ -144,3 +144,48 @@ def build_pism_feature_tensor(
         ],
         dim=-1,
     )
+
+
+def build_grad_dot_pism_feature_tensor(
+    expert_client_loss,
+    client_grad_sample_count,
+    device=None,
+    dtype=None,
+):
+    """
+    构造 grad_dot 版本的 PISM 输入：
+    [
+      expert_client_loss_i,l,e,
+      log1p(client_grad_sample_count_i,l,e)
+    ]
+
+    注意：
+    - FOGA score 不作为 PISM 输入。
+    - score 只作为 meta loss 的监督信号。
+    """
+    if dtype is None:
+        dtype = torch.float32
+
+    expert_client_loss = torch.as_tensor(
+        expert_client_loss,
+        device=device,
+        dtype=dtype,
+    ).reshape(-1)
+    client_grad_sample_count = torch.as_tensor(
+        client_grad_sample_count,
+        device=device,
+        dtype=dtype,
+    ).reshape(-1)
+    if expert_client_loss.numel() != client_grad_sample_count.numel():
+        raise ValueError(
+            "expert_client_loss and client_grad_sample_count must have the same length"
+        )
+
+    client_grad_sample_count = client_grad_sample_count.clamp_min(0)
+    return torch.stack(
+        [
+            expert_client_loss,
+            torch.log1p(client_grad_sample_count),
+        ],
+        dim=-1,
+    )

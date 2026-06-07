@@ -4,7 +4,12 @@ from abc import ABC, abstractmethod
 import torch
 from torch import nn
 
-from fl.pism import ExpertPISM, build_pism_feature_tensor, normalize_pism_inputs
+from fl.pism import (
+    ExpertPISM,
+    build_grad_dot_pism_feature_tensor,
+    build_pism_feature_tensor,
+    normalize_pism_inputs,
+)
 from fl.uoc_foga import (
     build_client_grad_query_for_expert,
     build_stratified_query_for_expert,
@@ -512,7 +517,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
     ):
         client_evidence = self._get_client_evidence_for_index(uoc_evidences, client_idx)
         if client_evidence is None:
-            return None, None, None
+            return None, None, None, None
 
         client_query = build_client_grad_query_for_expert(
             client_evidence=client_evidence,
@@ -521,7 +526,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             **self._get_client_grad_query_kwargs(),
         )
         if client_query is None:
-            return None, None, None
+            return None, None, None, None
 
         result = self._compute_client_expert_grad_state(
             global_model=global_model,
@@ -533,19 +538,19 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             device=device,
         )
         if result is None:
-            return None, None, None
+            return None, None, None, None
 
-        _, client_grad_state, sample_count = result
+        expert_client_loss, client_grad_state, sample_count = result
         score = dot_grad_to_grad(query_grad_state, client_grad_state, device=device)
         if score is None:
-            return None, None, None
+            return None, None, None, None
         cos_delta_neg_gclient = delta_to_negative_grad_score(
             delta_state,
             client_grad_state,
             metric="cosine",
             device=device,
         )
-        return score, sample_count, cos_delta_neg_gclient
+        return score, expert_client_loss, sample_count, cos_delta_neg_gclient
 
     def _mean_float_values(self, values):
         values = [float(value) for value in values if value is not None]
@@ -751,7 +756,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
                 device=device,
             )
             if score_metric == "grad_dot":
-                score, client_set_size, cos_delta_neg_gclient = self._compute_client_grad_dot_score(
+                score, _, client_set_size, cos_delta_neg_gclient = self._compute_client_grad_dot_score(
                     global_model=global_model,
                     uoc_evidences=uoc_evidences,
                     client_idx=client_idx,
@@ -899,10 +904,16 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             args=args,
             non_expert_method=args.non_expert_agg_method,
         )
+        self.score_metric = self._get_score_metric()
         self.pism_input_dim = int(getattr(args, "uoc_foga_pism_input_dim", 5))
-        if self.pism_input_dim != 5:
+        if self.score_metric == "grad_dot":
+            if self.pism_input_dim != 2:
+                raise ValueError(
+                    "grad_dot PISM requires uoc_foga_pism_input_dim: 2"
+                )
+        elif self.pism_input_dim != 5:
             raise ValueError(
-                "当前版本 PISM features 是 5 维，需要设置 uoc_foga_pism_input_dim: 5."
+                "当前版本非 grad_dot PISM features 是 5 维，需要设置 uoc_foga_pism_input_dim: 5."
             )
         self.pism_hidden_size = int(getattr(args, "uoc_foga_pism_hidden_size", 64))
         self.pism_dropout = float(getattr(args, "uoc_foga_pism_dropout", 0.0))
@@ -1334,6 +1345,8 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         expert_usages = []
         total_layer_usages = []
         delta_norms = []
+        expert_client_losses = []
+        client_grad_sample_counts = []
         for client_idx, client_state in enumerate(client_updates):
             delta_state = extract_expert_delta_state(
                 client_state,
@@ -1342,7 +1355,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 device=device,
             )
             if score_metric == "grad_dot":
-                score, client_set_size, cos_delta_neg_gclient = self._compute_client_grad_dot_score(
+                score, expert_client_loss, client_set_size, cos_delta_neg_gclient = self._compute_client_grad_dot_score(
                     global_model=global_model,
                     uoc_evidences=uoc_evidences,
                     client_idx=client_idx,
@@ -1381,6 +1394,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             expert_usages.append(expert_usage)
             total_layer_usages.append(total_layer_usage)
             delta_norms.append(l2_norm_state(delta_state, device=device))
+            if score_metric == "grad_dot":
+                expert_client_losses.append(expert_client_loss)
+                client_grad_sample_counts.append(client_set_size)
 
         self._add_grad_dot_metric_stats(
             metric,
@@ -1413,13 +1429,25 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "too_few_pism_clients",
             )
 
-        features = build_pism_feature_tensor(
-            client_loss=client_losses,
-            expert_usage=expert_usages,
-            delta_norm=delta_norms,
-            total_layer_usage=total_layer_usages,
-            device=device,
-        )
+        if score_metric == "grad_dot":
+            # grad_dot 的 score 由梯度内积监督；PISM 输入只使用 client 级 loss 和样本数。
+            features = build_grad_dot_pism_feature_tensor(
+                expert_client_loss=expert_client_losses,
+                client_grad_sample_count=client_grad_sample_counts,
+                device=device,
+            )
+            metric["pism_input_names"] = [
+                "expert_client_loss",
+                "log1p_client_grad_sample_count",
+            ]
+        else:
+            features = build_pism_feature_tensor(
+                client_loss=client_losses,
+                expert_usage=expert_usages,
+                delta_norm=delta_norms,
+                total_layer_usage=total_layer_usages,
+                device=device,
+            )
         if self.pism_renorm_inputs:
             features = normalize_pism_inputs(features)
         if not torch.isfinite(features).all():
@@ -1448,6 +1476,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "scores": scores_tensor,
             "metric": metric,
         }
+        if score_metric == "grad_dot":
+            record["expert_client_losses"] = expert_client_losses
+            record["client_grad_sample_counts"] = client_grad_sample_counts
         return metric, record
 
     def _apply_pism_weights_for_record(

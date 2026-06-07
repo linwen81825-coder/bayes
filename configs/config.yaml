@@ -97,7 +97,7 @@ uoc_foga:
   # score 转权重方式：relu（当前仅支持 relu）
   uoc_foga_score_mode: relu
 
-  # score 计算度量：cosine 保持旧行为，dot 使用内积
+  # score 计算度量：cosine 保持旧行为，dot 使用内积，grad_dot 使用源码风格梯度内积
   uoc_foga_score_metric: cosine
 
   # 最少有效客户端数：正整数
@@ -118,8 +118,12 @@ uoc_foga:
   # 增强筛选后 query 不足时是否回退到旧随机 class-balanced
   uoc_foga_query_fallback_to_random: true
 
-  # PISM 输入维度：当前固定为 5
-  uoc_foga_pism_input_dim: 5
+  # grad_dot PISM 输入：
+  # [
+  #   expert_client_loss,
+  #   log1p(client_grad_sample_count)
+  # ]
+  uoc_foga_pism_input_dim: 2
 
   # PISM 隐层宽度：正整数
   uoc_foga_pism_hidden_size: 64
