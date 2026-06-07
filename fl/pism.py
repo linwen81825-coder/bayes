@@ -4,7 +4,7 @@ from torch import nn
 
 class ExpertPISM(nn.Module):
     # PISM/DeepSets 元网络：根据每个 client-expert 的状态特征生成聚合权重。
-    def __init__(self, input_dim: int = 3, hidden_size: int = 64, dropout: float = 0.0, eps: float = 1e-12):
+    def __init__(self, input_dim: int = 5, hidden_size: int = 64, dropout: float = 0.0, eps: float = 1e-12):
         super(ExpertPISM, self).__init__()
         self.input_dim = input_dim
         self.hidden_size = hidden_size
@@ -93,19 +93,54 @@ def normalize_pism_inputs(x, eps=1e-6):
     return (x - mean) / (std + eps)
 
 
-def build_pism_feature_tensor(client_loss, expert_usage, delta_norm, device=None, dtype=None):
-    # s_i,l,e 是后续 meta loss 的监督信号，不是 PISM 输入特征。
+def build_pism_feature_tensor(
+    client_loss,
+    expert_usage,
+    delta_norm,
+    total_layer_usage=None,
+    device=None,
+    dtype=None,
+):
+    # s_i,l,e / FOGA score 仍然只用于 meta loss 监督，不作为 PISM 输入特征。
     if dtype is None:
         dtype = torch.float32
 
     client_loss = torch.as_tensor(client_loss, device=device, dtype=dtype).reshape(-1)
     expert_usage = torch.as_tensor(expert_usage, device=device, dtype=dtype).reshape(-1)
     delta_norm = torch.as_tensor(delta_norm, device=device, dtype=dtype).reshape(-1)
+    if total_layer_usage is None:
+        total_layer_usage = expert_usage.clone()
+    else:
+        total_layer_usage = torch.as_tensor(
+            total_layer_usage,
+            device=device,
+            dtype=dtype,
+        ).reshape(-1)
     if not (
-        client_loss.numel() == expert_usage.numel() == delta_norm.numel()
+        client_loss.numel()
+        == expert_usage.numel()
+        == delta_norm.numel()
+        == total_layer_usage.numel()
     ):
-        raise ValueError("client_loss, expert_usage, and delta_norm must have the same length")
+        raise ValueError(
+            "client_loss, expert_usage, delta_norm, and total_layer_usage must have the same length"
+        )
 
-    expert_usage = torch.log1p(expert_usage.clamp_min(0))
-    delta_norm = torch.log1p(delta_norm.clamp_min(0))
-    return torch.stack([client_loss, expert_usage, delta_norm], dim=-1)
+    eps = 1e-12
+    expert_usage = expert_usage.clamp_min(0)
+    delta_norm = delta_norm.clamp_min(0)
+    total_layer_usage = total_layer_usage.clamp_min(0)
+    total_for_ratio = torch.maximum(total_layer_usage, expert_usage).clamp_min(eps)
+    expert_usage_ratio = expert_usage / total_for_ratio
+    delta_norm_per_sqrt_usage = delta_norm / torch.sqrt(expert_usage + 1.0)
+
+    return torch.stack(
+        [
+            client_loss,
+            torch.log1p(expert_usage),
+            expert_usage_ratio,
+            torch.log1p(delta_norm),
+            torch.log1p(delta_norm_per_sqrt_usage.clamp_min(0)),
+        ],
+        dim=-1,
+    )

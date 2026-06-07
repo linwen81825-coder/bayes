@@ -673,7 +673,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             args=args,
             non_expert_method=args.non_expert_agg_method,
         )
-        self.pism_input_dim = int(getattr(args, "uoc_foga_pism_input_dim", 3))
+        self.pism_input_dim = int(getattr(args, "uoc_foga_pism_input_dim", 5))
+        if self.pism_input_dim != 5:
+            raise ValueError(
+                "当前版本 PISM features 是 5 维，需要设置 uoc_foga_pism_input_dim: 5."
+            )
         self.pism_hidden_size = int(getattr(args, "uoc_foga_pism_hidden_size", 64))
         self.pism_dropout = float(getattr(args, "uoc_foga_pism_dropout", 0.0))
         self.pism_lr = float(getattr(args, "uoc_foga_pism_lr", 1e-3))
@@ -749,6 +753,15 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
 
         raise ValueError(f"Unknown PISM tau schedule: {self.pism_tau_schedule!r}")
 
+    def _validate_checkpoint_input_dim(self, pism_config):
+        saved_input_dim = pism_config.get("input_dim")
+        if saved_input_dim is None:
+            return
+        if int(saved_input_dim) != self.pism_input_dim:
+            raise ValueError(
+                "PISM input_dim mismatch. Old checkpoint is incompatible after changing PISM features. Please set resume=false or use a new run_name."
+            )
+
     def _get_checkpoint_tau_schedule_config(self, pism_config):
         saved_tau = float(pism_config.get("tau", self.pism_tau))
         return {
@@ -816,6 +829,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         pism_config = state.get("pism_config", {})
         if not isinstance(pism_config, dict):
             pism_config = {}
+        self._validate_checkpoint_input_dim(pism_config)
         self._validate_checkpoint_tau_schedule(pism_config)
         self._validate_checkpoint_meta_steps(pism_config)
 
@@ -840,6 +854,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "pism_weight_entropy": None,
             "pism_input_mean": None,
             "pism_input_std": None,
+            "pism_input_names": [
+                "client_loss",
+                "log1p_expert_usage",
+                "expert_usage_ratio",
+                "log1p_delta_norm",
+                "log1p_delta_norm_per_sqrt_usage",
+            ],
             "pism_fallback_reason": None,
         })
         return metric
@@ -893,6 +914,61 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         )
         if indexed_value is not None:
             return indexed_value
+        return 0.0
+
+    def _sum_expert_usage_value(self, value):
+        try:
+            if value is None:
+                return 0.0
+            if torch.is_tensor(value):
+                if value.numel() == 0:
+                    return 0.0
+                return float(value.detach().cpu().float().sum().item())
+            if isinstance(value, dict):
+                total = 0.0
+                for item in value.values():
+                    total += self._sum_expert_usage_value(item)
+                return float(total)
+            if isinstance(value, (list, tuple)):
+                total = 0.0
+                for item in value:
+                    total += self._sum_expert_usage_value(item)
+                return float(total)
+            return float(value)
+        except (TypeError, ValueError, RuntimeError):
+            return 0.0
+
+    def _get_total_expert_usage_from_stats(self, client_stat, layer_id):
+        if not isinstance(client_stat, dict):
+            return 0.0
+
+        try:
+            layer_key = str(layer_id)
+            try:
+                layer_index = int(layer_id)
+            except (TypeError, ValueError):
+                layer_index = None
+
+            activations_by_layer = client_stat.get("expert_activations_by_layer")
+            if isinstance(activations_by_layer, dict):
+                value = activations_by_layer.get(layer_key)
+                if value is None and layer_index is not None:
+                    value = activations_by_layer.get(layer_index)
+                if value is not None:
+                    return self._sum_expert_usage_value(value)
+
+            stats_by_layer = client_stat.get("expert_stats_by_layer")
+            if isinstance(stats_by_layer, dict):
+                layer_stats = stats_by_layer.get(layer_key)
+                if layer_stats is None and layer_index is not None:
+                    layer_stats = stats_by_layer.get(layer_index)
+                if isinstance(layer_stats, dict) and "expert_activations" in layer_stats:
+                    return self._sum_expert_usage_value(layer_stats.get("expert_activations"))
+
+            if "expert_activations" in client_stat:
+                return self._sum_expert_usage_value(client_stat.get("expert_activations"))
+        except (TypeError, ValueError, RuntimeError):
+            return 0.0
         return 0.0
 
     def _get_client_loss_from_stats(self, client_stat):
@@ -1021,6 +1097,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         scores = []
         client_losses = []
         expert_usages = []
+        total_layer_usages = []
         delta_norms = []
         for client_idx, client_state in enumerate(client_updates):
             delta_state = extract_expert_delta_state(
@@ -1042,10 +1119,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             valid_client_ids.append(client_idx)
             scores.append(float(score))
             client_stat = client_stats[client_idx] if client_idx < len(client_stats) else {}
+            expert_usage = self._get_expert_usage_from_stats(client_stat, layer_id, expert_id)
+            total_layer_usage = self._get_total_expert_usage_from_stats(client_stat, layer_id)
+            if total_layer_usage < expert_usage:
+                total_layer_usage = expert_usage
             client_losses.append(self._get_client_loss_from_stats(client_stat))
-            expert_usages.append(
-                self._get_expert_usage_from_stats(client_stat, layer_id, expert_id)
-            )
+            expert_usages.append(expert_usage)
+            total_layer_usages.append(total_layer_usage)
             delta_norms.append(l2_norm_state(delta_state, device=device))
 
         score_summary = summarize_scores(client_scores)
@@ -1077,6 +1157,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             client_loss=client_losses,
             expert_usage=expert_usages,
             delta_norm=delta_norms,
+            total_layer_usage=total_layer_usages,
             device=device,
         )
         if self.pism_renorm_inputs:

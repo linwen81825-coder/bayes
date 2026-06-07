@@ -118,8 +118,8 @@ uoc_foga:
   # 增强筛选后 query 不足时是否回退到旧随机 class-balanced
   uoc_foga_query_fallback_to_random: true
 
-  # PISM 输入维度：当前固定为 3
-  uoc_foga_pism_input_dim: 3
+  # PISM 输入维度：当前固定为 5
+  uoc_foga_pism_input_dim: 5
 
   # PISM 隐层宽度：正整数
   uoc_foga_pism_hidden_size: 64
