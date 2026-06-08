@@ -933,6 +933,16 @@ class Server:
 
         if pism_summary is not None:
             # PISM summary 只打印轻量标量/字典，不输出 per-expert 大对象。
+            self.logger.info(
+                "[UOC-FOGA-PISM-DIAG] "
+                f"score_std_mean={pism_summary.get('uoc_foga_pism_score_std_mean')} "
+                f"score_pos_frac_mean={pism_summary.get('uoc_foga_pism_score_pos_frac_mean')} "
+                f"weight_score_corr_mean={pism_summary.get('uoc_foga_pism_weight_score_corr_mean')} "
+                f"weight_score_corr_valid_frac={pism_summary.get('uoc_foga_pism_weight_score_corr_valid_frac')} "
+                f"pism_top_score_rank_mean={pism_summary.get('uoc_foga_pism_pism_top_score_rank_mean')} "
+                f"pism_top_score_value_mean={pism_summary.get('uoc_foga_pism_pism_top_score_value_mean')} "
+                f"foga_top_pism_weight_mean={pism_summary.get('uoc_foga_pism_foga_top_pism_weight_mean')}\n"
+            )
             for key in (
                 "uoc_foga_pism_meta_loss_mean",
                 "uoc_foga_pism_updated_experts",

@@ -1111,6 +1111,135 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         )
 
 
+
+def _to_flat_float_list(values):
+    if values is None:
+        return []
+    if isinstance(values, torch.Tensor):
+        return [
+            float(value)
+            for value in values.detach().reshape(-1).float().cpu().tolist()
+        ]
+    if isinstance(values, (list, tuple)):
+        result = []
+        for value in values:
+            if isinstance(value, torch.Tensor):
+                result.extend(_to_flat_float_list(value))
+                continue
+            try:
+                result.append(float(value))
+            except (TypeError, ValueError):
+                result.append(float("nan"))
+        return result
+    try:
+        return [float(values)]
+    except (TypeError, ValueError):
+        return []
+
+
+def _is_finite_float(value):
+    try:
+        return bool(torch.isfinite(torch.tensor(float(value))).item())
+    except (TypeError, ValueError):
+        return False
+
+
+def _safe_numeric_values(values):
+    return [
+        value
+        for value in _to_flat_float_list(values)
+        if _is_finite_float(value)
+    ]
+
+
+def _safe_mean(values):
+    values = _safe_numeric_values(values)
+    if not values:
+        return float("nan")
+    return float(sum(values) / len(values))
+
+
+def _safe_std(values):
+    values = _safe_numeric_values(values)
+    if len(values) < 2:
+        return float("nan")
+    tensor = torch.tensor(values, dtype=torch.float64)
+    centered = tensor - tensor.mean()
+    return float(torch.sqrt(torch.mean(centered * centered)).item())
+
+
+def _safe_pearson(x, y):
+    x_values = _to_flat_float_list(x)
+    y_values = _to_flat_float_list(y)
+    pairs = [
+        (x_value, y_value)
+        for x_value, y_value in zip(x_values, y_values)
+        if _is_finite_float(x_value) and _is_finite_float(y_value)
+    ]
+    if len(pairs) < 2:
+        return float("nan")
+
+    x_tensor = torch.tensor([pair[0] for pair in pairs], dtype=torch.float64)
+    y_tensor = torch.tensor([pair[1] for pair in pairs], dtype=torch.float64)
+    x_centered = x_tensor - x_tensor.mean()
+    y_centered = y_tensor - y_tensor.mean()
+    denom = torch.sqrt(torch.sum(x_centered * x_centered) * torch.sum(y_centered * y_centered))
+    if not torch.isfinite(denom) or denom.item() <= 0.0:
+        return float("nan")
+    return float(torch.sum(x_centered * y_centered).item() / denom.item())
+
+
+def _rank_desc_index(values, index):
+    values = _to_flat_float_list(values)
+    try:
+        target_index = int(index)
+    except (TypeError, ValueError):
+        return float("nan")
+    valid_pairs = [
+        (idx, value)
+        for idx, value in enumerate(values)
+        if _is_finite_float(value)
+    ]
+    if not valid_pairs or target_index not in {idx for idx, _ in valid_pairs}:
+        return float("nan")
+    ranked = sorted(valid_pairs, key=lambda item: (-item[1], item[0]))
+    for rank, (idx, _) in enumerate(ranked, start=1):
+        if idx == target_index:
+            return float(rank)
+    return float("nan")
+
+
+def _build_pism_alignment_diagnostics(scores, weights):
+    score_values = _to_flat_float_list(scores)
+    weight_values = _to_flat_float_list(weights)
+    pairs = [
+        (idx, score, weight)
+        for idx, (score, weight) in enumerate(zip(score_values, weight_values))
+        if _is_finite_float(score) and _is_finite_float(weight)
+    ]
+    diagnostics = {
+        "score_std": _safe_std(score_values),
+        "score_pos_frac": float("nan"),
+        "weight_score_corr": _safe_pearson(score_values, weight_values),
+        "pism_top_client_score_rank": float("nan"),
+        "pism_top_client_score_value": float("nan"),
+        "foga_top_client_pism_weight": float("nan"),
+    }
+    valid_scores = _safe_numeric_values(score_values)
+    if valid_scores:
+        diagnostics["score_pos_frac"] = float(
+            sum(1 for score in valid_scores if score > 0.0) / len(valid_scores)
+        )
+    if not pairs:
+        return diagnostics
+
+    pism_top_index, pism_top_score, _ = max(pairs, key=lambda item: (item[2], -item[0]))
+    _, _, foga_top_weight = max(pairs, key=lambda item: (item[1], -item[0]))
+    diagnostics["pism_top_client_score_rank"] = _rank_desc_index(score_values, pism_top_index)
+    diagnostics["pism_top_client_score_value"] = float(pism_top_score)
+    diagnostics["foga_top_client_pism_weight"] = float(foga_top_weight)
+    return diagnostics
+
 class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
     # PISM 版 UOC-FOGA：用 DeepSets 元网络从 client/expert 特征生成专家聚合权重。
     def __init__(self, args):
@@ -2005,6 +2134,8 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         metric["pism_post_weight_entropy"] = weight_entropy
         metric["pism_fallback_reason"] = None
         metric["fallback_reason"] = None
+        # 诊断 FOGA score 区分度，以及最终 PISM 权重是否和 score 对齐。
+        metric.update(_build_pism_alignment_diagnostics(record["scores"], weights_tensor))
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
         if len(client_updates) == 0:
@@ -2123,6 +2254,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         pism_post_weight_min_values = []
         pism_post_weight_max_values = []
         pism_post_weight_entropy_values = []
+        pism_score_stds = []
+        pism_score_pos_fracs = []
+        pism_weight_score_corrs = []
+        pism_top_score_ranks = []
+        pism_top_score_values = []
+        foga_top_pism_weights = []
+        pism_weight_score_corr_valid_count = 0
         pism_fallback_reason_counts = collections.defaultdict(int)
         updated_experts = 0
 
@@ -2161,6 +2299,15 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             post_weight_entropy_value = expert_metric.get("pism_post_weight_entropy")
             if post_weight_entropy_value is not None:
                 pism_post_weight_entropy_values.append(float(post_weight_entropy_value))
+            pism_score_stds.append(expert_metric.get("score_std"))
+            pism_score_pos_fracs.append(expert_metric.get("score_pos_frac"))
+            weight_score_corr = expert_metric.get("weight_score_corr")
+            pism_weight_score_corrs.append(weight_score_corr)
+            if _safe_numeric_values([weight_score_corr]):
+                pism_weight_score_corr_valid_count += 1
+            pism_top_score_ranks.append(expert_metric.get("pism_top_client_score_rank"))
+            pism_top_score_values.append(expert_metric.get("pism_top_client_score_value"))
+            foga_top_pism_weights.append(expert_metric.get("foga_top_client_pism_weight"))
 
         fallback_experts = total_experts - updated_experts
         pism_summary = {
@@ -2203,6 +2350,17 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 if pism_post_weight_entropy_values
                 else None
             ),
+            "uoc_foga_pism_score_std_mean": _safe_mean(pism_score_stds),
+            "uoc_foga_pism_score_pos_frac_mean": _safe_mean(pism_score_pos_fracs),
+            "uoc_foga_pism_weight_score_corr_mean": _safe_mean(pism_weight_score_corrs),
+            "uoc_foga_pism_weight_score_corr_valid_frac": (
+                pism_weight_score_corr_valid_count / updated_experts
+                if updated_experts > 0
+                else 0.0
+            ),
+            "uoc_foga_pism_pism_top_score_rank_mean": _safe_mean(pism_top_score_ranks),
+            "uoc_foga_pism_pism_top_score_value_mean": _safe_mean(pism_top_score_values),
+            "uoc_foga_pism_foga_top_pism_weight_mean": _safe_mean(foga_top_pism_weights),
             "uoc_foga_pism_used_frac": (
                 updated_experts / total_experts
                 if total_experts > 0
