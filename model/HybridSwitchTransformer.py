@@ -57,7 +57,14 @@ class DenseFFN(nn.Module):
 
 class SwitchFFNExpert(nn.Module):
     # Token-level Switch FFN 中的单个专家，结构和 Transformer MLP 一致。
-    def __init__(self, embed_dim, hidden_dim, dropout_rate=0.1):
+    def __init__(
+        self,
+        embed_dim,
+        hidden_dim,
+        dropout_rate=0.1,
+        num_classes=None,
+        use_classifier=False,
+    ):
         super(SwitchFFNExpert, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
@@ -66,6 +73,12 @@ class SwitchFFNExpert(nn.Module):
             nn.Linear(hidden_dim, embed_dim),
             nn.Dropout(dropout_rate),
         )
+        if use_classifier:
+            if num_classes is None:
+                raise ValueError("num_classes is required when use_classifier=True")
+            self.classifier = nn.Linear(embed_dim, num_classes)
+        else:
+            self.classifier = None
 
     def forward(self, x):
         return self.net(x)
@@ -85,6 +98,8 @@ class TokenSwitchFFN(nn.Module):
         min_capacity=4,
         drop_tokens=True,
         top_k=1,
+        num_classes=None,
+        use_expert_classifier=False,
     ):
         super(TokenSwitchFFN, self).__init__()
         if top_k != 1:
@@ -99,7 +114,13 @@ class TokenSwitchFFN(nn.Module):
         hidden_dim = int(embed_dim * mlp_ratio)
         self.router = nn.Linear(embed_dim, num_experts)
         self.experts = nn.ModuleList([
-            SwitchFFNExpert(embed_dim, hidden_dim, dropout_rate)
+            SwitchFFNExpert(
+                embed_dim,
+                hidden_dim,
+                dropout_rate,
+                num_classes=num_classes,
+                use_classifier=use_expert_classifier,
+            )
             for _ in range(num_experts)
         ])
 
@@ -181,6 +202,8 @@ class TokenSwitchFFN(nn.Module):
             "overflow_counts": overflow_counts,
             "capacity": capacity,
             "avg_router_probs": avg_router_probs,
+            "top1_expert_ids": top1_indices,
+            "top1_gates": top1_probs,
         }
 
     def forward_force_expert(self, x, expert_id, gate_mode="one"):
@@ -216,6 +239,8 @@ class HybridTransformerBlock(nn.Module):
         drop_tokens=True,
         top_k=1,
         layer_id=0,
+        num_classes=None,
+        use_expert_classifier=False,
     ):
         super(HybridTransformerBlock, self).__init__()
         self.layer_id = layer_id
@@ -240,6 +265,8 @@ class HybridTransformerBlock(nn.Module):
                 min_capacity=min_capacity,
                 drop_tokens=drop_tokens,
                 top_k=top_k,
+                num_classes=num_classes,
+                use_expert_classifier=use_expert_classifier,
             )
         else:
             self.ffn = DenseFFN(
@@ -284,6 +311,8 @@ class HybridTransformerBlock(nn.Module):
                 "overflow_counts": switch_result["overflow_counts"],
                 "capacity": switch_result["capacity"],
                 "avg_router_probs": switch_result["avg_router_probs"],
+                "top1_expert_ids": switch_result["top1_expert_ids"],
+                "top1_gates": switch_result["top1_gates"],
             }
 
         x = x + self.dropout(self.ffn(ffn_input))
@@ -347,6 +376,9 @@ class HybridSwitchTransformer(nn.Module):
         self.embed_dim = embed_dim
         self.depth = depth
         self.moe_layers = set(moe_layers or [])
+        if not self.moe_layers:
+            raise ValueError("HybridSwitchTransformer requires at least one MoE layer")
+        self.classifier_layer_id = max(self.moe_layers)
         self.token_grid_size = token_grid_size
         self.use_cls_token = use_cls_token
         self.router_aux_loss_coef = router_aux_loss_coef
@@ -395,11 +427,12 @@ class HybridSwitchTransformer(nn.Module):
                 drop_tokens=drop_tokens,
                 top_k=top_k,
                 layer_id=layer_id,
+                num_classes=num_classes,
+                use_expert_classifier=layer_id == self.classifier_layer_id,
             )
             for layer_id in range(depth)
         ])
         self.norm = nn.LayerNorm(embed_dim)
-        self.classifier = nn.Linear(embed_dim, num_classes)
 
         nn.init.trunc_normal_(self.position_embedding, std=0.02)
         if self.cls_token is not None:
@@ -442,6 +475,56 @@ class HybridSwitchTransformer(nn.Module):
                 })
         return parameter_groups
 
+    def _compute_expert_classifier_logits(
+        self,
+        pooled,
+        top1_expert_ids=None,
+        top1_gates=None,
+        force_expert_id=None,
+    ):
+        classifier_block = self.blocks[self.classifier_layer_id]
+        if not classifier_block.use_switch_ffn:
+            raise ValueError("classifier layer must be a TokenSwitchFFN block")
+
+        expert_logits = []
+        for expert in classifier_block.ffn.experts:
+            if expert.classifier is None:
+                raise ValueError("classifier expert is missing classifier head")
+            expert_logits.append(expert.classifier(pooled))
+        expert_logits = torch.stack(expert_logits, dim=1)
+        num_experts = expert_logits.size(1)
+
+        if force_expert_id is not None:
+            force_expert_id = int(force_expert_id)
+            if force_expert_id < 0 or force_expert_id >= num_experts:
+                raise ValueError(
+                    f"force_expert_id must be in [0, {num_experts}), got {force_expert_id}"
+                )
+            return expert_logits[:, force_expert_id, :]
+
+        if top1_expert_ids is None or top1_gates is None:
+            raise ValueError("top1_expert_ids and top1_gates are required for expert classifier mixture")
+        if top1_expert_ids.dim() != 2 or top1_gates.dim() != 2:
+            raise ValueError("top1_expert_ids and top1_gates must have shape [B, N]")
+        if top1_expert_ids.shape != top1_gates.shape:
+            raise ValueError("top1_expert_ids and top1_gates must have the same shape")
+        if top1_expert_ids.size(0) != pooled.size(0):
+            raise ValueError("router batch size must match pooled batch size")
+
+        top1_expert_ids = top1_expert_ids.to(device=pooled.device, dtype=torch.long)
+        top1_gates = top1_gates.to(device=pooled.device)
+        head_weights = torch.zeros(
+            pooled.size(0),
+            num_experts,
+            device=pooled.device,
+            dtype=torch.float32,
+        )
+        # token 级 router gate 累加成样本级 expert head 权重。
+        head_weights.scatter_add_(dim=1, index=top1_expert_ids, src=top1_gates.float())
+        head_weights = head_weights / head_weights.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        head_weights = head_weights.to(dtype=expert_logits.dtype)
+        return torch.sum(expert_logits * head_weights.unsqueeze(-1), dim=1)
+
     def collect_uoc_evidence(self, x, max_samples=None, use_top1=True):
         # collect_uoc_evidence 只用于采集 UOC evidence，不改变正常 forward。
         if not use_top1:
@@ -470,7 +553,14 @@ class HybridSwitchTransformer(nn.Module):
 
             tokens = self.norm(tokens)
             pooled = tokens[:, 0] if self.cls_token is not None else tokens.mean(dim=1)
-            logits = self.classifier(pooled)
+            classifier_evidence = uoc_evidence.get(str(self.classifier_layer_id))
+            if classifier_evidence is None:
+                raise ValueError("collect_uoc_evidence could not find classifier MoE layer evidence")
+            logits = self._compute_expert_classifier_logits(
+                pooled,
+                top1_expert_ids=classifier_evidence.get("top1_expert_ids"),
+                top1_gates=classifier_evidence.get("top1_gates"),
+            )
             probs = torch.softmax(logits.float(), dim=-1)
             # entropy 只作为 query 筛选信号，不参与训练 loss。
             entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=-1).detach()
@@ -503,12 +593,33 @@ class HybridSwitchTransformer(nn.Module):
             residual=residual,
         )
 
+        classifier_top1_expert_ids = None
+        classifier_top1_gates = None
         for next_block in self.blocks[layer_index + 1:]:
-            x, _ = next_block(x)
+            x, switch_stats = next_block(x)
+            if switch_stats is None:
+                continue
+            if int(switch_stats["layer_id"]) == self.classifier_layer_id:
+                classifier_top1_expert_ids = switch_stats["top1_expert_ids"]
+                classifier_top1_gates = switch_stats["top1_gates"]
 
         x = self.norm(x)
         pooled = x[:, 0] if self.cls_token is not None else x.mean(dim=1)
-        logits = self.classifier(pooled)
+        if layer_index == self.classifier_layer_id:
+            logits = self._compute_expert_classifier_logits(
+                pooled,
+                force_expert_id=force_expert_id,
+            )
+        else:
+            if classifier_top1_expert_ids is None or classifier_top1_gates is None:
+                raise ValueError(
+                    "forward_uoc_from_hidden could not find classifier MoE layer router info"
+                )
+            logits = self._compute_expert_classifier_logits(
+                pooled,
+                top1_expert_ids=classifier_top1_expert_ids,
+                top1_gates=classifier_top1_gates,
+            )
         return {"logits": logits}
 
     def forward(self, x):
@@ -534,6 +645,8 @@ class HybridSwitchTransformer(nn.Module):
         avg_router_probs_by_layer = {}
         capacity_by_layer = {}
         switch_layer_count = 0
+        classifier_top1_expert_ids = None
+        classifier_top1_gates = None
 
         for block in self.blocks:
             tokens, switch_stats = block(tokens)
@@ -541,6 +654,9 @@ class HybridSwitchTransformer(nn.Module):
                 continue
 
             layer_key = str(switch_stats["layer_id"])
+            if int(switch_stats["layer_id"]) == self.classifier_layer_id:
+                classifier_top1_expert_ids = switch_stats["top1_expert_ids"]
+                classifier_top1_gates = switch_stats["top1_gates"]
             router_aux_loss = router_aux_loss + switch_stats["router_aux_loss"]
             router_z_loss = router_z_loss + switch_stats["router_z_loss"]
             expert_activations = expert_activations + switch_stats["expert_activations"]
@@ -573,7 +689,11 @@ class HybridSwitchTransformer(nn.Module):
         )
         tokens = self.norm(tokens)
         pooled = tokens[:, 0] if self.cls_token is not None else tokens.mean(dim=1)
-        logits = self.classifier(pooled)
+        logits = self._compute_expert_classifier_logits(
+            pooled,
+            top1_expert_ids=classifier_top1_expert_ids,
+            top1_gates=classifier_top1_gates,
+        )
 
         return {
             "logits": logits,
