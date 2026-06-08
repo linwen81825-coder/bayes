@@ -1153,6 +1153,16 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         self._validate_pism_tau_schedule()
         self.pism_renorm_inputs = bool(getattr(args, "uoc_foga_pism_renorm_inputs", True))
         self.pism_min_clients = int(getattr(args, "uoc_foga_pism_min_clients", 2))
+        self.uoc_foga_pism_min_weight_factor = float(
+            getattr(args, "uoc_foga_pism_min_weight_factor", 0.0)
+        )
+        self.uoc_foga_pism_fairness_blend = float(
+            getattr(args, "uoc_foga_pism_fairness_blend", 0.0)
+        )
+        if self.uoc_foga_pism_min_weight_factor < 0.0:
+            raise ValueError("uoc_foga_pism_min_weight_factor must be >= 0")
+        if not 0.0 <= self.uoc_foga_pism_fairness_blend <= 1.0:
+            raise ValueError("uoc_foga_pism_fairness_blend must be in [0, 1]")
         # meta_steps 表示每轮同一批 PISM records 上的 optimizer step 次数，不会重复构造 query / g_query。
         raw_meta_steps = getattr(args, "uoc_foga_pism_meta_steps", 1)
         try:
@@ -1203,6 +1213,44 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             # 3 维保持旧版语义：[client_loss, log1p(usage), log1p(delta_norm)]。
             return features[..., [0, 1, 3]]
         return features
+
+    def _postprocess_pism_weights(self, weights, fairness_values=None):
+        weights = weights.float()
+        weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+        if weights.numel() == 0:
+            return weights
+
+        weight_sum = weights.sum()
+        if not torch.isfinite(weight_sum) or weight_sum.item() <= 0.0:
+            weights = torch.ones_like(weights) / float(weights.numel())
+        else:
+            weights = weights / weight_sum
+
+        num_clients = weights.numel()
+        if self.uoc_foga_pism_min_weight_factor > 0.0:
+            min_weight = self.uoc_foga_pism_min_weight_factor * (1.0 / float(num_clients))
+            weights = torch.clamp(weights, min=min_weight)
+            weights = weights / weights.sum()
+
+        blend = float(self.uoc_foga_pism_fairness_blend)
+        if blend > 0.0 and fairness_values is not None:
+            fairness = fairness_values.to(weights.device).float()
+            fairness = torch.nan_to_num(fairness, nan=0.0, posinf=0.0, neginf=0.0)
+            fairness = torch.clamp(fairness, min=0.0)
+            fairness_sum = fairness.sum()
+            if (
+                fairness.numel() == num_clients
+                and torch.isfinite(fairness_sum)
+                and fairness_sum.item() > 0.0
+            ):
+                fairness = fairness / fairness_sum
+                weights = (1.0 - blend) * weights + blend * fairness
+                weights = weights / weights.sum()
+
+        weight_sum = weights.sum()
+        if not torch.isfinite(weight_sum) or weight_sum.item() <= 0.0:
+            return torch.ones_like(weights) / float(weights.numel())
+        return weights / weight_sum
 
     def _validate_pism_tau_schedule(self):
         if self.pism_tau_schedule not in {"constant", "source_exp"}:
@@ -1591,6 +1639,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             float(value) for value in features.detach().std(dim=0, unbiased=False).cpu().tolist()
         ]
         scores_tensor = torch.tensor(scores, device=device, dtype=torch.float32).detach()
+        fairness_values = (
+            torch.tensor(client_losses, device=device, dtype=torch.float32).detach()
+            if client_losses
+            else None
+        )
         record = {
             "layer_id": str(layer_id),
             "expert_id": str(expert_id),
@@ -1598,6 +1651,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "valid_client_ids": valid_client_ids,
             "features": features,
             "scores": scores_tensor,
+            "fairness_values": fairness_values,
             "metric": metric,
         }
         return metric, record
@@ -1844,6 +1898,18 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             float(value) for value in features.detach().std(dim=0, unbiased=False).cpu().tolist()
         ]
         scores_tensor = torch.tensor(scores, device=device, dtype=torch.float32).detach()
+        if score_metric == "grad_dot":
+            fairness_values = (
+                torch.tensor(expert_client_losses, device=device, dtype=torch.float32).detach()
+                if expert_client_losses
+                else None
+            )
+        else:
+            fairness_values = (
+                torch.tensor(client_losses, device=device, dtype=torch.float32).detach()
+                if client_losses
+                else None
+            )
         record = {
             "layer_id": str(layer_id),
             "expert_id": str(expert_id),
@@ -1851,6 +1917,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "valid_client_ids": valid_client_ids,
             "features": features,
             "scores": scores_tensor,
+            "fairness_values": fairness_values,
             "metric": metric,
         }
         if score_metric == "grad_dot":
@@ -1871,6 +1938,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         metric = record["metric"]
         with torch.no_grad():
             weights_tensor = self.meta_net(record["features"], tau=current_tau)
+            weights_tensor = self._postprocess_pism_weights(
+                weights_tensor,
+                record.get("fairness_values"),
+            )
         if not torch.isfinite(weights_tensor).all():
             self._fallback_expert(
                 aggregated_state,
@@ -1918,6 +1989,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             return
 
         weight_entropy = expert_weight_entropy(weights)
+        weight_min = min(weights.values()) if weights else None
         weight_max = max(weights.values()) if weights else None
         metric["weight_max"] = weight_max
         metric["weight_entropy"] = weight_entropy
@@ -1925,8 +1997,12 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         metric["aggregation_weight_source"] = "pism"
         metric["pism_used"] = True
         metric["pism_meta_loss"] = meta_loss_value
+        metric["pism_weight_min"] = weight_min
         metric["pism_weight_max"] = weight_max
         metric["pism_weight_entropy"] = weight_entropy
+        metric["pism_post_weight_min"] = weight_min
+        metric["pism_post_weight_max"] = weight_max
+        metric["pism_post_weight_entropy"] = weight_entropy
         metric["pism_fallback_reason"] = None
         metric["fallback_reason"] = None
 
@@ -2044,6 +2120,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         pism_meta_losses = []
         pism_weight_entropies = []
         pism_weight_max_values = []
+        pism_post_weight_min_values = []
+        pism_post_weight_max_values = []
+        pism_post_weight_entropy_values = []
         pism_fallback_reason_counts = collections.defaultdict(int)
         updated_experts = 0
 
@@ -2073,6 +2152,15 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             weight_max_value = expert_metric.get("pism_weight_max")
             if weight_max_value is not None:
                 pism_weight_max_values.append(float(weight_max_value))
+            post_weight_min_value = expert_metric.get("pism_post_weight_min")
+            if post_weight_min_value is not None:
+                pism_post_weight_min_values.append(float(post_weight_min_value))
+            post_weight_max_value = expert_metric.get("pism_post_weight_max")
+            if post_weight_max_value is not None:
+                pism_post_weight_max_values.append(float(post_weight_max_value))
+            post_weight_entropy_value = expert_metric.get("pism_post_weight_entropy")
+            if post_weight_entropy_value is not None:
+                pism_post_weight_entropy_values.append(float(post_weight_entropy_value))
 
         fallback_experts = total_experts - updated_experts
         pism_summary = {
@@ -2092,6 +2180,27 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "uoc_foga_pism_weight_max_mean": (
                 sum(pism_weight_max_values) / len(pism_weight_max_values)
                 if pism_weight_max_values
+                else None
+            ),
+            "uoc_foga_pism_min_weight_factor": float(
+                self.uoc_foga_pism_min_weight_factor
+            ),
+            "uoc_foga_pism_fairness_blend": float(
+                self.uoc_foga_pism_fairness_blend
+            ),
+            "pism_post_weight_min_mean": (
+                sum(pism_post_weight_min_values) / len(pism_post_weight_min_values)
+                if pism_post_weight_min_values
+                else None
+            ),
+            "pism_post_weight_max_mean": (
+                sum(pism_post_weight_max_values) / len(pism_post_weight_max_values)
+                if pism_post_weight_max_values
+                else None
+            ),
+            "pism_post_weight_entropy_mean": (
+                sum(pism_post_weight_entropy_values) / len(pism_post_weight_entropy_values)
+                if pism_post_weight_entropy_values
                 else None
             ),
             "uoc_foga_pism_used_frac": (

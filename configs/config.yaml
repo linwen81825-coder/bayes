@@ -167,6 +167,10 @@ uoc_foga:
   # PISM 最少有效客户端数：正整数
   uoc_foga_pism_min_clients: 2
 
+  # PISM 最终聚合权重后处理；0.0 表示关闭，保持旧行为
+  uoc_foga_pism_min_weight_factor: 0.0
+  uoc_foga_pism_fairness_blend: 0.0
+
 
 # ============================================================
 # 数据集与数据划分配置
