@@ -98,7 +98,7 @@ uoc_foga:
   uoc_foga_score_mode: relu
 
   # score 计算度量：cosine 保持旧行为，dot 使用内积，grad_dot 使用源码风格梯度内积，delta_consensus 使用 leave-one-out delta 共识方向
-  uoc_foga_score_metric: grad_dot
+  uoc_foga_score_metric: grad_cosine
 
   # 最少有效客户端数：正整数
   uoc_foga_min_valid_clients: 2

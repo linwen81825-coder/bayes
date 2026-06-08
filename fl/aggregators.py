@@ -15,6 +15,7 @@ from fl.uoc_foga import (
     build_client_grad_query_for_expert,
     build_stratified_query_for_expert,
     cosine_delta_to_delta,
+    cosine_grad_to_grad,
     delta_to_negative_grad_score,
     dot_grad_to_grad,
     expert_weight_entropy,
@@ -419,7 +420,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
 
     def _get_score_metric(self):
         score_metric = getattr(self.args, "uoc_foga_score_metric", "cosine")
-        if score_metric not in {"cosine", "dot", "grad_dot", "delta_consensus"}:
+        if score_metric not in {"cosine", "dot", "grad_dot", "grad_cosine", "delta_consensus"}:
             raise ValueError(f"Unknown UOC-FOGA score metric: {score_metric!r}")
         return score_metric
 
@@ -633,10 +634,11 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         expert_param_keys,
         expert_params,
         device,
+        score_metric="grad_dot",
     ):
         client_evidence = self._get_client_evidence_for_index(uoc_evidences, client_idx)
         if client_evidence is None:
-            return None, None, None, None
+            return None, None, None, None, None
 
         client_query = build_client_grad_query_for_expert(
             client_evidence=client_evidence,
@@ -645,7 +647,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             **self._get_client_grad_query_kwargs(),
         )
         if client_query is None:
-            return None, None, None, None
+            return None, None, None, None, None
 
         result = self._compute_client_expert_grad_state(
             global_model=global_model,
@@ -657,19 +659,23 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             device=device,
         )
         if result is None:
-            return None, None, None, None
+            return None, None, None, None, None
 
         expert_client_loss, client_grad_state, sample_count = result
-        score = dot_grad_to_grad(query_grad_state, client_grad_state, device=device)
+        if score_metric == "grad_cosine":
+            # grad_cosine 只比较梯度方向，避免 raw grad_dot 被梯度范数主导。
+            score = cosine_grad_to_grad(query_grad_state, client_grad_state, device=device)
+        else:
+            score = dot_grad_to_grad(query_grad_state, client_grad_state, device=device)
         if score is None:
-            return None, None, None, None
+            return None, None, None, None, None
         cos_delta_neg_gclient = delta_to_negative_grad_score(
             delta_state,
             client_grad_state,
             metric="cosine",
             device=device,
         )
-        return score, expert_client_loss, sample_count, cos_delta_neg_gclient
+        return score, expert_client_loss, sample_count, cos_delta_neg_gclient, client_grad_state
 
     def _mean_float_values(self, values):
         values = [float(value) for value in values if value is not None]
@@ -686,26 +692,28 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         return float(variance ** 0.5)
 
     def _add_grad_dot_metric_stats(self, metric, scores, client_set_sizes, cos_delta_values):
-        if metric.get("score_metric") != "grad_dot":
+        score_metric = metric.get("score_metric")
+        if score_metric not in {"grad_dot", "grad_cosine"}:
             return metric
 
         scores = [float(value) for value in scores if value is not None]
         client_set_sizes = [float(value) for value in client_set_sizes if value is not None]
         cos_delta_values = [float(value) for value in cos_delta_values if value is not None]
+        prefix = "grad_cosine" if score_metric == "grad_cosine" else "grad_dot"
 
-        metric["grad_dot_valid_scores"] = len(scores)
-        metric["grad_dot_positive_frac"] = (
+        metric[f"{prefix}_valid_scores"] = len(scores)
+        metric[f"{prefix}_positive_frac"] = (
             sum(1 for value in scores if value > 0.0) / len(scores)
             if scores
             else None
         )
-        metric["grad_dot_score_mean"] = self._mean_float_values(scores)
-        metric["grad_dot_score_std"] = self._std_float_values(scores)
-        metric["grad_dot_score_min"] = min(scores) if scores else None
-        metric["grad_dot_score_max"] = max(scores) if scores else None
-        metric["grad_dot_client_set_size_mean"] = self._mean_float_values(client_set_sizes)
-        metric["grad_dot_client_set_size_min"] = min(client_set_sizes) if client_set_sizes else None
-        metric["grad_dot_client_set_size_max"] = max(client_set_sizes) if client_set_sizes else None
+        metric[f"{prefix}_score_mean"] = self._mean_float_values(scores)
+        metric[f"{prefix}_score_std"] = self._std_float_values(scores)
+        metric[f"{prefix}_score_min"] = min(scores) if scores else None
+        metric[f"{prefix}_score_max"] = max(scores) if scores else None
+        metric[f"{prefix}_client_set_size_mean"] = self._mean_float_values(client_set_sizes)
+        metric[f"{prefix}_client_set_size_min"] = min(client_set_sizes) if client_set_sizes else None
+        metric[f"{prefix}_client_set_size_max"] = max(client_set_sizes) if client_set_sizes else None
         metric["cos_delta_neg_gclient_mean"] = self._mean_float_values(cos_delta_values)
         metric["cos_delta_neg_gclient_positive_frac"] = (
             sum(1 for value in cos_delta_values if value > 0.0) / len(cos_delta_values)
@@ -953,7 +961,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
 
         score_metric = metric["score_metric"]
         expert_params = None
-        if score_metric == "grad_dot":
+        if score_metric in {"grad_dot", "grad_cosine"}:
             if named_parameters is None:
                 named_parameters = dict(global_model.named_parameters())
             expert_params = [named_parameters[key] for key in param_keys]
@@ -969,8 +977,8 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
                 expert_keys,
                 device=device,
             )
-            if score_metric == "grad_dot":
-                score, _, client_set_size, cos_delta_neg_gclient = self._compute_client_grad_dot_score(
+            if score_metric in {"grad_dot", "grad_cosine"}:
+                score, _, client_set_size, cos_delta_neg_gclient, _ = self._compute_client_grad_dot_score(
                     global_model=global_model,
                     uoc_evidences=uoc_evidences,
                     client_idx=client_idx,
@@ -981,6 +989,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
                     expert_param_keys=param_keys,
                     expert_params=expert_params,
                     device=device,
+                    score_metric=score_metric,
                 )
                 if score is not None:
                     grad_dot_scores.append(float(score))
@@ -1168,6 +1177,44 @@ def _safe_std(values):
     return float(torch.sqrt(torch.mean(centered * centered)).item())
 
 
+def _safe_zscore(values, eps=1e-8, device=None, dtype=torch.float32):
+    x = torch.as_tensor(values, device=device, dtype=dtype).reshape(-1)
+    if x.numel() == 0:
+        return x
+
+    finite_mask = torch.isfinite(x)
+    if not torch.any(finite_mask):
+        return torch.zeros_like(x)
+
+    finite_values = x[finite_mask]
+    fill_value = finite_values.mean()
+    x = torch.where(finite_mask, x, fill_value)
+    if x.numel() < 2:
+        return torch.zeros_like(x)
+
+    std = x.std(unbiased=False)
+    if not torch.isfinite(std) or std.item() < eps:
+        return torch.zeros_like(x)
+
+    z = (x - x.mean()) / (std + eps)
+    return torch.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _safe_rank_norm_desc(values, device=None, dtype=torch.float32):
+    values = torch.as_tensor(values, device=device, dtype=dtype).reshape(-1)
+    if values.numel() == 0:
+        return values
+    if values.numel() == 1:
+        return torch.ones_like(values)
+
+    values = torch.nan_to_num(values, nan=-float("inf"), posinf=-float("inf"), neginf=-float("inf"))
+    ranked_indices = torch.argsort(values, descending=True, stable=True)
+    ranks = torch.empty_like(values, dtype=torch.float32)
+    rank_values = torch.arange(1, values.numel() + 1, device=values.device, dtype=torch.float32)
+    ranks[ranked_indices] = rank_values
+    return 1.0 - (ranks - 1.0) / max(float(values.numel() - 1), 1.0)
+
+
 def _safe_pearson(x, y):
     x_values = _to_flat_float_list(x)
     y_values = _to_flat_float_list(y)
@@ -1248,8 +1295,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             non_expert_method=args.non_expert_agg_method,
         )
         self.score_metric = self._get_score_metric()
-        self.pism_input_dim = int(getattr(args, "uoc_foga_pism_input_dim", 5))
-        if self.score_metric == "grad_dot":
+        if self.score_metric == "grad_cosine":
+            self.pism_input_dim = 6
+        else:
+            self.pism_input_dim = int(getattr(args, "uoc_foga_pism_input_dim", 5))
+        if self.score_metric == "grad_cosine":
+            pass
+        elif self.score_metric == "grad_dot":
             if self.pism_input_dim != 2:
                 raise ValueError(
                     "grad_dot PISM requires uoc_foga_pism_input_dim: 2"
@@ -1327,6 +1379,15 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         ]
 
     def _pism_input_names_for_config(self):
+        if self.score_metric == "grad_cosine":
+            return [
+                "expert_loss_z",
+                "log_usage_z",
+                "usage_ratio_z",
+                "consensus_grad_cos",
+                "consensus_grad_rank_norm",
+                "consensus_grad_pos_flag",
+            ]
         if self.score_metric == "grad_dot":
             return [
                 "expert_client_loss",
@@ -1629,6 +1690,110 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             return 0.0
         return float(client_stat.get("client_loss", client_stat.get("train_loss", 0.0)))
 
+    def _get_expert_loss_from_stats(self, client_stat, layer_id, expert_id):
+        if not isinstance(client_stat, dict):
+            return None
+
+        expert_index = int(expert_id)
+        layer_key = str(layer_id)
+        loss_by_layer = client_stat.get("expert_loss_by_layer")
+        if not isinstance(loss_by_layer, dict):
+            return None
+
+        layer_loss = loss_by_layer.get(layer_key, loss_by_layer.get(int(layer_id), None))
+        if not isinstance(layer_loss, dict):
+            return None
+
+        loss_sum = self._get_indexed_value(layer_loss.get("loss_sum"), expert_index)
+        loss_count = self._get_indexed_value(layer_loss.get("loss_count"), expert_index)
+        if loss_sum is None or loss_count is None:
+            return None
+        if loss_count <= 0.0:
+            return None
+        value = float(loss_sum) / max(float(loss_count), 1.0)
+        if not _safe_numeric_values([value]):
+            return None
+        return value
+
+    def _build_consensus_grad_cos_features(self, client_grad_states, device):
+        if len(client_grad_states) < 2:
+            return torch.zeros(len(client_grad_states), device=device, dtype=torch.float32)
+
+        consensus_values = []
+        for idx, client_grad_state in enumerate(client_grad_states):
+            ref_states = [
+                other_grad_state
+                for other_idx, other_grad_state in enumerate(client_grad_states)
+                if other_idx != idx
+            ]
+            ref_grad_state = average_delta_states(ref_states, device=device)
+            if ref_grad_state is None:
+                consensus_values.append(0.0)
+                continue
+            score = cosine_grad_to_grad(
+                ref_grad_state,
+                client_grad_state,
+                device=device,
+            )
+            consensus_values.append(float(score) if score is not None else 0.0)
+        return torch.as_tensor(consensus_values, device=device, dtype=torch.float32)
+
+    def _build_grad_cosine_pism_features_for_expert(
+        self,
+        client_stats,
+        valid_client_ids,
+        expert_usages,
+        total_layer_usages,
+        client_grad_states,
+        layer_id,
+        expert_id,
+        device,
+    ):
+        expert_loss_values = []
+        for client_idx in valid_client_ids:
+            client_stat = client_stats[client_idx] if client_idx < len(client_stats) else {}
+            expert_loss = self._get_expert_loss_from_stats(client_stat, layer_id, expert_id)
+            expert_loss_values.append(
+                float(expert_loss) if expert_loss is not None else float("nan")
+            )
+
+        expert_loss_z = _safe_zscore(expert_loss_values, device=device)
+        expert_usage = torch.as_tensor(expert_usages, device=device, dtype=torch.float32).reshape(-1)
+        total_layer_usage = torch.as_tensor(total_layer_usages, device=device, dtype=torch.float32).reshape(-1)
+        expert_usage = torch.nan_to_num(expert_usage, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        total_layer_usage = torch.nan_to_num(total_layer_usage, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
+        log_usage_z = _safe_zscore(torch.log1p(expert_usage), device=device)
+        usage_ratio = torch.where(
+            total_layer_usage > 0.0,
+            expert_usage / total_layer_usage.clamp_min(1e-8),
+            torch.zeros_like(expert_usage),
+        )
+        usage_ratio_z = _safe_zscore(usage_ratio, device=device)
+
+        consensus_grad_cos = self._build_consensus_grad_cos_features(client_grad_states, device)
+        consensus_grad_rank_norm = _safe_rank_norm_desc(consensus_grad_cos, device=device)
+        consensus_grad_pos_flag = (consensus_grad_cos > 0.0).float()
+
+        features = torch.stack(
+            [
+                expert_loss_z,
+                log_usage_z,
+                usage_ratio_z,
+                consensus_grad_cos,
+                consensus_grad_rank_norm,
+                consensus_grad_pos_flag,
+            ],
+            dim=-1,
+        )
+        features = torch.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+        feature_diag = {
+            "consensus_grad_cos_mean": _safe_mean(consensus_grad_cos),
+            "consensus_grad_pos_frac": _safe_mean(consensus_grad_pos_flag),
+            "expert_loss_z_std": _safe_std(expert_loss_z),
+        }
+        return features, feature_diag
+
     def _normalize_client_stats(self, client_stats, client_count):
         if client_stats is None:
             return [{} for _ in range(client_count)]
@@ -1888,7 +2053,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
 
         score_metric = metric["score_metric"]
         expert_params = None
-        if score_metric == "grad_dot":
+        if score_metric in {"grad_dot", "grad_cosine"}:
             if named_parameters is None:
                 named_parameters = dict(global_model.named_parameters())
             expert_params = [named_parameters[key] for key in param_keys]
@@ -1905,6 +2070,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         delta_norms = []
         expert_client_losses = []
         client_grad_sample_counts = []
+        client_grad_states = []
         for client_idx, client_state in enumerate(client_updates):
             delta_state = extract_expert_delta_state(
                 client_state,
@@ -1912,8 +2078,8 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 expert_keys,
                 device=device,
             )
-            if score_metric == "grad_dot":
-                score, expert_client_loss, client_set_size, cos_delta_neg_gclient = self._compute_client_grad_dot_score(
+            if score_metric in {"grad_dot", "grad_cosine"}:
+                score, expert_client_loss, client_set_size, cos_delta_neg_gclient, client_grad_state = self._compute_client_grad_dot_score(
                     global_model=global_model,
                     uoc_evidences=uoc_evidences,
                     client_idx=client_idx,
@@ -1924,6 +2090,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                     expert_param_keys=param_keys,
                     expert_params=expert_params,
                     device=device,
+                    score_metric=score_metric,
                 )
                 if score is not None:
                     grad_dot_scores.append(float(score))
@@ -1955,6 +2122,8 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             if score_metric == "grad_dot":
                 expert_client_losses.append(expert_client_loss)
                 client_grad_sample_counts.append(client_set_size)
+            if score_metric == "grad_cosine":
+                client_grad_states.append(client_grad_state)
 
         self._add_grad_dot_metric_stats(
             metric,
@@ -1998,6 +2167,19 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "expert_client_loss",
                 "log1p_client_grad_sample_count",
             ]
+        elif score_metric == "grad_cosine":
+            features, feature_diag = self._build_grad_cosine_pism_features_for_expert(
+                client_stats=client_stats,
+                valid_client_ids=valid_client_ids,
+                expert_usages=expert_usages,
+                total_layer_usages=total_layer_usages,
+                client_grad_states=client_grad_states,
+                layer_id=layer_id,
+                expert_id=expert_id,
+                device=device,
+            )
+            metric["pism_input_names"] = self._pism_input_names_for_config()
+            metric.update(feature_diag)
         else:
             features = build_pism_feature_tensor(
                 client_loss=client_losses,
@@ -2008,7 +2190,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             )
             features = self._select_pism_features_for_config(features)
             metric["pism_input_names"] = self._pism_input_names_for_config()
-        if self.pism_renorm_inputs:
+        if self.pism_renorm_inputs and score_metric != "grad_cosine":
             features = normalize_pism_inputs(features)
         if not torch.isfinite(features).all():
             return metric, self._fallback_expert(
@@ -2260,6 +2442,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         pism_top_score_ranks = []
         pism_top_score_values = []
         foga_top_pism_weights = []
+        pism_consensus_grad_cos_means = []
+        pism_consensus_grad_pos_fracs = []
+        pism_expert_loss_z_stds = []
         pism_weight_score_corr_valid_count = 0
         pism_fallback_reason_counts = collections.defaultdict(int)
         updated_experts = 0
@@ -2308,9 +2493,14 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             pism_top_score_ranks.append(expert_metric.get("pism_top_client_score_rank"))
             pism_top_score_values.append(expert_metric.get("pism_top_client_score_value"))
             foga_top_pism_weights.append(expert_metric.get("foga_top_client_pism_weight"))
+            pism_consensus_grad_cos_means.append(expert_metric.get("consensus_grad_cos_mean"))
+            pism_consensus_grad_pos_fracs.append(expert_metric.get("consensus_grad_pos_frac"))
+            pism_expert_loss_z_stds.append(expert_metric.get("expert_loss_z_std"))
 
         fallback_experts = total_experts - updated_experts
         pism_summary = {
+            "uoc_foga_score_metric": self.score_metric,
+            "uoc_foga_pism_input_dim": int(self.pism_input_dim),
             "uoc_foga_pism_meta_loss_mean": (
                 sum(pism_meta_losses) / len(pism_meta_losses)
                 if pism_meta_losses
@@ -2361,6 +2551,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "uoc_foga_pism_pism_top_score_rank_mean": _safe_mean(pism_top_score_ranks),
             "uoc_foga_pism_pism_top_score_value_mean": _safe_mean(pism_top_score_values),
             "uoc_foga_pism_foga_top_pism_weight_mean": _safe_mean(foga_top_pism_weights),
+            "uoc_foga_pism_consensus_grad_cos_mean": _safe_mean(pism_consensus_grad_cos_means),
+            "uoc_foga_pism_consensus_grad_pos_frac_mean": _safe_mean(pism_consensus_grad_pos_fracs),
+            "uoc_foga_pism_expert_loss_z_std_mean": _safe_mean(pism_expert_loss_z_stds),
             "uoc_foga_pism_used_frac": (
                 updated_experts / total_experts
                 if total_experts > 0

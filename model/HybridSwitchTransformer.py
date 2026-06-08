@@ -181,6 +181,8 @@ class TokenSwitchFFN(nn.Module):
             "overflow_counts": overflow_counts,
             "capacity": capacity,
             "avg_router_probs": avg_router_probs,
+            "top1_expert_ids": top1_indices,
+            "top1_gates": top1_probs,
         }
 
     def forward_force_expert(self, x, expert_id, gate_mode="one"):
@@ -284,6 +286,8 @@ class HybridTransformerBlock(nn.Module):
                 "overflow_counts": switch_result["overflow_counts"],
                 "capacity": switch_result["capacity"],
                 "avg_router_probs": switch_result["avg_router_probs"],
+                "top1_expert_ids": switch_result["top1_expert_ids"],
+                "top1_gates": switch_result["top1_gates"],
             }
 
         x = x + self.dropout(self.ffn(ffn_input))
@@ -533,6 +537,7 @@ class HybridSwitchTransformer(nn.Module):
         overflow_counts_by_layer = {}
         avg_router_probs_by_layer = {}
         capacity_by_layer = {}
+        router_assignments_by_layer = {}
         switch_layer_count = 0
 
         for block in self.blocks:
@@ -541,6 +546,10 @@ class HybridSwitchTransformer(nn.Module):
                 continue
 
             layer_key = str(switch_stats["layer_id"])
+            router_assignments_by_layer[layer_key] = {
+                "top1_expert_ids": switch_stats["top1_expert_ids"],
+                "top1_gates": switch_stats["top1_gates"],
+            }
             router_aux_loss = router_aux_loss + switch_stats["router_aux_loss"]
             router_z_loss = router_z_loss + switch_stats["router_z_loss"]
             expert_activations = expert_activations + switch_stats["expert_activations"]
@@ -594,4 +603,5 @@ class HybridSwitchTransformer(nn.Module):
             "overflow_counts_by_layer": overflow_counts_by_layer,
             "avg_router_probs_by_layer": avg_router_probs_by_layer,
             "capacity_by_layer": capacity_by_layer,
+            "router_assignments_by_layer": router_assignments_by_layer,
         }

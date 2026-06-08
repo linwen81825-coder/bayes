@@ -639,6 +639,10 @@ class Server:
                             "expert_activations_by_layer",
                             None,
                         ),
+                        "expert_loss_by_layer": client_stats.get(
+                            "expert_loss_by_layer",
+                            None,
+                        ),
                     })
 
                     client_expert_usage = client_stats["expert_activations"].float().cpu()
@@ -933,6 +937,15 @@ class Server:
 
         if pism_summary is not None:
             # PISM summary 只打印轻量标量/字典，不输出 per-expert 大对象。
+            if pism_summary.get("uoc_foga_score_metric") == "grad_cosine":
+                self.logger.info(
+                    "[UOC-FOGA-PISM-FEATURE] "
+                    f"score_metric={pism_summary.get('uoc_foga_score_metric')} "
+                    f"input_dim={pism_summary.get('uoc_foga_pism_input_dim')} "
+                    f"consensus_grad_cos_mean={pism_summary.get('uoc_foga_pism_consensus_grad_cos_mean')} "
+                    f"consensus_grad_pos_frac_mean={pism_summary.get('uoc_foga_pism_consensus_grad_pos_frac_mean')} "
+                    f"expert_loss_z_std_mean={pism_summary.get('uoc_foga_pism_expert_loss_z_std_mean')}\n"
+                )
             self.logger.info(
                 "[UOC-FOGA-PISM-DIAG] "
                 f"score_std_mean={pism_summary.get('uoc_foga_pism_score_std_mean')} "
@@ -944,6 +957,11 @@ class Server:
                 f"foga_top_pism_weight_mean={pism_summary.get('uoc_foga_pism_foga_top_pism_weight_mean')}\n"
             )
             for key in (
+                "uoc_foga_score_metric",
+                "uoc_foga_pism_input_dim",
+                "uoc_foga_pism_consensus_grad_cos_mean",
+                "uoc_foga_pism_consensus_grad_pos_frac_mean",
+                "uoc_foga_pism_expert_loss_z_std_mean",
                 "uoc_foga_pism_meta_loss_mean",
                 "uoc_foga_pism_updated_experts",
                 "uoc_foga_pism_fallback_experts",

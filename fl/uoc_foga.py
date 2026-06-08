@@ -220,6 +220,57 @@ def dot_grad_to_grad(query_grad_state, client_grad_state, device=None):
     return float(score.item())
 
 
+def cosine_grad_to_grad(query_grad_state, client_grad_state, eps=1e-8, device=None):
+    """
+    计算 grad_cosine 分数：cos(g_client, g_query)。
+
+    grad_cosine 只比较梯度方向，避免 raw grad_dot 被梯度范数主导。
+    """
+    if not isinstance(query_grad_state, dict) or not isinstance(client_grad_state, dict):
+        return None
+
+    query_chunks = []
+    client_chunks = []
+    common_keys = set(query_grad_state.keys()) & set(client_grad_state.keys())
+    for key in sorted(common_keys):
+        query_tensor = query_grad_state.get(key)
+        client_tensor = client_grad_state.get(key)
+        if query_tensor is None or client_tensor is None:
+            continue
+        if not torch.is_tensor(query_tensor) or not torch.is_tensor(client_tensor):
+            continue
+        if not torch.is_floating_point(query_tensor) or not torch.is_floating_point(client_tensor):
+            continue
+
+        query_vec = query_tensor.detach()
+        client_vec = client_tensor.detach()
+        if device is not None:
+            query_vec = query_vec.to(device)
+            client_vec = client_vec.to(device)
+        query_vec = query_vec.reshape(-1)
+        client_vec = client_vec.reshape(-1)
+        if query_vec.shape != client_vec.shape:
+            continue
+
+        query_chunks.append(query_vec.float())
+        client_chunks.append(client_vec.float())
+
+    if not query_chunks:
+        return None
+
+    query_vec = torch.cat(query_chunks, dim=0)
+    client_vec = torch.cat(client_chunks, dim=0)
+    query_norm = torch.linalg.vector_norm(query_vec)
+    client_norm = torch.linalg.vector_norm(client_vec)
+    if query_norm.item() <= eps or client_norm.item() <= eps:
+        return 0.0
+
+    score = torch.dot(client_vec, query_vec) / (client_norm * query_norm + eps)
+    if not torch.isfinite(score):
+        return None
+    return float(score.item())
+
+
 def cosine_delta_to_negative_grad(delta_state, grad_state, eps=1e-12, device=None):
     return delta_to_negative_grad_score(
         delta_state,

@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from types import SimpleNamespace
 from torch import nn
@@ -117,6 +118,43 @@ class Client:
                 if value is not None:
                     total_stats[layer_key][stat_key] += value.to(self.device)
             total_stats[layer_key]["capacity"] = stats.get("capacity", total_stats[layer_key]["capacity"])
+
+    def add_expert_loss_stats(self, total_stats, result, per_sample_loss):
+        assignments_by_layer = result.get("router_assignments_by_layer") or {}
+        if not assignments_by_layer:
+            return
+
+        per_sample_loss = per_sample_loss.detach().to(self.device).float().reshape(-1)
+        for layer_id, assignments in assignments_by_layer.items():
+            if not isinstance(assignments, dict):
+                continue
+            top1_expert_ids = assignments.get("top1_expert_ids")
+            if top1_expert_ids is None or not torch.is_tensor(top1_expert_ids):
+                continue
+            if top1_expert_ids.dim() < 2 or top1_expert_ids.size(0) != per_sample_loss.size(0):
+                continue
+
+            layer_key = str(layer_id)
+            if layer_key not in total_stats:
+                total_stats[layer_key] = {
+                    "loss_sum": torch.zeros(self.args.num_experts, device=self.device),
+                    "loss_count": torch.zeros(self.args.num_experts, device=self.device),
+                }
+
+            expert_ids = top1_expert_ids.detach().to(self.device).long().reshape(-1)
+            token_losses = per_sample_loss.view(-1, 1).expand_as(top1_expert_ids).reshape(-1)
+            valid_mask = (expert_ids >= 0) & (expert_ids < self.args.num_experts)
+            if not torch.any(valid_mask):
+                continue
+
+            expert_ids = expert_ids[valid_mask]
+            token_losses = token_losses[valid_mask]
+            loss_sum = torch.zeros(self.args.num_experts, device=self.device)
+            loss_count = torch.zeros(self.args.num_experts, device=self.device)
+            loss_sum.scatter_add_(0, expert_ids, token_losses)
+            loss_count.scatter_add_(0, expert_ids, torch.ones_like(token_losses))
+            total_stats[layer_key]["loss_sum"] += loss_sum
+            total_stats[layer_key]["loss_count"] += loss_count
 
     def _should_collect_uoc_evidence_before_train(self):
         expert_method = getattr(self.args, "expert_agg_method", "")
@@ -256,6 +294,7 @@ class Client:
         last_avg_router_probs = torch.zeros(self.args.num_experts, device=self.device)
         local_usage_total = torch.zeros(self.args.num_experts, device=self.device)
         local_layer_usage_total = {}
+        local_expert_loss_by_layer = {}
         round_loss_total = 0.0
         round_corrects = torch.zeros((), device=self.device)
         round_total_samples = 0
@@ -287,7 +326,8 @@ class Client:
                 result = self.model(inputs)
                 outputs = result["logits"]
                 extra_loss, router_aux_loss, router_z_loss = self.get_auxiliary_losses(result)
-                loss = self.criterion(outputs, labels) + extra_loss
+                per_sample_ce_loss = F.cross_entropy(outputs, labels, reduction="none")
+                loss = per_sample_ce_loss.mean() + extra_loss
                 loss.backward()
                 if grad_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(
@@ -306,6 +346,11 @@ class Client:
 
                 usage_total += self.get_expert_activations(result)
                 self.add_layer_stats(layer_usage_total, self.get_layer_expert_stats(result))
+                self.add_expert_loss_stats(
+                    local_expert_loss_by_layer,
+                    result,
+                    per_sample_ce_loss,
+                )
                 router_prob_sum += self.get_avg_router_probs(result) * batch_size
 
             train_loss = running_loss / len(self.train_loader.dataset)
@@ -379,6 +424,13 @@ class Client:
             }
             for layer_id, stats in local_layer_usage_total.items()
         }
+        expert_loss_by_layer_cpu = {
+            layer_id: {
+                stat_key: value.detach().cpu()
+                for stat_key, value in stats.items()
+            }
+            for layer_id, stats in local_expert_loss_by_layer.items()
+        }
         result = {
             "expert_activations": local_usage_total.detach().cpu(),
             "expert_stats_by_layer": layer_stats_cpu,
@@ -386,6 +438,7 @@ class Client:
                 layer_id: stats["expert_activations"]
                 for layer_id, stats in layer_stats_cpu.items()
             },
+            "expert_loss_by_layer": expert_loss_by_layer_cpu,
             "uoc_evidence_by_layer": uoc_evidence_by_layer,
             "train_loss": round_train_loss,
             "client_loss": round_train_loss,
