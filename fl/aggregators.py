@@ -978,7 +978,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
                 device=device,
             )
             if score_metric in {"grad_dot", "grad_cosine"}:
-                score, _, client_set_size, cos_delta_neg_gclient, _ = self._compute_client_grad_dot_score(
+                score, expert_client_loss, client_set_size, cos_delta_neg_gclient, client_grad_state = self._compute_client_grad_dot_score(
                     global_model=global_model,
                     uoc_evidences=uoc_evidences,
                     client_idx=client_idx,
@@ -2157,6 +2157,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             )
 
         if score_metric == "grad_dot":
+            # 防御性检查：grad_cosine 配置下绝对不能误走 grad_dot 的两维 PISM 输入路径。
+            if self.score_metric == "grad_cosine":
+                raise ValueError(
+                    "grad_cosine score_metric must not use build_grad_dot_pism_feature_tensor"
+                )
             # grad_dot 的 score 由梯度内积监督；PISM 输入只使用 client 级 loss 和样本数。
             features = build_grad_dot_pism_feature_tensor(
                 expert_client_loss=expert_client_losses,
