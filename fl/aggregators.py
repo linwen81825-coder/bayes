@@ -2190,6 +2190,12 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             )
             features = self._select_pism_features_for_config(features)
             metric["pism_input_names"] = self._pism_input_names_for_config()
+        if score_metric == "grad_cosine" and features.size(-1) != 6:
+            raise ValueError("grad_cosine PISM features must have input_dim=6")
+        if features.size(-1) != self.pism_input_dim:
+            raise ValueError(
+                f"PISM feature dim mismatch: expected {self.pism_input_dim}, got {features.size(-1)}"
+            )
         if self.pism_renorm_inputs and score_metric != "grad_cosine":
             features = normalize_pism_inputs(features)
         if not torch.isfinite(features).all():
