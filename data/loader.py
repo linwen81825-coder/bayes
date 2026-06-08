@@ -12,7 +12,6 @@ EXPECTED_VERSION = 2
 
 def get_cifar_stats(data_name):
     """Return dataset class, normalization stats, and class count."""
-
     data_dict = {
         "cifar10": (
             CIFAR10,
@@ -27,48 +26,93 @@ def get_cifar_stats(data_name):
             100,
         ),
     }
+
     if data_name not in data_dict:
         raise ValueError(f"Unsupported dataset: {data_name}")
+
     return data_dict[data_name]
 
 
 def build_transforms(data_name):
     """Use augmentation for client training and plain transforms for eval."""
-
     _, mean, std, _ = get_cifar_stats(data_name)
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-    ])
-    eval_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-    ])
+
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+    )
+
+    eval_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+    )
+
     return train_transform, eval_transform
+
+
+def _as_bool(value) -> bool:
+    """
+    将配置值安全转成 bool。
+
+    这样即使后续配置里写成字符串 "true" / "false"，也不会出现
+    bool("false") == True 这种坑。
+    """
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    return bool(value)
 
 
 def _use_pin_memory(args) -> bool:
     """仅在 CUDA 训练时启用 pin_memory。"""
-    return bool(getattr(args, "pin_memory", False)) and str(args.device).startswith("cuda")
+    return _as_bool(getattr(args, "pin_memory", False)) and str(args.device).startswith(
+        "cuda"
+    )
 
 
 def _build_loader_kwargs(args):
+    """
+    构造 DataLoader 参数。
+
+    关键修复：
+    1. 不再强制 persistent_workers=True。
+    2. persistent_workers 改成可配置，默认 False。
+    3. 只有 num_workers > 0 时才传 persistent_workers / prefetch_factor。
+       因为 num_workers=0 时传这些参数会触发 PyTorch DataLoader 报错。
+
+    对当前 FL 多客户端场景更稳：
+    - 每轮多个 client 会反复创建/使用 DataLoader；
+    - 如果强制 persistent_workers=True，worker 进程和共享内存句柄容易堆积；
+    - 默认 False 可以降低 Too many open files 风险。
+    """
     num_workers = int(getattr(args, "num_workers", 0))
+
     loader_kwargs = {
         "num_workers": num_workers,
         "pin_memory": _use_pin_memory(args),
     }
+
     if num_workers > 0:
-        # 仅在 worker 模式下传入这些参数，避免 num_workers=0 时触发 PyTorch 报错。
-        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["persistent_workers"] = _as_bool(
+            getattr(args, "persistent_workers", False)
+        )
         loader_kwargs["prefetch_factor"] = int(getattr(args, "prefetch_factor", 2))
+
     return loader_kwargs
 
 
 def load_partition_meta(args):
     meta_path = os.path.join(args.data_save_path, args.partition_meta_name)
+
     if not os.path.exists(meta_path):
         raise FileNotFoundError(
             f"Missing partition metadata: {meta_path}. "
@@ -77,12 +121,12 @@ def load_partition_meta(args):
 
     meta = torch.load(meta_path, weights_only=False)
     validate_partition_meta(meta, args)
+
     return meta
 
 
 def validate_partition_meta(meta, args):
     """Fail fast when saved partition metadata does not match current args."""
-
     validate_partition_structure(meta, args)
 
     checks = [
@@ -103,8 +147,8 @@ def validate_partition_meta(meta, args):
 
 def validate_partition_structure(meta, args):
     """Check only top-level split structure so bad metadata fails early."""
-
     splits = meta.get("splits")
+
     if not isinstance(splits, dict):
         raise ValueError(
             "partition_meta is incomplete: missing a valid `splits` dictionary. "
@@ -116,6 +160,7 @@ def validate_partition_structure(meta, args):
         "client_train_indices",
         "global_test_indices",
     }
+
     missing = required_split_keys - set(splits.keys())
     if missing:
         raise ValueError(
@@ -131,6 +176,7 @@ def validate_partition_structure(meta, args):
 
     expected_client_keys = {str(i) for i in range(1, args.num_clients + 1)}
     actual_client_keys = set(splits["client_train_indices"].keys())
+
     if actual_client_keys != expected_client_keys:
         raise ValueError(
             "partition_meta has incomplete client_train_indices keys: "
@@ -156,12 +202,18 @@ def validate_partition_structure(meta, args):
 def metadata_value_matches(actual, expected, value_type):
     if actual is None:
         return False
+
     if value_type == "float":
         return abs(float(actual) - float(expected)) <= 1e-12
+
     if value_type == "int":
         return int(actual) == int(expected)
+
     if value_type == "path":
-        return os.path.abspath(os.path.normpath(str(actual))) == os.path.abspath(os.path.normpath(str(expected)))
+        return os.path.abspath(os.path.normpath(str(actual))) == os.path.abspath(
+            os.path.normpath(str(expected))
+        )
+
     return actual == expected
 
 
@@ -174,6 +226,7 @@ def raise_partition_mismatch(field, actual, expected):
 
 def build_raw_cifar_dataset(args, train, transform):
     dataset_cls, _, _, _ = get_cifar_stats(args.data_name)
+
     try:
         return dataset_cls(
             root=args.data_path,
@@ -181,6 +234,7 @@ def build_raw_cifar_dataset(args, train, transform):
             download=False,
             transform=transform,
         )
+
     except FileNotFoundError as e:
         raise FileNotFoundError(
             f"Could not load raw CIFAR data from `{args.data_path}` with download=False. "
@@ -188,10 +242,20 @@ def build_raw_cifar_dataset(args, train, transform):
             "the original CIFAR files. Run `python train.py` to rebuild partition files "
             "after ensuring the dataset is available."
         ) from e
+
     except RuntimeError as e:
         error_text = str(e).lower()
+
         missing_keywords = ["not found", "dataset not found", "no such file", "download"]
-        corrupt_keywords = ["corrupt", "corrupted", "truncate", "truncated", "invalid", "pickle", "unpickling"]
+        corrupt_keywords = [
+            "corrupt",
+            "corrupted",
+            "truncate",
+            "truncated",
+            "invalid",
+            "pickle",
+            "unpickling",
+        ]
 
         if any(keyword in error_text for keyword in missing_keywords):
             raise FileNotFoundError(
@@ -216,6 +280,7 @@ def build_raw_cifar_dataset(args, train, transform):
             "the original CIFAR files. Please check data_path, then run `python train.py` "
             "to rebuild partition files after ensuring the dataset can be read."
         ) from e
+
     except Exception as e:
         raise RuntimeError(
             f"Unexpected error while loading raw CIFAR data from `{args.data_path}` with download=False. "
@@ -226,19 +291,22 @@ def build_raw_cifar_dataset(args, train, transform):
 
 def build_index_dataset(args, split, client_id=None, meta=None):
     """Build a Dataset from raw CIFAR data plus saved partition indices."""
-
     meta = meta or load_partition_meta(args)
+
     train_transform, eval_transform = build_transforms(args.data_name)
     splits = meta["splits"]
 
     if split == "client_train":
         if client_id is None:
             raise ValueError("client_id is required for client_train split")
+
         indices = splits["client_train_indices"][str(client_id)]
         dataset = build_raw_cifar_dataset(args, train=True, transform=train_transform)
+
     elif split == "global_test":
         indices = splits["global_test_indices"]
         dataset = build_raw_cifar_dataset(args, train=False, transform=eval_transform)
+
     else:
         raise ValueError(f"Unknown split: {split}")
 
@@ -252,6 +320,7 @@ def build_client_train_loader(args, client_id, meta=None):
         client_id=client_id,
         meta=meta,
     )
+
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -265,6 +334,7 @@ def build_global_eval_loader(args, split, meta=None):
         raise ValueError("split must be global_test")
 
     dataset = build_index_dataset(args=args, split=split, meta=meta)
+
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
