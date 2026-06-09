@@ -440,11 +440,6 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             "fallback_to_random": bool(
                 getattr(self.args, "uoc_foga_query_fallback_to_random", True)
             ),
-            # mixed_global_expert 模式专用：只影响 g_query 的 D_query,l,e；
-            # g_client,i,l,e 仍然由 build_client_grad_query_for_expert 使用客户端自己的 evidence 构造。
-            "global_query_ratio": float(
-                getattr(self.args, "uoc_foga_global_query_ratio", 0.5)
-            ),
         }
 
     def _copy_query_stats_to_metric(self, metric, query):
@@ -461,12 +456,6 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             "expert_token_ratio_max",
             "query_entropy_mean",
             "max_samples_per_client_per_class",
-            "global_query_ratio",
-            "mixed_global_query_size",
-            "mixed_expert_query_size",
-            "mixed_global_query_num_classes",
-            "mixed_expert_query_num_classes",
-            "mixed_global_ratio_effective",
         ):
             if key in query:
                 metric[key] = query[key]
@@ -545,33 +534,15 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         return metric
 
     def _get_client_grad_query_kwargs(self):
-        """
-        构造 g_client,i,l,e 使用的 client-grad query 参数。
-
-        注意：
-        - mixed_global_expert 只用于服务端全局 g_query 的 D_query,l,e；
-        - g_client,i,l,e 仍然在客户端 i 自己的 expert evidence 上算；
-        - 因此当全局 query_select_mode 是 mixed_global_expert 时，
-          client-grad query 自动回退到 expert_ratio_entropy。
-        """
-        query_select_mode = getattr(
-            self.args,
-            "uoc_foga_query_select_mode",
-            "class_balanced_random",
-        )
-
-        # mixed_global_expert 是 g_query 的混合全局 query 构造方式，
-        # build_client_grad_query_for_expert 不支持也不应该使用它。
-        if query_select_mode == "mixed_global_expert":
-            client_grad_query_select_mode = "expert_ratio_entropy"
-        else:
-            client_grad_query_select_mode = query_select_mode
-
         return {
             "query_per_class": self.uoc_foga_client_grad_query_per_class,
             "min_query_samples": self.uoc_foga_client_grad_min_samples_per_expert,
             "min_classes": self.uoc_foga_client_grad_min_classes_per_expert,
-            "query_select_mode": client_grad_query_select_mode,
+            "query_select_mode": getattr(
+                self.args,
+                "uoc_foga_query_select_mode",
+                "class_balanced_random",
+            ),
             "min_expert_token_ratio": self.uoc_foga_client_grad_min_expert_token_ratio,
             "max_samples_per_client_per_class": (
                 self.uoc_foga_client_grad_max_samples_per_client_per_class
