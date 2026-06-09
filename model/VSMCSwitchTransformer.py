@@ -20,6 +20,7 @@ class SwitchRouterStats:
     - expert_counts 是本层所有 token 对每个 expert 的使用次数，shape=[E]
     - sample_expert_counts 是每个样本内部每个 expert 的 token 数，shape=[B, E]
     """
+
     router_probs: torch.Tensor
     expert_counts: torch.Tensor
     sample_expert_counts: torch.Tensor
@@ -31,9 +32,8 @@ class SwitchFeedForward(nn.Module):
     """
     VSMC 风格的 Top-1 Switch FFN。
 
-    每个 token 只路由到一个 expert：
-        router(x) -> softmax -> top1 expert
-        expert_output * top1_prob
+    正常前向：
+        router(x) -> softmax -> top1 expert -> expert_output * top1_prob
 
     expert 结构：
         Linear(hidden_dim, ffn_dim)
@@ -56,7 +56,7 @@ class SwitchFeedForward(nn.Module):
         self.router = nn.Linear(hidden_dim, num_experts)
 
         # 保留 VSMC 原项目里的 server-side router adaptation 参数。
-        # 只跑普通 FedAvg 时它们不会训练，也不会影响主流程。
+        # 只跑普通 FedAvg / 你的算法时，默认不会训练这些参数。
         self.router.server_temperature = nn.Parameter(
             torch.ones(()),
             requires_grad=False,
@@ -88,7 +88,7 @@ class SwitchFeedForward(nn.Module):
     ) -> torch.Tensor:
         """
         兼容 VSMC 原项目的 server_temperature / server_bias。
-        只跑 FedAvg 时，一般不需要关心这个函数。
+        普通 FedAvg 和当前 MPSL 算法一般不会显式使用。
         """
         if hasattr(self.router, "server_temperature") and self.router.server_temperature is not None:
             temp_min = float(
@@ -174,8 +174,8 @@ class SwitchFeedForward(nn.Module):
             aux_loss=aux_loss,
         )
 
-        # 这些 raw 张量用于模型 forward 汇总分层统计。
-        # router_probs_raw 不 detach，方便将来如需 server/router adaptation 时保留梯度。
+        # 这些 raw 张量用于模型 forward 汇总分层统计，也用于 collect_uoc_evidence。
+        # router_probs_raw 不 detach，方便将来如需 router adaptation 时保留梯度。
         stats.router_probs_raw = router_probs
         stats.router_logits_raw = router_logits
         stats.router_probs_tokens_raw = router_probs.view(
@@ -190,6 +190,54 @@ class SwitchFeedForward(nn.Module):
         )
 
         return flat_output.reshape(batch_size, seq_len, hidden_dim), stats
+
+    def forward_force_expert(
+        self,
+        x: torch.Tensor,
+        expert_id: int,
+        gate_mode: str = "one",
+    ) -> torch.Tensor:
+        """
+        强制所有 token 经过指定 expert。
+
+        这个接口只用于 UOC-FOGA / PISM 的 query 梯度计算，
+        不影响正常 forward。
+
+        参数：
+            x: [B, T, D]，某层 FFN 输入 hidden
+            expert_id: 强制使用的 expert 编号
+            gate_mode:
+                - "one": 不乘 router gate，直接使用 expert 输出
+                - "top1_gate" / "router_prob": 乘当前 router 对该 expert 的概率
+        """
+        expert_id = int(expert_id)
+        if expert_id < 0 or expert_id >= self.num_experts:
+            raise ValueError(
+                f"expert_id must be in [0, {self.num_experts}), got {expert_id}"
+            )
+
+        hidden_dim = x.size(-1)
+        flat_x = x.reshape(-1, hidden_dim)
+        forced_output = self.experts[expert_id](flat_x)
+
+        if gate_mode in {"one", "force_one", None}:
+            pass
+        elif gate_mode in {"top1_gate", "router_prob", "prob"}:
+            router_logits = self.router(flat_x)
+            router_logits = self._apply_server_router_adapt(
+                router_logits,
+                server_adapt_config=None,
+            )
+            router_probs = F.softmax(router_logits, dim=-1)
+            gate = router_probs[:, expert_id].unsqueeze(-1)
+            forced_output = forced_output * gate
+        else:
+            raise ValueError(
+                f"Unsupported gate_mode={gate_mode!r}. "
+                f"Supported: 'one', 'top1_gate', 'router_prob'."
+            )
+
+        return forced_output.reshape_as(x)
 
 
 class SwitchTransformerBlock(nn.Module):
@@ -251,11 +299,51 @@ class SwitchTransformerBlock(nn.Module):
         x = x + ffn_output
 
         if return_moe_inputs:
+            # hidden 是 FFN 输入，即 ffn_norm 后的 token 表示。
             stats.moe_input_raw = ffn_input
+
+            # residual 是 FFN 残差相加前的 block 状态。
             stats.block_residual_input_raw = ffn_residual_input
+
+            # block_output_raw 是当前 block 完成后的输出。
             stats.block_output_raw = x
 
         return x, stats
+
+    def forward_from_ffn_input(
+        self,
+        hidden: torch.Tensor,
+        force_expert_id: int,
+        gate_mode: str = "one",
+        residual: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        从采集到的 FFN 输入 hidden 开始，强制经过指定 expert。
+
+        参数：
+            hidden:
+                当前 MoE 层 FFN 输入，通常是 ffn_norm 后的 hidden，shape=[B,T,D]
+            force_expert_id:
+                强制使用的 expert id
+            gate_mode:
+                强制 expert 输出是否乘 gate
+            residual:
+                FFN 残差相加前的 block 状态，shape=[B,T,D]
+
+        返回：
+            当前 block 的输出，shape=[B,T,D]
+        """
+        forced_ffn_output = self.switch_ffn.forward_force_expert(
+            hidden,
+            expert_id=force_expert_id,
+            gate_mode=gate_mode,
+        )
+
+        if residual is None:
+            # 兼容没有 residual 的旧 evidence；不推荐但能避免直接崩。
+            residual = hidden
+
+        return residual + forced_ffn_output
 
 
 class SwitchTransformerClassifier(nn.Module):
@@ -275,6 +363,7 @@ class SwitchTransformerClassifier(nn.Module):
     注意：
     - forward 返回 MPSL client.py 需要的 dict。
     - 参数名保留 blocks.*.switch_ffn.experts.*，方便 MPSL 聚合器识别 expert 参数。
+    - 额外补了 collect_uoc_evidence / forward_uoc_from_hidden，用于 UOC-FOGA / PISM。
     """
 
     def __init__(
@@ -353,10 +442,10 @@ class SwitchTransformerClassifier(nn.Module):
         """
         构建图像 tokenizer。
 
-        patch_embed：
+        patch_embed:
             Conv2d 直接把图像切成 patch token。
 
-        resnet18 / resnet34 / resnet50：
+        resnet18 / resnet34 / resnet50:
             CIFAR 版本 ResNet stem：
             conv1 改成 3x3 stride=1，去掉 maxpool，
             最后用 1x1 conv 投影到 hidden_dim。
@@ -442,6 +531,25 @@ class SwitchTransformerClassifier(nn.Module):
                 nn.init.trunc_normal_(module.weight, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
+
+    def _tokenize(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        图像转 token，并加入 CLS token 与位置编码。
+        """
+        x = self.tokenizer(x)
+        x = x.flatten(2).transpose(1, 2)
+
+        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
+        if x.size(1) != self.pos_embed.size(1):
+            raise RuntimeError(
+                f"Position embedding length mismatch: "
+                f"x has {x.size(1)} tokens, pos_embed has {self.pos_embed.size(1)} tokens. "
+                f"请检查 image_size / tokenizer 输出尺寸是否一致。"
+            )
+
+        return self.dropout(x + self.pos_embed)
 
     def _build_mpsl_output(
         self,
@@ -532,20 +640,7 @@ class SwitchTransformerClassifier(nn.Module):
         参数 return_aux 保留只是为了兼容调用签名；
         不管 return_aux 是 True/False，这里都返回 dict。
         """
-        x = self.tokenizer(x)
-        x = x.flatten(2).transpose(1, 2)
-
-        cls_tokens = self.cls_token.expand(x.size(0), -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-
-        if x.size(1) != self.pos_embed.size(1):
-            raise RuntimeError(
-                f"Position embedding length mismatch: "
-                f"x has {x.size(1)} tokens, pos_embed has {self.pos_embed.size(1)} tokens. "
-                f"请检查 image_size / tokenizer 输出尺寸是否一致。"
-            )
-
-        x = self.dropout(x + self.pos_embed)
+        x = self._tokenize(x)
 
         aux_losses = []
         expert_counts = []
@@ -631,6 +726,120 @@ class SwitchTransformerClassifier(nn.Module):
             )
 
         return self._build_mpsl_output(logits=logits, router_stats=router_stats)
+
+    @torch.no_grad()
+    def collect_uoc_evidence(
+        self,
+        x: torch.Tensor,
+        max_samples: Optional[int] = None,
+        use_top1: bool = True,
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
+        """
+        采集 UOC-FOGA / PISM 需要的 evidence。
+
+        返回格式：
+            {
+                "0": {
+                    "hidden": [B,T,D],
+                    "residual": [B,T,D],
+                    "top1_expert_ids": [B,T],
+                    "top1_gates": [B,T],
+                    "entropy": [B],
+                },
+                "1": {...}
+            }
+
+        说明：
+        - hidden 是当前 MoE 层 FFN 输入，即 ffn_norm 后的 token 表示。
+        - residual 是 FFN 残差相加前的 block 状态。
+        - top1_expert_ids 是原 router 正常选择的 expert。
+        - top1_gates 是 router 对 top1 expert 的概率。
+        """
+        if not use_top1:
+            raise ValueError("VSMC collect_uoc_evidence currently supports use_top1=True only.")
+
+        if max_samples is not None:
+            x = x[:max_samples]
+
+        was_training = self.training
+        self.eval()
+
+        try:
+            tokens = self._tokenize(x)
+            uoc_evidence: Dict[str, Dict[str, torch.Tensor]] = {}
+
+            for layer_id, block in enumerate(self.blocks):
+                tokens, stats = block(
+                    tokens,
+                    server_adapt_config=None,
+                    return_moe_inputs=True,
+                )
+
+                router_probs_tokens = stats.router_probs_tokens_raw.detach()
+                top1_expert_ids = stats.selected_experts.detach()
+                top1_gates = router_probs_tokens.gather(
+                    dim=-1,
+                    index=top1_expert_ids.unsqueeze(-1),
+                ).squeeze(-1)
+
+                uoc_evidence[str(layer_id)] = {
+                    "hidden": stats.moe_input_raw.detach(),
+                    "residual": stats.block_residual_input_raw.detach(),
+                    "top1_expert_ids": top1_expert_ids.detach(),
+                    "top1_gates": top1_gates.detach(),
+                }
+
+            final_tokens = self.norm(tokens)
+            logits = self.classifier(final_tokens[:, 0])
+            probs = torch.softmax(logits.float(), dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=-1).detach()
+
+            for layer_evidence in uoc_evidence.values():
+                layer_evidence["entropy"] = entropy.detach()
+
+            return uoc_evidence
+
+        finally:
+            self.train(was_training)
+
+    def forward_uoc_from_hidden(
+        self,
+        hidden: torch.Tensor,
+        layer_id: int | str,
+        force_expert_id: int,
+        gate_mode: str = "one",
+        residual: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        从某一层 MoE 的 hidden 开始，强制经过指定 expert，
+        然后继续跑后续 Transformer block 和 classifier。
+
+        这个接口只用于服务器端 UOC-FOGA / PISM 聚合。
+        """
+        layer_index = int(layer_id)
+        if layer_index < 0 or layer_index >= len(self.blocks):
+            raise ValueError(f"layer_id is outside model depth: {layer_id}")
+
+        block = self.blocks[layer_index]
+
+        x = block.forward_from_ffn_input(
+            hidden=hidden,
+            force_expert_id=force_expert_id,
+            gate_mode=gate_mode,
+            residual=residual,
+        )
+
+        for next_block in self.blocks[layer_index + 1:]:
+            x, _ = next_block(
+                x,
+                server_adapt_config=None,
+                return_moe_inputs=False,
+            )
+
+        x = self.norm(x)
+        logits = self.classifier(x[:, 0])
+
+        return {"logits": logits}
 
     def forward_from_block_output(
         self,
