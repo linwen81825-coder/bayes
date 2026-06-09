@@ -1296,7 +1296,8 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         )
         self.score_metric = self._get_score_metric()
         if self.score_metric == "grad_cosine":
-            self.pism_input_dim = 6
+            # grad_cosine 版删掉绝对 usage 特征 log_usage_z，只保留 5 维 PISM 输入。
+            self.pism_input_dim = 5
         else:
             self.pism_input_dim = int(getattr(args, "uoc_foga_pism_input_dim", 5))
         if self.score_metric == "grad_cosine":
@@ -1382,7 +1383,6 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         if self.score_metric == "grad_cosine":
             return [
                 "expert_loss_z",
-                "log_usage_z",
                 "usage_ratio_z",
                 "consensus_grad_cos",
                 "consensus_grad_rank_norm",
@@ -1763,7 +1763,8 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         expert_usage = torch.nan_to_num(expert_usage, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
         total_layer_usage = torch.nan_to_num(total_layer_usage, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
 
-        log_usage_z = _safe_zscore(torch.log1p(expert_usage), device=device)
+        # 删掉 log_usage_z：绝对 expert usage 容易成为客户端样本量代理，
+        # 只保留 usage_ratio_z 表示该 expert 在当前客户端当前层中的相对重要性。
         usage_ratio = torch.where(
             total_layer_usage > 0.0,
             expert_usage / total_layer_usage.clamp_min(1e-8),
@@ -1778,7 +1779,6 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         features = torch.stack(
             [
                 expert_loss_z,
-                log_usage_z,
                 usage_ratio_z,
                 consensus_grad_cos,
                 consensus_grad_rank_norm,
@@ -2195,8 +2195,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             )
             features = self._select_pism_features_for_config(features)
             metric["pism_input_names"] = self._pism_input_names_for_config()
-        if score_metric == "grad_cosine" and features.size(-1) != 6:
-            raise ValueError("grad_cosine PISM features must have input_dim=6")
+        if score_metric == "grad_cosine" and features.size(-1) != 5:
+            raise ValueError(
+                "grad_cosine PISM features must have input_dim=5 after removing log_usage_z"
+            )
         if features.size(-1) != self.pism_input_dim:
             raise ValueError(
                 f"PISM feature dim mismatch: expected {self.pism_input_dim}, got {features.size(-1)}"
