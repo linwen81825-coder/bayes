@@ -106,7 +106,7 @@ uoc_foga:
   # 是否打印完整 per-expert UOC 详情：true / false
   uoc_foga_log_detail: false
 
-  # query 筛选模式：class_balanced_random 保持旧行为，expert_ratio_entropy 启用增强筛选
+  # query 筛选模式：class_balanced_random 保持旧行为，expert_ratio_entropy 启用增强筛选,mixed_global_expert
   uoc_foga_query_select_mode: expert_ratio_entropy
 
   # expert token 命中比例阈值；旧模式默认不额外过滤
@@ -117,6 +117,8 @@ uoc_foga:
 
   # 增强筛选后 query 不足时是否回退到旧随机 class-balanced
   uoc_foga_query_fallback_to_random: true
+
+  uoc_foga_global_query_ratio: 0.5
 
   # grad_dot 的 client-grad set 单独采样参数。
   # 这些参数只影响 g_client 的 D_client,i,l,e 构造，不影响全局 query set。
