@@ -946,6 +946,14 @@ class Server:
                     f"consensus_grad_pos_frac_mean={pism_summary.get('uoc_foga_pism_consensus_grad_pos_frac_mean')} "
                     f"expert_loss_z_std_mean={pism_summary.get('uoc_foga_pism_expert_loss_z_std_mean')}\n"
                 )
+                self.logger.info(
+                    "[UOC-FOGA-MIXED-QUERY] "
+                    f"global_size_mean={pism_summary.get('uoc_foga_mixed_global_query_size_mean')} "
+                    f"expert_size_mean={pism_summary.get('uoc_foga_mixed_expert_query_size_mean')} "
+                    f"global_classes_mean={pism_summary.get('uoc_foga_mixed_global_query_num_classes_mean')} "
+                    f"expert_classes_mean={pism_summary.get('uoc_foga_mixed_expert_query_num_classes_mean')} "
+                    f"global_ratio_effective_mean={pism_summary.get('uoc_foga_mixed_global_ratio_effective_mean')}\n"
+                )
             self.logger.info(
                 "[UOC-FOGA-PISM-DIAG] "
                 f"score_std_mean={pism_summary.get('uoc_foga_pism_score_std_mean')} "
@@ -962,6 +970,11 @@ class Server:
                 "uoc_foga_pism_consensus_grad_cos_mean",
                 "uoc_foga_pism_consensus_grad_pos_frac_mean",
                 "uoc_foga_pism_expert_loss_z_std_mean",
+                "uoc_foga_mixed_global_query_size_mean",
+                "uoc_foga_mixed_expert_query_size_mean",
+                "uoc_foga_mixed_global_query_num_classes_mean",
+                "uoc_foga_mixed_expert_query_num_classes_mean",
+                "uoc_foga_mixed_global_ratio_effective_mean",
                 "uoc_foga_pism_meta_loss_mean",
                 "uoc_foga_pism_updated_experts",
                 "uoc_foga_pism_fallback_experts",
