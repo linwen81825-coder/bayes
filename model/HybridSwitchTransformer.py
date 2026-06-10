@@ -49,16 +49,24 @@ class ResNet18LightCIFARBackbone(nn.Module):
     """
     轻量版 CIFAR ResNet18 backbone。
 
-    和完整 ResNet18CIFARBackbone 的区别：
+    这版不是新增 backbone 名字，而是直接把原来的 resnet18_light 改成 4x4 输出版本。
+
+    结构：
     - 保留 conv1 + bn1 + relu + maxpool + layer1 + layer2 + layer3；
-    - 去掉最强、最重的 layer4；
-    - 输出通道从 512 降到 256；
-    - 比 cnn_stem 强，比完整 resnet18 弱。
+    - 不使用 layer4；
+    - 在 layer3 后面加 AvgPool2d(kernel_size=2, stride=2)，把 8x8 下采样到 4x4；
+    - 输出通道仍然是 256；
+    - AvgPool2d 没有可学习参数，不会新增模型参数。
+
+    输出 shape：
+    - layer3 输出: [B, 256, 8, 8]
+    - avgpool 后: [B, 256, 4, 4]
 
     设计目的：
-    - 降低共享 backbone 对 FedAvg 的兜底能力；
-    - 保留足够好的 token 表示，避免 UOC/FOGA/PISM evidence 像 cnn_stem 那样变差；
-    - 让专家聚合更容易体现差异。
+    - backbone 比完整 resnet18 弱；
+    - 不像原来的 resnet18_light 那样保留 8x8 真实空间 token；
+    - 后续 token 数限制为 4x4=16，避免 FedAvg 被 64 个真实 token 托高；
+    - 保留 ResNet 残差表征，不像 cnn_stem 那样把 evidence 质量削得太狠。
     """
 
     def __init__(self):
@@ -80,6 +88,8 @@ class ResNet18LightCIFARBackbone(nn.Module):
         backbone.maxpool = nn.Identity()
 
         # 轻量版只保留到 layer3，不使用 layer4。
+        # layer3 输出是 [B, 256, 8, 8]。
+        # 最后加一个无参数 AvgPool2d，把 8x8 下采样成 4x4。
         self.features = nn.Sequential(
             backbone.conv1,
             backbone.bn1,
@@ -88,9 +98,10 @@ class ResNet18LightCIFARBackbone(nn.Module):
             backbone.layer1,
             backbone.layer2,
             backbone.layer3,
+            nn.AvgPool2d(kernel_size=2, stride=2),
         )
 
-        # ResNet18 的 layer3 输出通道是 256。
+        # ResNet18 的 layer3 输出通道是 256；后面的 AvgPool2d 只改空间大小，不改通道数。
         self.out_channels = 256
 
     def forward(self, x):
