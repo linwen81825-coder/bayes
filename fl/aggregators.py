@@ -1428,7 +1428,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             getattr(args, "uoc_foga_pism_tau_decay", 1.0)
         )
         self._validate_pism_tau_schedule()
-        self.pism_renorm_inputs = bool(getattr(args, "uoc_foga_pism_renorm_inputs", True))
+        # 全局控制所有 PISM 输入是否按有效客户端维度做 z-score。
+        # 注意：这个开关对 cosine / grad_cosine / grad_dot / delta_consensus 等所有 score_metric 都生效；
+        # false 时保留 raw PISM 输入，例如 [client_loss, log1p(expert_usage), log1p(delta_norm)]。
+        self.pism_renorm_inputs = bool(getattr(args, "uoc_foga_pism_renorm_inputs", False))
         self.pism_min_clients = int(getattr(args, "uoc_foga_pism_min_clients", 2))
         self.uoc_foga_pism_min_weight_factor = float(
             getattr(args, "uoc_foga_pism_min_weight_factor", 0.0)
@@ -2506,7 +2509,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             raise ValueError(
                 f"PISM feature dim mismatch: expected {self.pism_input_dim}, got {features.size(-1)}"
             )
-        if self.pism_renorm_inputs and score_metric != "grad_cosine":
+        if self.pism_renorm_inputs:
             features = normalize_pism_inputs(features)
         if not torch.isfinite(features).all():
             return metric, self._fallback_expert(

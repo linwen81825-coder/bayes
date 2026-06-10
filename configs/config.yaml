@@ -98,7 +98,7 @@ uoc_foga:
   uoc_foga_score_mode: relu
 
   uoc_foga_score_tau: 0.5
-  
+
   # score 计算度量：
   # - cosine：旧版 delta 与 -query_grad 的 cosine
   # - dot：旧版 delta 与 -query_grad 的 dot
@@ -107,6 +107,8 @@ uoc_foga:
   # - delta_consensus：leave-one-out delta 共识方向
   uoc_foga_score_metric: grad_cosine
 
+  uoc_foga_pism_renorm_inputs: false
+  
   # 最少有效客户端数：正整数
   uoc_foga_min_valid_clients: 2
 
