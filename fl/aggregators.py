@@ -1364,9 +1364,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         )
         self.score_metric = self._get_score_metric()
         if self.score_metric == "grad_cosine":
-            # grad_cosine 版删掉绝对 usage 以及离散 consensus rank/pos flag，
-            # 只保留 3 维 PISM 输入：expert_loss_z / usage_ratio_z / consensus_grad_cos。
-            self.pism_input_dim = 3
+            # grad_cosine 版进一步做干净消融：删掉所有 consensus 输入，
+            # 只保留 2 维 PISM 输入：expert_loss_z / usage_ratio_z。
+            # consensus_grad_cos 仍然只作为诊断日志保留，不参与 PISM 权重生成。
+            self.pism_input_dim = 2
         else:
             self.pism_input_dim = int(getattr(args, "uoc_foga_pism_input_dim", 5))
         if self.score_metric == "grad_cosine":
@@ -1478,7 +1479,6 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             return [
                 "expert_loss_z",
                 "usage_ratio_z",
-                "consensus_grad_cos",
             ]
         if self.score_metric == "grad_dot":
             return [
@@ -1865,15 +1865,14 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         usage_ratio_z = _safe_zscore(usage_ratio, device=device)
 
         consensus_grad_cos = self._build_consensus_grad_cos_features(client_grad_states, device)
-        # consensus_grad_rank_norm / consensus_grad_pos_flag 只作为旧诊断含义保留，不再进入 PISM 输入。
-        # 这一步用于验证后期 PISM 是否被离散 consensus 排名/正负标记带偏。
+        # consensus_grad_cos 只保留为诊断，不再进入 PISM 输入。
+        # 这一步用于验证 consensus 是否整体污染 PISM 的客户端选择。
         consensus_grad_pos_flag = (consensus_grad_cos > 0.0).float()
 
         features = torch.stack(
             [
                 expert_loss_z,
                 usage_ratio_z,
-                consensus_grad_cos,
             ],
             dim=-1,
         )
@@ -2473,7 +2472,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             )
             features = self._select_pism_features_for_config(features)
             metric["pism_input_names"] = self._pism_input_names_for_config()
-        if self.score_metric == "grad_cosine" and features.size(-1) != self.pism_input_dim:
+        if score_metric == "grad_cosine" and features.size(-1) != self.pism_input_dim:
             raise ValueError(
                 f"grad_cosine PISM features must have input_dim={self.pism_input_dim}, "
                 f"got {features.size(-1)}"
