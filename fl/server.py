@@ -795,18 +795,20 @@ class Server:
         total_client_steps = self.server_epochs * len(self.clientsID_list)
         initial_client_steps = self.start_round * len(self.clientsID_list)
 
-        progress_bar = tqdm(
-            total=total_client_steps,
-            initial=initial_client_steps,
-            desc="Experiment progress",
-            unit="client",
-            dynamic_ncols=True,
-            leave=True,
-            ascii=False,
-            mininterval=0.1,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
-        )
-
+    progress_bar = tqdm(
+        total=total_client_steps,
+        initial=initial_client_steps,
+        desc="Experiment progress",
+        unit="client",
+        dynamic_ncols=True,
+        leave=True,
+        ascii=False,
+        mininterval=0.1,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+        # 控制台瘦身：默认关闭 tqdm，避免进度条刷屏。
+        # 不影响日志文件，因为 tqdm 本来也不写入日志文件。
+        disable=bool(getattr(self.args, "quiet_console", True)),
+    )
         try:
             # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
             for c_T in range(self.start_round, self.server_epochs):
@@ -941,10 +943,24 @@ class Server:
                 round_eval_seconds = None
                 if should_eval:
                     eval_start_time = time.perf_counter()
-                    test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
-                    round_eval_seconds = time.perf_counter() - eval_start_time
-                    self.logger.info(f"--server_global_test_loss : {test_loss:.4f} --server_global_test_acc : {test_acc:.4f}\n")
-                    is_best = self.update_best_model(test_acc=test_acc, test_loss=test_loss, round_id=round_completed)
+                test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
+
+                round_eval_seconds = time.perf_counter() - eval_start_time
+                self.logger.info(f"--server_global_test_loss : {test_loss:.4f} --server_global_test_acc : {test_acc:.4f}\n")
+
+                is_best = self.update_best_model(test_acc=test_acc, test_loss=test_loss, round_id=round_completed)
+
+                # 控制台专用精简摘要：
+                # 只有这条日志会通过 train.py 里的 ConsoleSummaryFilter 显示到控制台。
+                # 其他完整诊断日志仍然全部写入 logs/*.log。
+                self.logger.info(
+                    f"round={round_completed:04d}/{self.server_epochs:04d} "
+                    f"loss={test_loss:.4f} "
+                    f"final_acc={test_acc * 100.0:.2f}% "
+                    f"best_acc={self.best_test_acc * 100.0:.2f}% "
+                    f"best_round={self.best_round}",
+                    extra={"to_console": True},
+                )
                     record_server_result(
                         {
                             "phase": "test",

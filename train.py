@@ -10,8 +10,21 @@ from data.data import CIFARPartitionBuilder
 from fl.server import Server
 from utils.utils import get_experiment_stem, resolve_device, set_seed
 
-
 warnings.filterwarnings("ignore")
+
+
+class ConsoleSummaryFilter(logging.Filter):
+    """
+    控制台日志过滤器。
+
+    目标：
+    - 控制台只显示训练摘要，例如 round / loss / final_acc / best_acc。
+    - 其他完整 debug / diagnostics 日志不在控制台显示。
+    - 文件日志不使用这个 filter，所以完整日志仍然会保存到 logs/*.log。
+    """
+
+    def filter(self, record):
+        return bool(getattr(record, "to_console", False))
 
 
 def configure_torch_multiprocessing():
@@ -22,7 +35,7 @@ def configure_torch_multiprocessing():
     DataLoader 在 num_workers > 0 时会使用多进程。
     PyTorch 默认的 file_descriptor 共享策略容易占用较多文件描述符，
     在 FL 多客户端反复创建/使用 DataLoader 的场景里，可能触发：
-        OSError: [Errno 24] Too many open files
+    OSError: [Errno 24] Too many open files
 
     file_system 策略可以降低文件描述符压力。
     这里放在训练入口最前面执行，确保创建 DataLoader / Server 前生效。
@@ -50,13 +63,19 @@ def build_logger(args):
     if logger.handlers:
         logger.handlers.clear()
 
-    # 控制台日志：训练时直接在终端输出。
+    # 控制台日志：
+    # 只显示带 extra={"to_console": True} 的精简摘要。
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
-    console_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+    console_handler.setLevel(logging.INFO)
+    console_handler.addFilter(ConsoleSummaryFilter())
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
 
-    # 文件日志：同时把训练过程保存到 save/result/logs/*.log。
-    file_handler = logging.FileHandler(os.path.join(log_dir, f"{logger_name}.log"))
+    # 文件日志：
+    # 不加 filter，完整保留所有 info/debug/diagnostics 日志。
+    file_handler = logging.FileHandler(
+        os.path.join(log_dir, f"{logger_name}.log"),
+        encoding="utf-8",
+    )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 
@@ -80,6 +99,7 @@ def main():
     set_seed(args.seed)
 
     logger = build_logger(args)
+
     logger.info(f"[Runtime] device={args.device}")
 
     if args.resume:
