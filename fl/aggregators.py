@@ -1,4 +1,5 @@
 import collections
+import math
 from abc import ABC, abstractmethod
 
 import torch
@@ -14,6 +15,7 @@ from fl.uoc_foga import (
     average_delta_states,
     build_client_grad_query_for_expert,
     build_stratified_query_for_expert,
+    build_reference_query_for_layer,
     cosine_delta_to_delta,
     cosine_grad_to_grad,
     delta_to_negative_grad_score,
@@ -897,6 +899,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         expert_id,
         global_model,
         uoc_evidences,
+        reference_uoc_evidence,
         no_evidence_fallback_reason,
         device,
         named_parameters=None,
@@ -1108,6 +1111,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         self._aggregate_non_expert_keys(aggregated_state, client_updates, client_weights)
 
         uoc_evidences = self._resolve_uoc_evidences(kwargs)
+        reference_uoc_evidence = kwargs.get("reference_uoc_evidence", None)
         no_evidence_fallback_reason = None
         if not uoc_evidences:
             no_evidence_fallback_reason = "no_uoc_evidence_passed_to_aggregator"
@@ -1130,6 +1134,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
                 expert_id=str(expert_id),
                 global_model=global_model,
                 uoc_evidences=uoc_evidences,
+                reference_uoc_evidence=reference_uoc_evidence,
                 no_evidence_fallback_reason=no_evidence_fallback_reason,
                 device=device,
                 named_parameters=named_parameters,
@@ -1370,6 +1375,18 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         self.uoc_foga_pism_fairness_blend = float(
             getattr(args, "uoc_foga_pism_fairness_blend", 0.0)
         )
+        # 诊断 A/C：reference gradient / reference step 只记录日志，不参与训练和聚合。
+        self.uoc_foga_ref_grad_diag_enabled = bool(
+            getattr(args, "uoc_foga_ref_grad_diag_enabled", False)
+        )
+        self.uoc_foga_ref_step_diag_enabled = bool(
+            getattr(args, "uoc_foga_ref_step_diag_enabled", False)
+        )
+        self.uoc_foga_ref_step_lr = float(
+            getattr(args, "uoc_foga_ref_step_lr", 0.01)
+        )
+        if self.uoc_foga_ref_step_lr <= 0.0:
+            raise ValueError("uoc_foga_ref_step_lr must be > 0")
         if self.uoc_foga_pism_min_weight_factor < 0.0:
             raise ValueError("uoc_foga_pism_min_weight_factor must be >= 0")
         if not 0.0 <= self.uoc_foga_pism_fairness_blend <= 1.0:
@@ -1823,6 +1840,161 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         }
         return features, feature_diag
 
+    def _compute_query_ref_cos_diag(
+        self,
+        global_model,
+        reference_uoc_evidence,
+        query_grad_state,
+        expert_keys,
+        layer_id,
+        expert_id,
+        device,
+        named_parameters=None,
+    ):
+        """诊断 A：比较当前 g_query 与 fixed/global balanced reference gradient。"""
+        if not self.uoc_foga_ref_grad_diag_enabled:
+            return None, None
+        if reference_uoc_evidence is None or global_model is None:
+            return None, None
+        if query_grad_state is None:
+            return None, None
+
+        ref_query = build_reference_query_for_layer(
+            reference_uoc_evidence=reference_uoc_evidence,
+            layer_id=layer_id,
+            num_classes=self._get_num_classes(),
+        )
+        if ref_query is None:
+            return None, None
+
+        param_keys, ref_grad_state, ref_fallback = self._build_expert_params_and_grads(
+            global_model=global_model,
+            expert_keys=expert_keys,
+            query=ref_query,
+            layer_id=layer_id,
+            expert_id=expert_id,
+            device=device,
+            named_parameters=named_parameters,
+        )
+        if ref_fallback is not None or ref_grad_state is None:
+            return None, ref_query
+
+        query_ref_cos = cosine_grad_to_grad(
+            query_grad_state,
+            ref_grad_state,
+            device=device,
+        )
+        return query_ref_cos, ref_query
+
+    def _compute_reference_loss_for_query(
+        self,
+        global_model,
+        ref_query,
+        layer_id,
+        expert_id,
+        device,
+    ):
+        if global_model is None or not isinstance(ref_query, dict):
+            return None
+        hidden = ref_query.get("hidden")
+        labels = ref_query.get("labels")
+        if hidden is None or labels is None:
+            return None
+        if not torch.is_tensor(hidden) or not torch.is_tensor(labels):
+            return None
+        if hidden.dim() == 0 or labels.dim() == 0 or hidden.size(0) == 0:
+            return None
+
+        hidden = hidden.to(device)
+        labels = labels.to(device).long()
+        residual = ref_query.get("residual")
+        if residual is not None:
+            residual = residual.to(device) if torch.is_tensor(residual) else None
+
+        was_training = global_model.training
+        try:
+            global_model.eval()
+            with torch.no_grad():
+                output = global_model.forward_uoc_from_hidden(
+                    hidden=hidden,
+                    residual=residual,
+                    layer_id=layer_id,
+                    force_expert_id=expert_id,
+                    gate_mode=getattr(self.args, "uoc_foga_gate_mode", "one"),
+                )
+                loss = self.uoc_criterion(output["logits"], labels)
+            if not torch.isfinite(loss):
+                return None
+            return float(loss.detach().cpu().item())
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            return None
+        finally:
+            global_model.train(was_training)
+
+    def _run_ref_step_diag_for_client_grad(
+        self,
+        global_model,
+        ref_query,
+        layer_id,
+        expert_id,
+        expert_param_keys,
+        client_grad_state,
+        device,
+    ):
+        """诊断 C：临时小步 expert 更新，观察 balanced reference loss 是否下降。"""
+        if not self.uoc_foga_ref_step_diag_enabled:
+            return None
+        if global_model is None or ref_query is None or client_grad_state is None:
+            return None
+        if not expert_param_keys:
+            return None
+
+        named_parameters = dict(global_model.named_parameters())
+        params = []
+        grads = []
+        for key in expert_param_keys:
+            param = named_parameters.get(key)
+            grad = client_grad_state.get(key) if isinstance(client_grad_state, dict) else None
+            if param is None or grad is None:
+                continue
+            if not torch.is_tensor(grad) or tuple(param.shape) != tuple(grad.shape):
+                continue
+            params.append(param)
+            grads.append(grad.to(param.device))
+        if not params:
+            return None
+
+        loss_before = self._compute_reference_loss_for_query(
+            global_model=global_model,
+            ref_query=ref_query,
+            layer_id=layer_id,
+            expert_id=expert_id,
+            device=device,
+        )
+        if loss_before is None:
+            return None
+
+        originals = [param.detach().clone() for param in params]
+        try:
+            with torch.no_grad():
+                for param, grad in zip(params, grads):
+                    param.add_(grad, alpha=-float(self.uoc_foga_ref_step_lr))
+            loss_after = self._compute_reference_loss_for_query(
+                global_model=global_model,
+                ref_query=ref_query,
+                layer_id=layer_id,
+                expert_id=expert_id,
+                device=device,
+            )
+        finally:
+            with torch.no_grad():
+                for param, original in zip(params, originals):
+                    param.copy_(original)
+
+        if loss_after is None:
+            return None
+        return float(loss_after - loss_before)
+
     def _normalize_client_stats(self, client_stats, client_count):
         if client_stats is None:
             return [{} for _ in range(client_count)]
@@ -1856,6 +2028,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         global_state,
         client_updates,
         client_stats,
+        client_weights,
         expert_keys,
         layer_id,
         expert_id,
@@ -1961,6 +2134,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         metric["pism_input_std"] = [
             float(value) for value in features.detach().std(dim=0, unbiased=False).cpu().tolist()
         ]
+        # 诊断 B：FOGA score 是否和客户端样本量相关。
+        metric["score_sample_corr"] = _safe_pearson(scores, log_client_sizes)
+
         scores_tensor = torch.tensor(scores, device=device, dtype=torch.float32).detach()
         fairness_values = (
             torch.tensor(client_losses, device=device, dtype=torch.float32).detach()
@@ -1975,6 +2151,12 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "features": features,
             "scores": scores_tensor,
             "fairness_values": fairness_values,
+            "log_client_sizes": torch.tensor(log_client_sizes, device=device, dtype=torch.float32).detach(),
+            "client_grad_states": client_grad_states,
+            "ref_query": ref_query,
+            "layer_id": str(layer_id),
+            "expert_id": str(expert_id),
+            "param_keys": param_keys,
             "metric": metric,
         }
         return metric, record
@@ -1985,11 +2167,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         global_state,
         client_updates,
         client_stats,
+        client_weights,
         expert_keys,
         layer_id,
         expert_id,
         global_model,
         uoc_evidences,
+        reference_uoc_evidence,
         no_evidence_fallback_reason,
         device,
         named_parameters=None,
@@ -2003,6 +2187,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 global_state=global_state,
                 client_updates=client_updates,
                 client_stats=client_stats,
+                client_weights=client_weights,
                 expert_keys=expert_keys,
                 layer_id=layer_id,
                 expert_id=expert_id,
@@ -2080,6 +2265,19 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 grad_fallback,
             )
 
+        # 诊断 A：只比较 g_query 和 reference gradient，不参与 score/PISM/聚合。
+        query_ref_cos, ref_query = self._compute_query_ref_cos_diag(
+            global_model=global_model,
+            reference_uoc_evidence=reference_uoc_evidence,
+            query_grad_state=grad_state,
+            expert_keys=expert_keys,
+            layer_id=layer_id,
+            expert_id=expert_id,
+            device=device,
+            named_parameters=named_parameters,
+        )
+        metric["query_ref_cos"] = query_ref_cos
+
         score_metric = metric["score_metric"]
         expert_params = None
         if score_metric in {"grad_dot", "grad_cosine"}:
@@ -2100,6 +2298,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         expert_client_losses = []
         client_grad_sample_counts = []
         client_grad_states = []
+        log_client_sizes = []
         for client_idx, client_state in enumerate(client_updates):
             delta_state = extract_expert_delta_state(
                 client_state,
@@ -2153,6 +2352,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 client_grad_sample_counts.append(client_set_size)
             if score_metric == "grad_cosine":
                 client_grad_states.append(client_grad_state)
+            client_size = client_weights[client_idx] if client_idx < len(client_weights) else 0.0
+            try:
+                log_client_sizes.append(math.log1p(max(float(client_size), 0.0)))
+            except (TypeError, ValueError):
+                log_client_sizes.append(float("nan"))
 
         self._add_grad_dot_metric_stats(
             metric,
@@ -2250,6 +2454,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         metric["pism_input_std"] = [
             float(value) for value in features.detach().std(dim=0, unbiased=False).cpu().tolist()
         ]
+        # 诊断 B：FOGA score 是否和客户端样本量相关。
+        metric["score_sample_corr"] = _safe_pearson(scores, log_client_sizes)
+
         scores_tensor = torch.tensor(scores, device=device, dtype=torch.float32).detach()
         if score_metric == "grad_dot":
             fairness_values = (
@@ -2271,6 +2478,12 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "features": features,
             "scores": scores_tensor,
             "fairness_values": fairness_values,
+            "log_client_sizes": torch.tensor(log_client_sizes, device=device, dtype=torch.float32).detach(),
+            "client_grad_states": client_grad_states,
+            "ref_query": ref_query,
+            "layer_id": str(layer_id),
+            "expert_id": str(expert_id),
+            "param_keys": param_keys,
             "metric": metric,
         }
         if score_metric == "grad_dot":
@@ -2287,6 +2500,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         meta_loss_value,
         device,
         current_tau,
+        global_model=None,
     ):
         metric = record["metric"]
         with torch.no_grad():
@@ -2360,6 +2574,43 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         metric["fallback_reason"] = None
         # 诊断 FOGA score 区分度，以及最终 PISM 权重是否和 score 对齐。
         metric.update(_build_pism_alignment_diagnostics(record["scores"], weights_tensor))
+        # 诊断 B：最终 PISM weight 是否和客户端样本量相关。
+        metric["weight_sample_corr"] = _safe_pearson(
+            weights_tensor,
+            record.get("log_client_sizes"),
+        )
+
+        # 诊断 C：FOGA top / PISM top client 的小步 expert 更新是否降低 reference loss。
+        ref_query = record.get("ref_query")
+        client_grad_states = record.get("client_grad_states") or []
+        if (
+            self.uoc_foga_ref_step_diag_enabled
+            and global_model is not None
+            and ref_query is not None
+            and client_grad_states
+        ):
+            score_values = record["scores"].detach()
+            if score_values.numel() == len(client_grad_states) and weights_tensor.numel() == len(client_grad_states):
+                foga_top_idx = int(torch.argmax(score_values).item())
+                pism_top_idx = int(torch.argmax(weights_tensor.detach()).item())
+                metric["ref_step_foga_top_loss_delta"] = self._run_ref_step_diag_for_client_grad(
+                    global_model=global_model,
+                    ref_query=ref_query,
+                    layer_id=record.get("layer_id"),
+                    expert_id=record.get("expert_id"),
+                    expert_param_keys=record.get("param_keys"),
+                    client_grad_state=client_grad_states[foga_top_idx],
+                    device=device,
+                )
+                metric["ref_step_pism_top_loss_delta"] = self._run_ref_step_diag_for_client_grad(
+                    global_model=global_model,
+                    ref_query=ref_query,
+                    layer_id=record.get("layer_id"),
+                    expert_id=record.get("expert_id"),
+                    expert_param_keys=record.get("param_keys"),
+                    client_grad_state=client_grad_states[pism_top_idx],
+                    device=device,
+                )
 
     def aggregate(self, client_updates, client_weights, global_model=None, **kwargs):
         if len(client_updates) == 0:
@@ -2376,6 +2627,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         self._aggregate_non_expert_keys(aggregated_state, client_updates, client_weights)
 
         uoc_evidences = self._resolve_uoc_evidences(kwargs)
+        reference_uoc_evidence = kwargs.get("reference_uoc_evidence", None)
         no_evidence_fallback_reason = None
         if not uoc_evidences:
             no_evidence_fallback_reason = "no_uoc_evidence_passed_to_aggregator"
@@ -2399,11 +2651,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 global_state=global_state,
                 client_updates=client_updates,
                 client_stats=client_stats,
+                client_weights=client_weights,
                 expert_keys=expert_keys,
                 layer_id=str(layer_id),
                 expert_id=str(expert_id),
                 global_model=global_model,
                 uoc_evidences=uoc_evidences,
+                reference_uoc_evidence=reference_uoc_evidence,
                 no_evidence_fallback_reason=no_evidence_fallback_reason,
                 device=device,
                 named_parameters=named_parameters,
@@ -2463,6 +2717,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                     meta_loss_value,
                     device,
                     current_tau,
+                    global_model=global_model,
                 )
 
         # 只汇总轻量 Python 标量，便于 server 日志观察 PISM 趋势。
@@ -2487,6 +2742,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         pism_consensus_grad_cos_means = []
         pism_consensus_grad_pos_fracs = []
         pism_expert_loss_z_stds = []
+        query_ref_cos_values = []
+        pism_score_sample_corrs = []
+        pism_weight_sample_corrs = []
+        ref_step_foga_top_loss_deltas = []
+        ref_step_pism_top_loss_deltas = []
         # mixed_global_expert query 的 round 级诊断。
         # 这些统计来自每个 expert 的 D_query,l,e 构造结果，用来确认
         # global-balanced 与 expert-specific 两部分是否真的混入成功。
@@ -2554,6 +2814,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             pism_consensus_grad_cos_means.append(expert_metric.get("consensus_grad_cos_mean"))
             pism_consensus_grad_pos_fracs.append(expert_metric.get("consensus_grad_pos_frac"))
             pism_expert_loss_z_stds.append(expert_metric.get("expert_loss_z_std"))
+            query_ref_cos_values.append(expert_metric.get("query_ref_cos"))
+            pism_score_sample_corrs.append(expert_metric.get("score_sample_corr"))
+            pism_weight_sample_corrs.append(expert_metric.get("weight_sample_corr"))
+            ref_step_foga_top_loss_deltas.append(expert_metric.get("ref_step_foga_top_loss_delta"))
+            ref_step_pism_top_loss_deltas.append(expert_metric.get("ref_step_pism_top_loss_delta"))
 
         fallback_experts = total_experts - updated_experts
         pism_summary = {
@@ -2612,6 +2877,19 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "uoc_foga_pism_consensus_grad_cos_mean": _safe_mean(pism_consensus_grad_cos_means),
             "uoc_foga_pism_consensus_grad_pos_frac_mean": _safe_mean(pism_consensus_grad_pos_fracs),
             "uoc_foga_pism_expert_loss_z_std_mean": _safe_mean(pism_expert_loss_z_stds),
+            "uoc_foga_query_ref_cos_mean": _safe_mean(query_ref_cos_values),
+            "uoc_foga_query_ref_cos_std": _safe_std(query_ref_cos_values),
+            "uoc_foga_query_ref_cos_min": min(_safe_numeric_values(query_ref_cos_values)) if _safe_numeric_values(query_ref_cos_values) else float("nan"),
+            "uoc_foga_query_ref_cos_valid_frac": (len(_safe_numeric_values(query_ref_cos_values)) / total_experts if total_experts > 0 else 0.0),
+            "uoc_foga_pism_score_sample_corr_mean": _safe_mean(pism_score_sample_corrs),
+            "uoc_foga_pism_score_sample_corr_valid_frac": (len(_safe_numeric_values(pism_score_sample_corrs)) / updated_experts if updated_experts > 0 else 0.0),
+            "uoc_foga_pism_weight_sample_corr_mean": _safe_mean(pism_weight_sample_corrs),
+            "uoc_foga_pism_weight_sample_corr_valid_frac": (len(_safe_numeric_values(pism_weight_sample_corrs)) / updated_experts if updated_experts > 0 else 0.0),
+            "uoc_foga_ref_step_foga_top_loss_delta_mean": _safe_mean(ref_step_foga_top_loss_deltas),
+            "uoc_foga_ref_step_foga_top_improve_frac": (sum(1 for value in _safe_numeric_values(ref_step_foga_top_loss_deltas) if value < 0.0) / len(_safe_numeric_values(ref_step_foga_top_loss_deltas)) if _safe_numeric_values(ref_step_foga_top_loss_deltas) else float("nan")),
+            "uoc_foga_ref_step_pism_top_loss_delta_mean": _safe_mean(ref_step_pism_top_loss_deltas),
+            "uoc_foga_ref_step_pism_top_improve_frac": (sum(1 for value in _safe_numeric_values(ref_step_pism_top_loss_deltas) if value < 0.0) / len(_safe_numeric_values(ref_step_pism_top_loss_deltas)) if _safe_numeric_values(ref_step_pism_top_loss_deltas) else float("nan")),
+            "uoc_foga_ref_step_valid_frac": (max(len(_safe_numeric_values(ref_step_foga_top_loss_deltas)), len(_safe_numeric_values(ref_step_pism_top_loss_deltas))) / updated_experts if updated_experts > 0 else 0.0),
             "uoc_foga_mixed_global_query_size_mean": _safe_mean(mixed_global_query_sizes),
             "uoc_foga_mixed_expert_query_size_mean": _safe_mean(mixed_expert_query_sizes),
             "uoc_foga_mixed_global_query_num_classes_mean": _safe_mean(mixed_global_query_num_classes),

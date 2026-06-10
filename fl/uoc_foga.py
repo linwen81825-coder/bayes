@@ -1589,3 +1589,63 @@ def make_uniform_weights(client_ids):
 
     weight = 1.0 / len(client_ids)
     return {client_id: weight for client_id in client_ids}
+
+
+def build_reference_query_for_layer(reference_uoc_evidence, layer_id, num_classes=None):
+    """
+    将 server 端收集的 fixed/global balanced reference evidence 转成
+    forward_uoc_from_hidden 可直接使用的 query dict。
+
+    这个 helper 不按 expert 过滤；同一 layer 的同一批 reference hidden/residual/labels
+    会被所有 expert 共享，只用于诊断 g_query 是否接近 balanced reference gradient。
+    """
+    layer_evidence = _get_layer_evidence(reference_uoc_evidence, layer_id)
+    if not isinstance(layer_evidence, dict):
+        return None
+
+    hidden = _as_cpu_tensor(layer_evidence.get("hidden"))
+    labels = _as_cpu_tensor(layer_evidence.get("labels"))
+    residual = _as_cpu_tensor(layer_evidence.get("residual"))
+    if hidden is None or labels is None:
+        return None
+    if hidden.dim() == 0 or labels.dim() == 0:
+        return None
+    if residual is not None and residual.dim() == 0:
+        residual = None
+
+    sample_count_values = [hidden.size(0), labels.size(0)]
+    if residual is not None:
+        sample_count_values.append(residual.size(0))
+    sample_count = min(sample_count_values)
+    if sample_count <= 0:
+        return None
+
+    hidden = hidden[:sample_count].detach().cpu()
+    labels = labels[:sample_count].long().detach().cpu()
+    if residual is not None:
+        residual = residual[:sample_count].detach().cpu()
+        if residual.shape[1:] != hidden.shape[1:]:
+            residual = None
+
+    if labels.numel() > 0:
+        query_num_classes = int(torch.unique(labels.long()).numel())
+    else:
+        query_num_classes = 0
+    if num_classes is None:
+        num_classes = max(int(labels.max().item()) + 1 if labels.numel() > 0 else 0, 1)
+    class_hist = [0 for _ in range(int(num_classes))]
+    for class_id in range(len(class_hist)):
+        class_hist[class_id] = int((labels == class_id).sum().item())
+
+    return {
+        "hidden": hidden,
+        "labels": labels,
+        "residual": residual,
+        "has_residual": residual is not None,
+        "class_hist": class_hist,
+        "query_size": int(sample_count),
+        "query_num_classes": int(query_num_classes),
+        "sample_count": int(sample_count),
+        "num_classes": int(query_num_classes),
+        "fallback_reason": None,
+    }

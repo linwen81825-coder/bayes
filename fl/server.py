@@ -75,6 +75,27 @@ class Server:
         )
         self.num_experts = self.args.num_experts
         self.criterion = nn.CrossEntropyLoss()
+        # UOC-FOGA 诊断 A/C 的 fixed balanced reference set。
+        # 只做日志诊断，不参与训练、PISM loss 或聚合权重。
+        self.uoc_foga_ref_grad_diag_enabled = bool(
+            getattr(self.args, "uoc_foga_ref_grad_diag_enabled", False)
+        )
+        self.uoc_foga_ref_step_diag_enabled = bool(
+            getattr(self.args, "uoc_foga_ref_step_diag_enabled", False)
+        )
+        self.uoc_foga_ref_grad_diag_every = max(
+            1, int(getattr(self.args, "uoc_foga_ref_grad_diag_every", 1))
+        )
+        self.uoc_foga_ref_step_diag_every = max(
+            1, int(getattr(self.args, "uoc_foga_ref_step_diag_every", 1))
+        )
+        self.uoc_foga_ref_query_per_class = max(
+            1, int(getattr(self.args, "uoc_foga_ref_query_per_class", 8))
+        )
+        self.reference_inputs = None
+        self.reference_labels = None
+        if self.uoc_foga_ref_grad_diag_enabled or self.uoc_foga_ref_step_diag_enabled:
+            self._build_fixed_balanced_reference_batch()
 
         if self.resume_enabled:
             self.init_resume_training_state()
@@ -550,6 +571,181 @@ class Server:
             "delta_consensus_ref_clients_mean": delta_consensus_ref_clients_mean,
         }
 
+    def _infer_num_classes(self):
+        num_classes = getattr(self.args, "num_classes", None)
+        if num_classes is not None:
+            return int(num_classes)
+        data_name = str(getattr(self.args, "data_name", "cifar10")).lower()
+        if data_name == "cifar100":
+            return 100
+        return 10
+
+    def _build_fixed_balanced_reference_batch(self):
+        """从 global eval loader 中固定抽取 class-balanced reference batch，只做诊断。"""
+        num_classes = self._infer_num_classes()
+        per_class = self.uoc_foga_ref_query_per_class
+        selected_inputs = []
+        selected_labels = []
+        class_counts = {class_id: 0 for class_id in range(num_classes)}
+        target_total = num_classes * per_class
+
+        for inputs, labels in self.global_test_loader:
+            labels_cpu = labels.detach().cpu().long()
+            inputs_cpu = inputs.detach().cpu()
+            for sample_idx in range(labels_cpu.size(0)):
+                label = int(labels_cpu[sample_idx].item())
+                if label not in class_counts:
+                    continue
+                if class_counts[label] >= per_class:
+                    continue
+                selected_inputs.append(inputs_cpu[sample_idx].clone())
+                selected_labels.append(labels_cpu[sample_idx].clone())
+                class_counts[label] += 1
+                if len(selected_labels) >= target_total:
+                    break
+            if len(selected_labels) >= target_total:
+                break
+
+        if not selected_inputs:
+            self.logger.info("--uoc_foga_ref_batch_built : false --reason : no_reference_samples\n")
+            self.reference_inputs = None
+            self.reference_labels = None
+            return
+
+        self.reference_inputs = torch.stack(selected_inputs, dim=0)
+        self.reference_labels = torch.stack(selected_labels, dim=0).long()
+        self.logger.info(
+            "--uoc_foga_ref_batch_built : true "
+            f"--ref_query_per_class : {per_class} "
+            f"--ref_total_samples : {int(self.reference_labels.numel())} "
+            f"--ref_class_counts : {[class_counts[idx] for idx in range(num_classes)]}\n"
+        )
+
+    def _forward_model_collecting_uoc_evidence(self, inputs):
+        """兼容不同模型 forward 参数名，尽量拿到 layer evidence。"""
+        forward_attempts = (
+            {"return_uoc_evidence": True},
+            {"collect_uoc_evidence": True},
+            {"return_evidence": True},
+            {"collect_evidence": True},
+            {},
+        )
+        last_error = None
+        for kwargs in forward_attempts:
+            try:
+                return self.model(inputs, **kwargs)
+            except TypeError as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+        return self.model(inputs)
+
+    def _extract_uoc_evidence_from_output(self, output):
+        if not isinstance(output, dict):
+            return None
+        for key in (
+            "uoc_evidence_by_layer",
+            "evidence_by_layer",
+            "uoc_evidence",
+            "evidence",
+            "moe_evidence_by_layer",
+        ):
+            value = output.get(key)
+            if isinstance(value, dict):
+                return value
+        return None
+
+    def _append_reference_evidence_chunk(self, merged, evidence_by_layer, labels):
+        if not isinstance(evidence_by_layer, dict):
+            return
+        labels_cpu = labels.detach().cpu().long()
+        for layer_id, layer_evidence in evidence_by_layer.items():
+            if not isinstance(layer_evidence, dict):
+                continue
+            hidden = layer_evidence.get("hidden")
+            if hidden is None or not torch.is_tensor(hidden):
+                continue
+            sample_count = hidden.size(0)
+            if sample_count <= 0:
+                continue
+            layer_key = str(layer_id)
+            target = merged.setdefault(layer_key, {"hidden": [], "labels": [], "residual": []})
+            target["hidden"].append(hidden[:sample_count].detach().cpu())
+
+            evidence_labels = layer_evidence.get("labels")
+            if torch.is_tensor(evidence_labels) and evidence_labels.dim() > 0:
+                target["labels"].append(evidence_labels[:sample_count].detach().cpu().long())
+            else:
+                target["labels"].append(labels_cpu[:sample_count])
+
+            residual = layer_evidence.get("residual")
+            if torch.is_tensor(residual) and residual.dim() > 0 and residual.size(0) >= sample_count:
+                target["residual"].append(residual[:sample_count].detach().cpu())
+
+    def _finalize_reference_evidence(self, merged):
+        finalized = {}
+        for layer_id, chunks in merged.items():
+            hidden_chunks = chunks.get("hidden") or []
+            label_chunks = chunks.get("labels") or []
+            if not hidden_chunks or not label_chunks:
+                continue
+            hidden = torch.cat(hidden_chunks, dim=0)
+            labels = torch.cat(label_chunks, dim=0).long()
+            sample_count = min(hidden.size(0), labels.size(0))
+            if sample_count <= 0:
+                continue
+            layer_result = {
+                "hidden": hidden[:sample_count],
+                "labels": labels[:sample_count],
+            }
+            residual_chunks = chunks.get("residual") or []
+            if len(residual_chunks) == len(hidden_chunks):
+                residual = torch.cat(residual_chunks, dim=0)
+                if residual.size(0) >= sample_count and residual.shape[1:] == hidden.shape[1:]:
+                    layer_result["residual"] = residual[:sample_count]
+            finalized[str(layer_id)] = layer_result
+        return finalized
+
+    def _collect_reference_uoc_evidence(self, round_completed):
+        """每轮聚合前收集 fixed balanced reference 的 hidden/residual/labels。"""
+        need_grad_diag = (
+            self.uoc_foga_ref_grad_diag_enabled
+            and round_completed % self.uoc_foga_ref_grad_diag_every == 0
+        )
+        need_step_diag = (
+            self.uoc_foga_ref_step_diag_enabled
+            and round_completed % self.uoc_foga_ref_step_diag_every == 0
+        )
+        if not (need_grad_diag or need_step_diag):
+            return None
+        if self.reference_inputs is None or self.reference_labels is None:
+            return None
+
+        was_training = self.model.training
+        merged = {}
+        try:
+            self.model.to(self.device)
+            self.model.eval()
+            inputs = self.reference_inputs.to(self.device)
+            labels = self.reference_labels.to(self.device)
+            with torch.no_grad():
+                output = self._forward_model_collecting_uoc_evidence(inputs)
+            evidence_by_layer = self._extract_uoc_evidence_from_output(output)
+            self._append_reference_evidence_chunk(merged, evidence_by_layer, labels)
+        except Exception as exc:  # 诊断失败不能影响训练。
+            self.logger.info(f"--uoc_foga_ref_evidence_failed : {type(exc).__name__}: {exc}\n")
+            return None
+        finally:
+            self.model.train(was_training)
+
+        reference_evidence = self._finalize_reference_evidence(merged)
+        self.logger.info(
+            "--uoc_foga_ref_evidence_layers : "
+            f"{ {layer: int(value['hidden'].shape[0]) for layer, value in reference_evidence.items()} }\n"
+        )
+        return reference_evidence if reference_evidence else None
+
     def train(self):
         if self.start_round >= self.server_epochs:
             self.logger.info(
@@ -691,9 +887,11 @@ class Server:
                 # 所有客户端本地训练完成后，服务端通过聚合器更新全局模型。
                 round_completed = c_T + 1
                 aggregation_start_time = time.perf_counter()
+                reference_uoc_evidence = self._collect_reference_uoc_evidence(round_completed)
                 self.aggregation(
                     client_states=client_states if use_in_memory_updates else None,
                     uoc_evidence=round_client_uoc_evidences,
+                    reference_uoc_evidence=reference_uoc_evidence,
                     client_stats=round_client_stats,
                     round_index=round_completed,
                 )
@@ -829,7 +1027,7 @@ class Server:
         # sample_weighted 聚合会使用客户端训练样本数作为权重来源。
         return get_client_train_size(self.args, client_id, meta=self.partition_meta)
 
-    def aggregation_by_method(self, client_states=None, uoc_evidence=None, client_stats=None, round_index=None):
+    def aggregation_by_method(self, client_states=None, uoc_evidence=None, reference_uoc_evidence=None, client_stats=None, round_index=None):
         # 聚合器接口：
         # - 非专家参数使用 non_expert_agg_method；
         # - 专家参数使用 expert_agg_method。
@@ -863,6 +1061,7 @@ class Server:
                 client_weights=client_sizes,
                 global_model=self.model,
                 uoc_evidence=uoc_evidence,
+                reference_uoc_evidence=reference_uoc_evidence,
                 client_stats=client_stats,
                 round_index=round_index,
             )
@@ -964,6 +1163,28 @@ class Server:
                 f"pism_top_score_value_mean={pism_summary.get('uoc_foga_pism_pism_top_score_value_mean')} "
                 f"foga_top_pism_weight_mean={pism_summary.get('uoc_foga_pism_foga_top_pism_weight_mean')}\n"
             )
+            self.logger.info(
+                "[UOC-FOGA-QUERY-REF] "
+                f"query_ref_cos_mean={pism_summary.get('uoc_foga_query_ref_cos_mean')} "
+                f"query_ref_cos_std={pism_summary.get('uoc_foga_query_ref_cos_std')} "
+                f"query_ref_cos_min={pism_summary.get('uoc_foga_query_ref_cos_min')} "
+                f"query_ref_cos_valid_frac={pism_summary.get('uoc_foga_query_ref_cos_valid_frac')}\n"
+            )
+            self.logger.info(
+                "[UOC-FOGA-SAMPLE-BIAS] "
+                f"score_sample_corr_mean={pism_summary.get('uoc_foga_pism_score_sample_corr_mean')} "
+                f"score_sample_corr_valid_frac={pism_summary.get('uoc_foga_pism_score_sample_corr_valid_frac')} "
+                f"weight_sample_corr_mean={pism_summary.get('uoc_foga_pism_weight_sample_corr_mean')} "
+                f"weight_sample_corr_valid_frac={pism_summary.get('uoc_foga_pism_weight_sample_corr_valid_frac')}\n"
+            )
+            self.logger.info(
+                "[UOC-FOGA-REF-STEP] "
+                f"foga_top_delta_mean={pism_summary.get('uoc_foga_ref_step_foga_top_loss_delta_mean')} "
+                f"foga_top_improve_frac={pism_summary.get('uoc_foga_ref_step_foga_top_improve_frac')} "
+                f"pism_top_delta_mean={pism_summary.get('uoc_foga_ref_step_pism_top_loss_delta_mean')} "
+                f"pism_top_improve_frac={pism_summary.get('uoc_foga_ref_step_pism_top_improve_frac')} "
+                f"valid_frac={pism_summary.get('uoc_foga_ref_step_valid_frac')}\n"
+            )
             for key in (
                 "uoc_foga_score_metric",
                 "uoc_foga_pism_input_dim",
@@ -996,6 +1217,19 @@ class Server:
                 "uoc_foga_pism_tau_init",
                 "uoc_foga_pism_tau_min",
                 "uoc_foga_pism_tau_decay",
+                "uoc_foga_query_ref_cos_mean",
+                "uoc_foga_query_ref_cos_std",
+                "uoc_foga_query_ref_cos_min",
+                "uoc_foga_query_ref_cos_valid_frac",
+                "uoc_foga_pism_score_sample_corr_mean",
+                "uoc_foga_pism_score_sample_corr_valid_frac",
+                "uoc_foga_pism_weight_sample_corr_mean",
+                "uoc_foga_pism_weight_sample_corr_valid_frac",
+                "uoc_foga_ref_step_foga_top_loss_delta_mean",
+                "uoc_foga_ref_step_foga_top_improve_frac",
+                "uoc_foga_ref_step_pism_top_loss_delta_mean",
+                "uoc_foga_ref_step_pism_top_improve_frac",
+                "uoc_foga_ref_step_valid_frac",
                 "uoc_foga_client_grad_query_per_class",
                 "uoc_foga_client_grad_min_samples_per_expert",
                 "uoc_foga_client_grad_min_classes_per_expert",
@@ -1010,10 +1244,11 @@ class Server:
         )
         self.logger.info(f"--client_train_sizes : {client_sizes}\n")
 
-    def aggregation(self, client_states=None, uoc_evidence=None, client_stats=None, round_index=None):
+    def aggregation(self, client_states=None, uoc_evidence=None, reference_uoc_evidence=None, client_stats=None, round_index=None):
         self.aggregation_by_method(
             client_states=client_states,
             uoc_evidence=uoc_evidence,
+            reference_uoc_evidence=reference_uoc_evidence,
             client_stats=client_stats,
             round_index=round_index,
         )
