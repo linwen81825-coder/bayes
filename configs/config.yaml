@@ -292,9 +292,10 @@ data:
 model:
   # 模型类型，目前使用 hybrid_switch_transformer
   model_type: hybrid_switch_transformer
+  
+  # 图像 backbone：cnn_stem / resnet18 / resnet18_light
+  backbone_type: resnet18_light
 
-  # 图像 backbone：cnn_stem / resnet18
-  backbone_type: resnet18
 
   # dropout 概率
   dropout: 0.2

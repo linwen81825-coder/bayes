@@ -17,11 +17,18 @@ def make_group_norm(num_channels, max_groups=8):
 class ResNet18CIFARBackbone(nn.Module):
     def __init__(self):
         super(ResNet18CIFARBackbone, self).__init__()
+
         backbone = resnet18(weights=None)
         backbone.conv1 = nn.Conv2d(
-            3, 64, kernel_size=3, stride=1, padding=1, bias=False
+            3,
+            64,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
         )
         backbone.maxpool = nn.Identity()
+
         self.features = nn.Sequential(
             backbone.conv1,
             backbone.bn1,
@@ -38,10 +45,63 @@ class ResNet18CIFARBackbone(nn.Module):
         return self.features(x)
 
 
+class ResNet18LightCIFARBackbone(nn.Module):
+    """
+    轻量版 CIFAR ResNet18 backbone。
+
+    和完整 ResNet18CIFARBackbone 的区别：
+    - 保留 conv1 + bn1 + relu + maxpool + layer1 + layer2 + layer3；
+    - 去掉最强、最重的 layer4；
+    - 输出通道从 512 降到 256；
+    - 比 cnn_stem 强，比完整 resnet18 弱。
+
+    设计目的：
+    - 降低共享 backbone 对 FedAvg 的兜底能力；
+    - 保留足够好的 token 表示，避免 UOC/FOGA/PISM evidence 像 cnn_stem 那样变差；
+    - 让专家聚合更容易体现差异。
+    """
+
+    def __init__(self):
+        super(ResNet18LightCIFARBackbone, self).__init__()
+
+        backbone = resnet18(weights=None)
+
+        # CIFAR 图像是 32x32，使用 3x3 stride=1，避免 ImageNet 版 conv1 过早降采样。
+        backbone.conv1 = nn.Conv2d(
+            3,
+            64,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+
+        # CIFAR 图像较小，去掉 maxpool，保留更多空间信息。
+        backbone.maxpool = nn.Identity()
+
+        # 轻量版只保留到 layer3，不使用 layer4。
+        self.features = nn.Sequential(
+            backbone.conv1,
+            backbone.bn1,
+            backbone.relu,
+            backbone.maxpool,
+            backbone.layer1,
+            backbone.layer2,
+            backbone.layer3,
+        )
+
+        # ResNet18 的 layer3 输出通道是 256。
+        self.out_channels = 256
+
+    def forward(self, x):
+        return self.features(x)
+
+
 class DenseFFN(nn.Module):
     # Transformer block 中的普通 dense FFN：D -> hidden -> D。
     def __init__(self, embed_dim, mlp_ratio=4.0, dropout_rate=0.1):
         super(DenseFFN, self).__init__()
+
         hidden_dim = int(embed_dim * mlp_ratio)
         self.net = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
@@ -59,6 +119,7 @@ class SwitchFFNExpert(nn.Module):
     # Token-level Switch FFN 中的单个专家，结构和 Transformer MLP 一致。
     def __init__(self, embed_dim, hidden_dim, dropout_rate=0.1):
         super(SwitchFFNExpert, self).__init__()
+
         self.net = nn.Sequential(
             nn.Linear(embed_dim, hidden_dim),
             nn.GELU(),
@@ -87,6 +148,7 @@ class TokenSwitchFFN(nn.Module):
         top_k=1,
     ):
         super(TokenSwitchFFN, self).__init__()
+
         if top_k != 1:
             raise ValueError("TokenSwitchFFN currently supports top_k=1 only")
 
@@ -96,15 +158,20 @@ class TokenSwitchFFN(nn.Module):
         self.capacity_factor = capacity_factor
         self.min_capacity = min_capacity
         self.drop_tokens = drop_tokens
+
         hidden_dim = int(embed_dim * mlp_ratio)
+
         self.router = nn.Linear(embed_dim, num_experts)
-        self.experts = nn.ModuleList([
-            SwitchFFNExpert(embed_dim, hidden_dim, dropout_rate)
-            for _ in range(num_experts)
-        ])
+        self.experts = nn.ModuleList(
+            [
+                SwitchFFNExpert(embed_dim, hidden_dim, dropout_rate)
+                for _ in range(num_experts)
+            ]
+        )
 
     def forward(self, x, return_router_info: bool = False):
         embed_dim = x.size(-1)
+
         router_input = x
         if self.training and self.router_jitter_noise > 0:
             noise = torch.empty_like(router_input).uniform_(
@@ -115,43 +182,66 @@ class TokenSwitchFFN(nn.Module):
 
         router_logits = self.router(router_input)
         router_probs = F.softmax(router_logits.float(), dim=-1).to(x.dtype)
+
         top1_probs, top1_indices = torch.max(router_probs, dim=-1)
 
         flat_x = x.reshape(-1, embed_dim)
         flat_output = torch.zeros_like(flat_x)
+
         flat_indices = top1_indices.reshape(-1)
         flat_top1_probs = top1_probs.reshape(-1)
+
         total_tokens = max(flat_x.size(0), 1)
         capacity = max(
             self.min_capacity,
             math.ceil(self.capacity_factor * total_tokens / self.num_experts),
         )
+
         selected_counts = torch.bincount(
             flat_indices,
             minlength=self.num_experts,
         ).to(x.device)
-        expert_activations = torch.zeros(self.num_experts, device=x.device, dtype=torch.long)
-        overflow_counts = torch.zeros(self.num_experts, device=x.device, dtype=torch.long)
+
+        expert_activations = torch.zeros(
+            self.num_experts,
+            device=x.device,
+            dtype=torch.long,
+        )
+        overflow_counts = torch.zeros(
+            self.num_experts,
+            device=x.device,
+            dtype=torch.long,
+        )
 
         for expert_id, expert in enumerate(self.experts):
-            token_positions = torch.nonzero(flat_indices == expert_id, as_tuple=False).flatten()
+            token_positions = torch.nonzero(
+                flat_indices == expert_id,
+                as_tuple=False,
+            ).flatten()
+
             if token_positions.numel() == 0:
                 continue
 
             overflow_count = max(token_positions.numel() - capacity, 0)
             overflow_counts[expert_id] = overflow_count
+
             if self.drop_tokens:
                 accepted_positions = token_positions[:capacity]
             else:
                 accepted_positions = token_positions
 
             expert_activations[expert_id] = accepted_positions.numel()
+
             if accepted_positions.numel() > 0:
                 expert_output = expert(flat_x[accepted_positions])
-                flat_output[accepted_positions] = expert_output * flat_top1_probs[accepted_positions].unsqueeze(-1)
+                flat_output[accepted_positions] = (
+                    expert_output
+                    * flat_top1_probs[accepted_positions].unsqueeze(-1)
+                )
 
         # overflow token 的 FFN 增量保持为 0，外层 residual 会让这些 token 走 identity bypass。
         output = flat_output.reshape_as(x)
+
         if return_router_info:
             # top1_expert_ids/top1_gates 来自 router 的 top1 选择。
             router_info = {
@@ -161,13 +251,17 @@ class TokenSwitchFFN(nn.Module):
             return output, router_info
 
         usage_fraction = selected_counts.float() / float(total_tokens)
-        avg_router_probs = router_probs.float().mean(dim=tuple(range(router_probs.dim() - 1)))
+        avg_router_probs = router_probs.float().mean(
+            dim=tuple(range(router_probs.dim() - 1))
+        )
 
         # Switch Transformer load-balancing auxiliary loss:
         # aux = E * sum_e(f_e * p_e)
         # f_e 是 top-1 路由到 expert e 的 token 比例，p_e 是 router 对 expert e 的平均概率。
         # f_e 是离散选择，不参与梯度；p_e 保留梯度，推动 router 更均衡地使用专家。
-        router_aux_loss = self.num_experts * torch.sum(usage_fraction.detach() * avg_router_probs)
+        router_aux_loss = self.num_experts * torch.sum(
+            usage_fraction.detach() * avg_router_probs
+        )
 
         # router z-loss: mean(logsumexp(router_logits)^2)，抑制 router logits 过大。
         router_z_loss = torch.mean(torch.logsumexp(router_logits.float(), dim=-1) ** 2)
@@ -198,6 +292,7 @@ class TokenSwitchFFN(nn.Module):
 
         embed_dim = x.size(-1)
         flat_x = x.reshape(-1, embed_dim)
+
         forced_output = self.experts[expert_id](flat_x)
         return forced_output.reshape_as(x)
 
@@ -220,8 +315,10 @@ class HybridTransformerBlock(nn.Module):
         layer_id=0,
     ):
         super(HybridTransformerBlock, self).__init__()
+
         self.layer_id = layer_id
         self.use_switch_ffn = use_switch_ffn
+
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attention = nn.MultiheadAttention(
             embed_dim=embed_dim,
@@ -230,7 +327,9 @@ class HybridTransformerBlock(nn.Module):
             batch_first=True,
         )
         self.dropout = nn.Dropout(dropout_rate)
+
         self.norm2 = nn.LayerNorm(embed_dim)
+
         if use_switch_ffn:
             self.ffn = TokenSwitchFFN(
                 embed_dim=embed_dim,
@@ -252,18 +351,30 @@ class HybridTransformerBlock(nn.Module):
 
     def forward(self, x, return_uoc_info: bool = False, layer_id=None):
         norm_x = self.norm1(x)
-        attention_out, _ = self.attention(norm_x, norm_x, norm_x, need_weights=False)
+        attention_out, _ = self.attention(
+            norm_x,
+            norm_x,
+            norm_x,
+            need_weights=False,
+        )
         x = x + self.dropout(attention_out)
 
         ffn_input = self.norm2(x)
+
         if self.use_switch_ffn:
             if return_uoc_info:
                 # hidden 是 TokenSwitchFFN 的输入 ffn_input。
                 hidden = ffn_input.detach()
+
                 # residual 是 FFN 残差相加前的 x，用于从 hidden 精确恢复 block 输出。
                 residual = x.detach()
-                ffn_out, router_info = self.ffn(ffn_input, return_router_info=True)
+
+                ffn_out, router_info = self.ffn(
+                    ffn_input,
+                    return_router_info=True,
+                )
                 x = x + self.dropout(ffn_out)
+
                 uoc_layer_id = self.layer_id if layer_id is None else layer_id
                 uoc_info = {
                     str(uoc_layer_id): {
@@ -277,6 +388,7 @@ class HybridTransformerBlock(nn.Module):
 
             switch_result = self.ffn(ffn_input)
             x = x + self.dropout(switch_result["hidden"])
+
             return x, {
                 "layer_id": self.layer_id,
                 "router_aux_loss": switch_result["router_aux_loss"],
@@ -291,8 +403,10 @@ class HybridTransformerBlock(nn.Module):
             }
 
         x = x + self.dropout(self.ffn(ffn_input))
+
         if return_uoc_info:
             return x, None, {}
+
         return x, None
 
     def forward_from_ffn_input(
@@ -311,9 +425,11 @@ class HybridTransformerBlock(nn.Module):
             force_expert_id,
             gate_mode=gate_mode,
         )
+
         if residual is None:
             # 兼容旧 evidence：缺少 residual 时只能用 hidden 近似残差，推荐后续 evidence 带 residual。
             residual = hidden
+
         return residual + self.dropout(forced_ffn_out)
 
 
@@ -344,6 +460,7 @@ class HybridSwitchTransformer(nn.Module):
         router_z_loss_coef=0.001,
     ):
         super(HybridSwitchTransformer, self).__init__()
+
         if embed_dim % num_heads != 0:
             raise ValueError("embed_dim must be divisible by num_heads")
 
@@ -362,46 +479,72 @@ class HybridSwitchTransformer(nn.Module):
                 nn.Conv2d(3, stem_channels, kernel_size=3, stride=1, padding=1),
                 make_group_norm(stem_channels),
                 nn.GELU(),
-                nn.Conv2d(stem_channels, stem_channels, kernel_size=3, stride=2, padding=1),
+                nn.Conv2d(
+                    stem_channels,
+                    stem_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                ),
                 make_group_norm(stem_channels),
                 nn.GELU(),
             )
             backbone_out_channels = stem_channels
+
         elif backbone_type == "resnet18":
             self.stem = ResNet18CIFARBackbone()
             backbone_out_channels = self.stem.out_channels
+
+        elif backbone_type == "resnet18_light":
+            self.stem = ResNet18LightCIFARBackbone()
+            backbone_out_channels = self.stem.out_channels
+
         else:
-            raise ValueError("backbone_type must be one of: cnn_stem, resnet18")
+            raise ValueError(
+                "backbone_type must be one of: cnn_stem, resnet18, resnet18_light"
+            )
 
         self.token_pool = nn.AdaptiveAvgPool2d((token_grid_size, token_grid_size))
-        self.token_projection = nn.Conv2d(backbone_out_channels, embed_dim, kernel_size=1)
-        num_position_tokens = token_grid_size * token_grid_size + (1 if use_cls_token else 0)
+        self.token_projection = nn.Conv2d(
+            backbone_out_channels,
+            embed_dim,
+            kernel_size=1,
+        )
+
+        num_position_tokens = token_grid_size * token_grid_size + (
+            1 if use_cls_token else 0
+        )
         self.position_embedding = nn.Parameter(
             torch.zeros(1, num_position_tokens, embed_dim)
         )
+
         if use_cls_token:
             self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         else:
             self.cls_token = None
+
         self.position_dropout = nn.Dropout(dropout_rate)
 
-        self.blocks = nn.ModuleList([
-            HybridTransformerBlock(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                dropout_rate=dropout_rate,
-                use_switch_ffn=layer_id in self.moe_layers,
-                num_experts=num_experts,
-                router_jitter_noise=router_jitter_noise,
-                capacity_factor=capacity_factor,
-                min_capacity=min_capacity,
-                drop_tokens=drop_tokens,
-                top_k=top_k,
-                layer_id=layer_id,
-            )
-            for layer_id in range(depth)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                HybridTransformerBlock(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    dropout_rate=dropout_rate,
+                    use_switch_ffn=layer_id in self.moe_layers,
+                    num_experts=num_experts,
+                    router_jitter_noise=router_jitter_noise,
+                    capacity_factor=capacity_factor,
+                    min_capacity=min_capacity,
+                    drop_tokens=drop_tokens,
+                    top_k=top_k,
+                    layer_id=layer_id,
+                )
+                for layer_id in range(depth)
+            ]
+        )
+
         self.norm = nn.LayerNorm(embed_dim)
         self.classifier = nn.Linear(embed_dim, num_classes)
 
@@ -411,56 +554,73 @@ class HybridSwitchTransformer(nn.Module):
 
     def get_expert_state_dict_by_layer(self):
         expert_states = {}
+
         for layer_id, block in enumerate(self.blocks):
             if not block.use_switch_ffn:
                 continue
+
             expert_states[str(layer_id)] = {
                 str(expert_id): expert.state_dict()
                 for expert_id, expert in enumerate(block.ffn.experts)
             }
+
         return expert_states
 
     def get_router_state_dict_by_layer(self):
         router_states = {}
+
         for layer_id, block in enumerate(self.blocks):
             if block.use_switch_ffn:
                 router_states[str(layer_id)] = block.ffn.router.state_dict()
+
         return router_states
 
     def get_moe_parameter_groups(self):
         parameter_groups = []
+
         for layer_id, block in enumerate(self.blocks):
             if not block.use_switch_ffn:
                 continue
-            parameter_groups.append({
-                "type": "router",
-                "layer_id": str(layer_id),
-                "params": block.ffn.router.parameters(),
-            })
-            for expert_id, expert in enumerate(block.ffn.experts):
-                parameter_groups.append({
-                    "type": "expert",
+
+            parameter_groups.append(
+                {
+                    "type": "router",
                     "layer_id": str(layer_id),
-                    "expert_id": str(expert_id),
-                    "params": expert.parameters(),
-                })
+                    "params": block.ffn.router.parameters(),
+                }
+            )
+
+            for expert_id, expert in enumerate(block.ffn.experts):
+                parameter_groups.append(
+                    {
+                        "type": "expert",
+                        "layer_id": str(layer_id),
+                        "expert_id": str(expert_id),
+                        "params": expert.parameters(),
+                    }
+                )
+
         return parameter_groups
 
     def collect_uoc_evidence(self, x, max_samples=None, use_top1=True):
         # collect_uoc_evidence 只用于采集 UOC evidence，不改变正常 forward。
         if not use_top1:
             raise ValueError("collect_uoc_evidence currently supports use_top1=True only")
+
         if max_samples is not None:
             x = x[:max_samples]
 
         with torch.no_grad():
             feature_map = self.stem(x)
             feature_map = self.token_pool(feature_map)
+
             tokens = self.token_projection(feature_map)
             tokens = tokens.flatten(2).transpose(1, 2)
+
             if self.cls_token is not None:
                 cls_tokens = self.cls_token.expand(tokens.size(0), -1, -1)
                 tokens = torch.cat([cls_tokens, tokens], dim=1)
+
             tokens = self.position_dropout(tokens + self.position_embedding)
 
             uoc_evidence = {}
@@ -473,11 +633,15 @@ class HybridSwitchTransformer(nn.Module):
                 uoc_evidence.update(block_uoc_info)
 
             tokens = self.norm(tokens)
+
             pooled = tokens[:, 0] if self.cls_token is not None else tokens.mean(dim=1)
             logits = self.classifier(pooled)
+
             probs = torch.softmax(logits.float(), dim=-1)
+
             # entropy 只作为 query 筛选信号，不参与训练 loss。
             entropy = -(probs * torch.log(probs + 1e-12)).sum(dim=-1).detach()
+
             for layer_evidence in uoc_evidence.values():
                 hidden = layer_evidence.get("hidden")
                 if hidden is None:
@@ -513,24 +677,30 @@ class HybridSwitchTransformer(nn.Module):
         x = self.norm(x)
         pooled = x[:, 0] if self.cls_token is not None else x.mean(dim=1)
         logits = self.classifier(pooled)
+
         return {"logits": logits}
 
     def forward(self, x):
         feature_map = self.stem(x)
         feature_map = self.token_pool(feature_map)
+
         tokens = self.token_projection(feature_map)
         tokens = tokens.flatten(2).transpose(1, 2)
+
         if self.cls_token is not None:
             cls_tokens = self.cls_token.expand(tokens.size(0), -1, -1)
             tokens = torch.cat([cls_tokens, tokens], dim=1)
+
         tokens = self.position_dropout(tokens + self.position_embedding)
 
         router_aux_loss = tokens.new_tensor(0.0)
         router_z_loss = tokens.new_tensor(0.0)
+
         expert_activations = torch.zeros(self.num_experts, device=tokens.device)
         selected_counts = torch.zeros(self.num_experts, device=tokens.device)
         overflow_counts = torch.zeros(self.num_experts, device=tokens.device)
         avg_router_probs = torch.zeros(self.num_experts, device=tokens.device)
+
         expert_stats_by_layer = {}
         expert_activations_by_layer = {}
         selected_counts_by_layer = {}
@@ -538,24 +708,32 @@ class HybridSwitchTransformer(nn.Module):
         avg_router_probs_by_layer = {}
         capacity_by_layer = {}
         router_assignments_by_layer = {}
+
         switch_layer_count = 0
 
         for block in self.blocks:
             tokens, switch_stats = block(tokens)
+
             if switch_stats is None:
                 continue
 
             layer_key = str(switch_stats["layer_id"])
+
             router_assignments_by_layer[layer_key] = {
                 "top1_expert_ids": switch_stats["top1_expert_ids"],
                 "top1_gates": switch_stats["top1_gates"],
             }
+
             router_aux_loss = router_aux_loss + switch_stats["router_aux_loss"]
             router_z_loss = router_z_loss + switch_stats["router_z_loss"]
-            expert_activations = expert_activations + switch_stats["expert_activations"]
+
+            expert_activations = (
+                expert_activations + switch_stats["expert_activations"]
+            )
             selected_counts = selected_counts + switch_stats["selected_counts"]
             overflow_counts = overflow_counts + switch_stats["overflow_counts"]
             avg_router_probs = avg_router_probs + switch_stats["avg_router_probs"]
+
             layer_stats = {
                 "expert_activations": switch_stats["expert_activations"],
                 "selected_counts": switch_stats["selected_counts"],
@@ -563,12 +741,16 @@ class HybridSwitchTransformer(nn.Module):
                 "capacity": switch_stats["capacity"],
                 "avg_router_probs": switch_stats["avg_router_probs"],
             }
+
             expert_stats_by_layer[layer_key] = layer_stats
-            expert_activations_by_layer[layer_key] = layer_stats["expert_activations"]
+            expert_activations_by_layer[layer_key] = layer_stats[
+                "expert_activations"
+            ]
             selected_counts_by_layer[layer_key] = layer_stats["selected_counts"]
             overflow_counts_by_layer[layer_key] = layer_stats["overflow_counts"]
             avg_router_probs_by_layer[layer_key] = layer_stats["avg_router_probs"]
             capacity_by_layer[layer_key] = layer_stats["capacity"]
+
             switch_layer_count += 1
 
         if switch_layer_count > 0:
@@ -580,7 +762,9 @@ class HybridSwitchTransformer(nn.Module):
             self.router_aux_loss_coef * router_aux_loss
             + self.router_z_loss_coef * router_z_loss
         )
+
         tokens = self.norm(tokens)
+
         pooled = tokens[:, 0] if self.cls_token is not None else tokens.mean(dim=1)
         logits = self.classifier(pooled)
 

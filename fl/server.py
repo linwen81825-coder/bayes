@@ -807,7 +807,7 @@ class Server:
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
             # 控制台瘦身：默认关闭 tqdm，避免进度条刷屏。
             # 不影响日志文件，因为 tqdm 本来也不写入日志文件。
-            disable=bool(getattr(self.args, "quiet_console", True)),
+            disable=False,
         )
         try:
             # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
@@ -956,7 +956,7 @@ class Server:
                     self.logger.info(
                         f"round={round_completed:04d}/{self.server_epochs:04d} "
                         f"loss={test_loss:.4f} "
-                        f"final_acc={test_acc * 100.0:.2f}% "
+                        f"test_acc={test_acc * 100.0:.2f}% "
                         f"best_acc={self.best_test_acc * 100.0:.2f}% "
                         f"best_round={self.best_round}",
                         extra={"to_console": True},
