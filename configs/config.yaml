@@ -97,7 +97,12 @@ uoc_foga:
   # score 转权重方式：relu（当前仅支持 relu）
   uoc_foga_score_mode: relu
 
-  # score 计算度量：cosine 保持旧行为，dot 使用内积，grad_dot 使用源码风格梯度内积，delta_consensus 使用 leave-one-out delta 共识方向
+  # score 计算度量：
+  # - cosine：旧版 delta 与 -query_grad 的 cosine
+  # - dot：旧版 delta 与 -query_grad 的 dot
+  # - grad_dot：源码风格梯度内积 <g_client, g_query>
+  # - grad_cosine：梯度方向 cosine，cos(g_client, g_query)
+  # - delta_consensus：leave-one-out delta 共识方向
   uoc_foga_score_metric: grad_cosine
 
   # 最少有效客户端数：正整数
@@ -106,10 +111,18 @@ uoc_foga:
   # 是否打印完整 per-expert UOC 详情：true / false
   uoc_foga_log_detail: false
 
-  # query 筛选模式：class_balanced_random 保持旧行为，expert_ratio_entropy 启用增强筛选,mixed_global_expert
+  # query 筛选模式：
+  # - class_balanced_random：旧随机 class-balanced query
+  # - expert_ratio_entropy：expert-specific query，按 expert 命中比例/entropy 筛选
+  # - mixed_global_expert：D_query = D_global_balanced ∪ D_expert_specific
   uoc_foga_query_select_mode: expert_ratio_entropy
 
-  # expert token 命中比例阈值；旧模式默认不额外过滤
+  # mixed_global_expert 下 global-balanced query 的目标比例。
+  # 例如 0.5 表示 global 和 expert-specific 大致各占一半。
+  # 当前 query_select_mode 不是 mixed_global_expert 时，该参数不生效。
+  uoc_foga_global_query_ratio: 0.5
+
+  # expert token 命中比例阈值；expert_ratio_entropy / mixed 的 expert-specific 部分使用
   uoc_foga_min_expert_token_ratio: 0.05
 
   # 每个 class 内每个 client 最多保留多少样本；0 表示不限制
@@ -118,10 +131,12 @@ uoc_foga:
   # 增强筛选后 query 不足时是否回退到旧随机 class-balanced
   uoc_foga_query_fallback_to_random: true
 
-  uoc_foga_global_query_ratio: 0.5
-
-  # grad_dot 的 client-grad set 单独采样参数。
-  # 这些参数只影响 g_client 的 D_client,i,l,e 构造，不影响全局 query set。
+  # ============================================================
+  # client-grad set 配置
+  # ============================================================
+  # 这些参数只影响 g_client 的 D_client,i,l,e 构造，不影响全局 D_query,l,e。
+  # 即使 uoc_foga_query_select_mode=mixed_global_expert，
+  # g_client 仍然按客户端自己的 expert evidence 构造。
   uoc_foga_client_grad_query_per_class: 8
   uoc_foga_client_grad_min_samples_per_expert: 4
   uoc_foga_client_grad_min_classes_per_expert: 1
@@ -129,12 +144,20 @@ uoc_foga:
   uoc_foga_client_grad_max_samples_per_client_per_class: 8
   uoc_foga_client_grad_fallback_to_random: true
 
-  # grad_dot PISM 输入：2/3/5
+  # ============================================================
+  # PISM 配置
+  # ============================================================
+  # grad_cosine 下 PISM 输入为 5 维：
   # [
-  #   expert_client_loss,
-  #   log1p(client_grad_sample_count)
+  #   expert_loss_z,
+  #   usage_ratio_z,
+  #   consensus_grad_cos,
+  #   consensus_grad_rank_norm,
+  #   consensus_grad_pos_flag
   # ]
-  uoc_foga_pism_input_dim: 2
+  #
+  # 注意：旧 grad_dot 分支可能仍使用旧 input_dim 逻辑。
+  uoc_foga_pism_input_dim: 5
 
   # PISM 隐层宽度：正整数
   uoc_foga_pism_hidden_size: 64
@@ -173,6 +196,53 @@ uoc_foga:
   uoc_foga_pism_min_weight_factor: 0.0
   uoc_foga_pism_fairness_blend: 0.0
 
+  # ============================================================
+  # 诊断 A：query gradient vs fixed balanced reference gradient
+  # ============================================================
+  # 只打日志，不参与训练、不参与 score、不参与 PISM、不参与聚合权重。
+  #
+  # 打开后会记录：
+  # - [UOC-FOGA-QUERY-REF]
+  # - uoc_foga_query_ref_cos_mean
+  # - uoc_foga_query_ref_cos_std
+  # - uoc_foga_query_ref_cos_min
+  # - uoc_foga_query_ref_cos_valid_frac
+  #
+  # 默认关闭，避免普通实验变慢。
+  uoc_foga_ref_grad_diag_enabled: false
+
+  # 每几轮做一次诊断；1 表示每轮
+  uoc_foga_ref_grad_diag_every: 1
+
+  # 每类 fixed balanced reference 样本数
+  uoc_foga_ref_query_per_class: 8
+
+  # reference set 来源。
+  # global_test 只能做诊断，不能参与训练和调权。
+  uoc_foga_ref_query_split: global_test
+
+  # ============================================================
+  # 诊断 C：top client 小步 expert 更新是否降低 reference loss
+  # ============================================================
+  # 只打日志，不参与训练、不参与 score、不参与 PISM、不参与聚合权重。
+  #
+  # 打开后会记录：
+  # - [UOC-FOGA-REF-STEP]
+  # - uoc_foga_ref_step_foga_top_loss_delta_mean
+  # - uoc_foga_ref_step_foga_top_improve_frac
+  # - uoc_foga_ref_step_pism_top_loss_delta_mean
+  # - uoc_foga_ref_step_pism_top_improve_frac
+  # - uoc_foga_ref_step_valid_frac
+  #
+  # 默认关闭，因为这个诊断会额外 forward，比较慢。
+  uoc_foga_ref_step_diag_enabled: false
+
+  # 每几轮做一次 ref-step 诊断；建议正式 50 轮时用 5 或 10
+  uoc_foga_ref_step_diag_every: 5
+
+  # 小步更新学习率，只用于诊断临时更新，之后会恢复参数
+  uoc_foga_ref_step_lr: 0.01
+
 
 # ============================================================
 # 数据集与数据划分配置
@@ -210,7 +280,6 @@ data:
 
   # 每个 worker 预取 batch 数；仅 num_workers > 0 时生效
   prefetch_factor: 2
-
 
 
 # ============================================================

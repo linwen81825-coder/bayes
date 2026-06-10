@@ -622,7 +622,22 @@ class Server:
         )
 
     def _forward_model_collecting_uoc_evidence(self, inputs):
-        """兼容不同模型 forward 参数名，尽量拿到 layer evidence。"""
+        """
+        收集 fixed reference batch 的 UOC evidence。
+
+        HybridSwitchTransformer 的普通 forward() 只返回 logits / router stats，
+        不返回 hidden/residual 这类 UOC evidence。真正用于 UOC 的接口是
+        model.collect_uoc_evidence(...)，所以这里必须优先调用它。
+        """
+        if hasattr(self.model, "collect_uoc_evidence"):
+            return {
+                "uoc_evidence_by_layer": self.model.collect_uoc_evidence(
+                    inputs,
+                    max_samples=None,
+                    use_top1=bool(getattr(self.args, "uoc_foga_use_top1", True)),
+                )
+            }
+
         forward_attempts = (
             {"return_uoc_evidence": True},
             {"collect_uoc_evidence": True},
@@ -641,9 +656,32 @@ class Server:
             raise last_error
         return self.model(inputs)
 
+    def _is_layer_evidence_dict(self, value):
+        """
+        判断一个 dict 是否已经是 {layer_id: layer_evidence} 格式。
+
+        collect_uoc_evidence() 可能直接返回：
+            {"1": {"hidden": ..., "residual": ...}, "3": ...}
+
+        普通 forward 包装接口可能返回：
+            {"uoc_evidence_by_layer": {"1": ...}}
+        """
+        if not isinstance(value, dict) or not value:
+            return False
+        for layer_value in value.values():
+            if isinstance(layer_value, dict) and torch.is_tensor(layer_value.get("hidden")):
+                return True
+        return False
+
     def _extract_uoc_evidence_from_output(self, output):
         if not isinstance(output, dict):
             return None
+
+        # collect_uoc_evidence() 直接返回的 layer evidence。
+        if self._is_layer_evidence_dict(output):
+            return output
+
+        # forward() 包装返回的 layer evidence。
         for key in (
             "uoc_evidence_by_layer",
             "evidence_by_layer",
@@ -652,8 +690,9 @@ class Server:
             "moe_evidence_by_layer",
         ):
             value = output.get(key)
-            if isinstance(value, dict):
+            if self._is_layer_evidence_dict(value):
                 return value
+
         return None
 
     def _append_reference_evidence_chunk(self, merged, evidence_by_layer, labels):
