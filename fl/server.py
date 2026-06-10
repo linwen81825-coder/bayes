@@ -809,6 +809,7 @@ class Server:
             # 不影响日志文件，因为 tqdm 本来也不写入日志文件。
             disable=bool(getattr(self.args, "quiet_console", True)),
         )
+
         try:
             # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
             for c_T in range(self.start_round, self.server_epochs):
@@ -944,10 +945,8 @@ class Server:
                 if should_eval:
                     eval_start_time = time.perf_counter()
                     test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
-
                     round_eval_seconds = time.perf_counter() - eval_start_time
                     self.logger.info(f"--server_global_test_loss : {test_loss:.4f} --server_global_test_acc : {test_acc:.4f}\n")
-
                     is_best = self.update_best_model(test_acc=test_acc, test_loss=test_loss, round_id=round_completed)
 
                     # 控制台专用精简摘要：
@@ -1224,6 +1223,12 @@ class Server:
                 f"logit_score_corr_valid_frac={pism_summary.get('uoc_foga_pism_logit_score_corr_valid_frac')} "
                 f"logit_std_mean={pism_summary.get('uoc_foga_pism_logit_std_mean')}\n"
             )
+            self.logger.info(
+                "[PISM-FEATURE-USE] "
+                f"score_corr={json.dumps(pism_summary.get('uoc_foga_pism_feature_score_corr_mean'), ensure_ascii=False, sort_keys=True)} "
+                f"logit_corr={json.dumps(pism_summary.get('uoc_foga_pism_feature_logit_corr_mean'), ensure_ascii=False, sort_keys=True)} "
+                f"weight_corr={json.dumps(pism_summary.get('uoc_foga_pism_feature_weight_corr_mean'), ensure_ascii=False, sort_keys=True)}\n"
+            )
             for debug_record in pism_summary.get("pism_alignment_debug_records") or []:
                 self.logger.info(
                     "[PISM-ALIGN-DEBUG] "
@@ -1270,6 +1275,13 @@ class Server:
                 "uoc_foga_pism_logit_score_corr_mean",
                 "uoc_foga_pism_logit_score_corr_valid_frac",
                 "uoc_foga_pism_logit_std_mean",
+                "uoc_foga_pism_feature_score_corr_mean",
+                "uoc_foga_pism_feature_logit_corr_mean",
+                "uoc_foga_pism_feature_weight_corr_mean",
+                "uoc_foga_pism_feature_mean",
+                "uoc_foga_pism_feature_std_mean",
+                "uoc_foga_pism_feature_foga_top_value_mean",
+                "uoc_foga_pism_feature_pism_top_value_mean",
                 "uoc_foga_mixed_global_query_size_mean",
                 "uoc_foga_mixed_expert_query_size_mean",
                 "uoc_foga_mixed_global_query_num_classes_mean",

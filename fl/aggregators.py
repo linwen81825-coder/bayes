@@ -1355,6 +1355,21 @@ def _safe_rank_value_or_none(value):
         return None
     return int(value)
 
+
+def _safe_mean_dicts(dict_values):
+    # 对多个 {feature_name: value} 诊断字典按 key 求均值。
+    # 只用于日志汇总，不参与训练和聚合。
+    buckets = collections.defaultdict(list)
+    for item in dict_values:
+        if not isinstance(item, dict):
+            continue
+        for key, value in item.items():
+            numeric_value = _safe_float_or_none(value)
+            if numeric_value is not None:
+                buckets[str(key)].append(numeric_value)
+    return {key: _safe_mean(values) for key, values in sorted(buckets.items())}
+
+
 class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
     # PISM 版 UOC-FOGA：用 DeepSets 元网络从 client/expert 特征生成专家聚合权重。
     def __init__(self, args):
@@ -2595,6 +2610,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "pism_logit": _safe_float_or_none(logits[idx]),
                 "pism_weight": _safe_float_or_none(weights[idx]),
                 "weight_rank_desc": _safe_rank_value_or_none(weight_ranks[idx]),
+                # 动态输出本次 PISM 真正使用的全部输入，避免只适配某一种 input_dim。
+                "features": feature_map,
+                # 下面几个字段保留旧日志兼容；如果当前输入没有这些 key，会显示为 None。
                 "expert_loss_z": feature_map.get("expert_loss_z"),
                 "usage_ratio_z": feature_map.get("usage_ratio_z"),
                 "consensus_grad_cos": feature_map.get("consensus_grad_cos"),
@@ -2642,6 +2660,93 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "foga_top_pism_weight": _safe_float_or_none(metric.get("foga_top_client_pism_weight")),
             "weight_score_corr": _safe_float_or_none(metric.get("weight_score_corr")),
             "logit_score_corr": _safe_float_or_none(metric.get("logit_score_corr")),
+        }
+
+    def _build_pism_feature_usefulness_diag(
+        self,
+        features_tensor,
+        scores_tensor,
+        logits_tensor,
+        weights_tensor,
+        feature_names,
+    ):
+        # 诊断每个 PISM 输入特征是否真的有用：
+        # 1) 和 FOGA score 的相关性：这个特征是否能解释老师信号；
+        # 2) 和 PISM logit/weight 的相关性：PISM 是否真的在用这个特征；
+        # 3) FOGA top / PISM top 上的特征值：两者选人依据是否一致。
+        # 只写日志，不参与 meta loss、score、softmax 或聚合权重。
+        if not torch.is_tensor(features_tensor):
+            return {}
+        if not torch.is_tensor(scores_tensor):
+            scores_tensor = torch.as_tensor(scores_tensor, dtype=torch.float32, device=features_tensor.device)
+        if not torch.is_tensor(logits_tensor):
+            logits_tensor = torch.as_tensor(logits_tensor, dtype=torch.float32, device=features_tensor.device)
+        if not torch.is_tensor(weights_tensor):
+            weights_tensor = torch.as_tensor(weights_tensor, dtype=torch.float32, device=features_tensor.device)
+
+        features = features_tensor.detach().float()
+        if features.dim() == 1:
+            features = features.unsqueeze(-1)
+        scores = scores_tensor.detach().float().reshape(-1)
+        logits = logits_tensor.detach().float().reshape(-1)
+        weights = weights_tensor.detach().float().reshape(-1)
+        valid_count = min(features.size(0), scores.numel(), logits.numel(), weights.numel())
+        if valid_count <= 0:
+            return {}
+
+        features = features[:valid_count]
+        scores = scores[:valid_count]
+        logits = logits[:valid_count]
+        weights = weights[:valid_count]
+        names = list(feature_names or [])
+        if len(names) < features.size(1):
+            names.extend([f"feature_{idx}" for idx in range(len(names), features.size(1))])
+
+        foga_top_idx = None
+        pism_top_idx = None
+        finite_score_pairs = [
+            (idx, float(value.detach().cpu().item()))
+            for idx, value in enumerate(scores)
+            if torch.isfinite(value)
+        ]
+        finite_weight_pairs = [
+            (idx, float(value.detach().cpu().item()))
+            for idx, value in enumerate(weights)
+            if torch.isfinite(value)
+        ]
+        if finite_score_pairs:
+            foga_top_idx = max(finite_score_pairs, key=lambda item: (item[1], -item[0]))[0]
+        if finite_weight_pairs:
+            pism_top_idx = max(finite_weight_pairs, key=lambda item: (item[1], -item[0]))[0]
+
+        feature_score_corr = {}
+        feature_logit_corr = {}
+        feature_weight_corr = {}
+        feature_mean = {}
+        feature_std = {}
+        feature_foga_top_value = {}
+        feature_pism_top_value = {}
+        for pos in range(features.size(1)):
+            name = str(names[pos])
+            values = features[:, pos]
+            feature_score_corr[name] = _safe_pearson(values, scores)
+            feature_logit_corr[name] = _safe_pearson(values, logits)
+            feature_weight_corr[name] = _safe_pearson(values, weights)
+            feature_mean[name] = _safe_mean(values)
+            feature_std[name] = _safe_std(values)
+            if foga_top_idx is not None:
+                feature_foga_top_value[name] = _safe_float_or_none(values[foga_top_idx].detach().cpu().item())
+            if pism_top_idx is not None:
+                feature_pism_top_value[name] = _safe_float_or_none(values[pism_top_idx].detach().cpu().item())
+
+        return {
+            "pism_feature_score_corr": feature_score_corr,
+            "pism_feature_logit_corr": feature_logit_corr,
+            "pism_feature_weight_corr": feature_weight_corr,
+            "pism_feature_mean": feature_mean,
+            "pism_feature_std": feature_std,
+            "pism_feature_foga_top_value": feature_foga_top_value,
+            "pism_feature_pism_top_value": feature_pism_top_value,
         }
 
     def _apply_pism_weights_for_record(
@@ -2737,6 +2842,15 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         logits_tensor = logits_tensor.detach().reshape(-1)
         metric["logit_score_corr"] = _safe_pearson(logits_tensor, record["scores"])
         metric["pism_logit_std"] = _safe_std(logits_tensor)
+        metric.update(
+            self._build_pism_feature_usefulness_diag(
+                features_tensor=record.get("features"),
+                scores_tensor=record.get("scores"),
+                logits_tensor=logits_tensor,
+                weights_tensor=weights_tensor.detach(),
+                feature_names=metric.get("pism_input_names"),
+            )
+        )
         if self._should_collect_pism_alignment_debug(round_index):
             metric["pism_alignment_debug_record"] = self._build_pism_alignment_debug_record(
                 record=record,
@@ -2921,6 +3035,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         pism_logit_score_corrs = []
         pism_logit_score_corr_valid_count = 0
         pism_logit_stds = []
+        pism_feature_score_corrs = []
+        pism_feature_logit_corrs = []
+        pism_feature_weight_corrs = []
+        pism_feature_means = []
+        pism_feature_stds = []
+        pism_feature_foga_top_values = []
+        pism_feature_pism_top_values = []
         pism_alignment_debug_candidates = []
         ref_step_foga_top_loss_deltas = []
         ref_step_pism_top_loss_deltas = []
@@ -2999,6 +3120,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             if _safe_numeric_values([logit_score_corr]):
                 pism_logit_score_corr_valid_count += 1
             pism_logit_stds.append(expert_metric.get("pism_logit_std"))
+            pism_feature_score_corrs.append(expert_metric.get("pism_feature_score_corr"))
+            pism_feature_logit_corrs.append(expert_metric.get("pism_feature_logit_corr"))
+            pism_feature_weight_corrs.append(expert_metric.get("pism_feature_weight_corr"))
+            pism_feature_means.append(expert_metric.get("pism_feature_mean"))
+            pism_feature_stds.append(expert_metric.get("pism_feature_std"))
+            pism_feature_foga_top_values.append(expert_metric.get("pism_feature_foga_top_value"))
+            pism_feature_pism_top_values.append(expert_metric.get("pism_feature_pism_top_value"))
             debug_record = expert_metric.get("pism_alignment_debug_record")
             if isinstance(debug_record, dict):
                 pism_alignment_debug_candidates.append(debug_record)
@@ -3079,6 +3207,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 else 0.0
             ),
             "uoc_foga_pism_logit_std_mean": _safe_mean(pism_logit_stds),
+            "uoc_foga_pism_feature_score_corr_mean": _safe_mean_dicts(pism_feature_score_corrs),
+            "uoc_foga_pism_feature_logit_corr_mean": _safe_mean_dicts(pism_feature_logit_corrs),
+            "uoc_foga_pism_feature_weight_corr_mean": _safe_mean_dicts(pism_feature_weight_corrs),
+            "uoc_foga_pism_feature_mean": _safe_mean_dicts(pism_feature_means),
+            "uoc_foga_pism_feature_std_mean": _safe_mean_dicts(pism_feature_stds),
+            "uoc_foga_pism_feature_foga_top_value_mean": _safe_mean_dicts(pism_feature_foga_top_values),
+            "uoc_foga_pism_feature_pism_top_value_mean": _safe_mean_dicts(pism_feature_pism_top_values),
             "pism_alignment_debug_records": pism_alignment_debug_records,
             "uoc_foga_pism_pism_top_score_rank_mean": _safe_mean(pism_top_score_ranks),
             "uoc_foga_pism_pism_top_score_value_mean": _safe_mean(pism_top_score_values),
