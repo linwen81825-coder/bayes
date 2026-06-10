@@ -2675,7 +2675,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 meta_losses = []
                 for record in per_expert_records:
                     weights = self.meta_net(record["features"], tau=current_tau)
-                    meta_losses.append(-(weights * record["scores"]).sum())
+                    meta_losses.append(-(weights * record["scores"]).mean())
                 meta_loss = torch.stack(meta_losses).mean()
 
                 if not torch.isfinite(meta_loss):
