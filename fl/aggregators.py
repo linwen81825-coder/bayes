@@ -1364,8 +1364,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         )
         self.score_metric = self._get_score_metric()
         if self.score_metric == "grad_cosine":
-            # grad_cosine 版删掉绝对 usage 特征 log_usage_z，只保留 5 维 PISM 输入。
-            self.pism_input_dim = 5
+            # grad_cosine 版删掉绝对 usage 以及离散 consensus rank/pos flag，
+            # 只保留 3 维 PISM 输入：expert_loss_z / usage_ratio_z / consensus_grad_cos。
+            self.pism_input_dim = 3
         else:
             self.pism_input_dim = int(getattr(args, "uoc_foga_pism_input_dim", 5))
         if self.score_metric == "grad_cosine":
@@ -1478,8 +1479,6 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "expert_loss_z",
                 "usage_ratio_z",
                 "consensus_grad_cos",
-                "consensus_grad_rank_norm",
-                "consensus_grad_pos_flag",
             ]
         if self.score_metric == "grad_dot":
             return [
@@ -1866,7 +1865,8 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         usage_ratio_z = _safe_zscore(usage_ratio, device=device)
 
         consensus_grad_cos = self._build_consensus_grad_cos_features(client_grad_states, device)
-        consensus_grad_rank_norm = _safe_rank_norm_desc(consensus_grad_cos, device=device)
+        # consensus_grad_rank_norm / consensus_grad_pos_flag 只作为旧诊断含义保留，不再进入 PISM 输入。
+        # 这一步用于验证后期 PISM 是否被离散 consensus 排名/正负标记带偏。
         consensus_grad_pos_flag = (consensus_grad_cos > 0.0).float()
 
         features = torch.stack(
@@ -1874,8 +1874,6 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 expert_loss_z,
                 usage_ratio_z,
                 consensus_grad_cos,
-                consensus_grad_rank_norm,
-                consensus_grad_pos_flag,
             ],
             dim=-1,
         )
@@ -2600,8 +2598,6 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "expert_loss_z": feature_map.get("expert_loss_z"),
                 "usage_ratio_z": feature_map.get("usage_ratio_z"),
                 "consensus_grad_cos": feature_map.get("consensus_grad_cos"),
-                "consensus_grad_rank_norm": feature_map.get("consensus_grad_rank_norm"),
-                "consensus_grad_pos_flag": feature_map.get("consensus_grad_pos_flag"),
             }
             rows.append(row)
 
