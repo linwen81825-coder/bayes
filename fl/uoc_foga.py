@@ -1491,30 +1491,67 @@ def build_stratified_query_for_expert(
 
     raise ValueError(f"Unknown UOC-FOGA query_select_mode: {query_select_mode!r}")
 
-def positive_score_to_weights(client_scores, mode="relu", eps=1e-12):
-    if mode != "relu":
-        raise ValueError(f"Unknown score weighting mode: {mode!r}")
+def positive_score_to_weights(client_scores, mode="relu", tau=0.5, eps=1e-12):
+    """将客户端 score 转成聚合权重。
 
-    positive_scores = {}
+    支持两种模式：
+    - relu：旧逻辑，只保留正 score，负 score 置 0 后归一化；
+    - softmax：对所有有效 score 做 softmax(score / tau)，更平滑，不会把轻微负分直接打死。
+    """
+    mode = str(mode).lower()
+
+    valid_scores = {}
     for client_id, score in client_scores.items():
         if score is None:
             continue
-        positive_scores[client_id] = max(float(score), 0.0)
+        score_value = float(score)
+        if not math.isfinite(score_value):
+            continue
+        valid_scores[client_id] = score_value
 
-    if not positive_scores:
+    if not valid_scores:
         return {}, "no_valid_scores"
 
-    total_score = sum(positive_scores.values())
-    if total_score > eps:
+    if mode == "relu":
+        positive_scores = {
+            client_id: max(score, 0.0)
+            for client_id, score in valid_scores.items()
+        }
+        total_score = sum(positive_scores.values())
+        if total_score > eps:
+            weights = {
+                client_id: score / total_score
+                for client_id, score in positive_scores.items()
+            }
+            return weights, None
+
+        uniform_weight = 1.0 / len(positive_scores)
+        weights = {client_id: uniform_weight for client_id in positive_scores}
+        return weights, "all_scores_non_positive_or_zero"
+
+    if mode == "softmax":
+        tau = float(tau)
+        if tau <= 0.0 or not math.isfinite(tau):
+            raise ValueError(f"uoc_foga_score_tau must be a positive finite value, got {tau!r}")
+
+        max_score = max(valid_scores.values())
+        exp_scores = {
+            client_id: math.exp((score - max_score) / tau)
+            for client_id, score in valid_scores.items()
+        }
+        total_score = sum(exp_scores.values())
+        if total_score <= eps:
+            uniform_weight = 1.0 / len(exp_scores)
+            weights = {client_id: uniform_weight for client_id in exp_scores}
+            return weights, "softmax_scores_underflow"
+
         weights = {
             client_id: score / total_score
-            for client_id, score in positive_scores.items()
+            for client_id, score in exp_scores.items()
         }
         return weights, None
 
-    uniform_weight = 1.0 / len(positive_scores)
-    weights = {client_id: uniform_weight for client_id in positive_scores}
-    return weights, "all_scores_non_positive_or_zero"
+    raise ValueError(f"Unknown score weighting mode: {mode!r}")
 
 
 def expert_weight_entropy(weights, eps=1e-12):

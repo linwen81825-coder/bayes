@@ -849,10 +849,15 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             )
             return metric
 
+        score_mode = getattr(self.args, "uoc_foga_score_mode", "relu")
+        score_tau = float(getattr(self.args, "uoc_foga_score_tau", 0.5))
         weights, weight_fallback = positive_score_to_weights(
             client_scores,
-            mode=getattr(self.args, "uoc_foga_score_mode", "relu"),
+            mode=score_mode,
+            tau=score_tau,
         )
+        metric["score_weight_mode"] = str(score_mode).lower()
+        metric["score_tau"] = score_tau
         if weight_fallback is not None:
             metric["fallback_reason"] = weight_fallback
             self._mark_uniform_fallback_weights(metric, client_updates)
@@ -1059,10 +1064,15 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             )
             return metric
 
+        score_mode = getattr(self.args, "uoc_foga_score_mode", "relu")
+        score_tau = float(getattr(self.args, "uoc_foga_score_tau", 0.5))
         weights, score_fallback = positive_score_to_weights(
             client_scores,
-            mode=getattr(self.args, "uoc_foga_score_mode", "relu"),
+            mode=score_mode,
+            tau=score_tau,
         )
+        metric["score_weight_mode"] = str(score_mode).lower()
+        metric["score_tau"] = score_tau
         if score_fallback is not None:
             metric["fallback_reason"] = score_fallback
             self._mark_uniform_fallback_weights(metric, client_updates)

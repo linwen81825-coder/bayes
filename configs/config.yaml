@@ -94,9 +94,11 @@ uoc_foga:
   # 强制 expert 的 gate 模式：one（当前仅支持 one）
   uoc_foga_gate_mode: one
 
-  # score 转权重方式：relu（当前仅支持 relu）
+  # score 转权重方式：relu/softmax
   uoc_foga_score_mode: relu
 
+  uoc_foga_score_tau: 0.5
+  
   # score 计算度量：
   # - cosine：旧版 delta 与 -query_grad 的 cosine
   # - dot：旧版 delta 与 -query_grad 的 dot
