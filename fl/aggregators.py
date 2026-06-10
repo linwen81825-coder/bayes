@@ -2473,9 +2473,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             )
             features = self._select_pism_features_for_config(features)
             metric["pism_input_names"] = self._pism_input_names_for_config()
-        if score_metric == "grad_cosine" and features.size(-1) != 5:
+        if self.score_metric == "grad_cosine" and features.size(-1) != self.pism_input_dim:
             raise ValueError(
-                "grad_cosine PISM features must have input_dim=5 after removing log_usage_z"
+                f"grad_cosine PISM features must have input_dim={self.pism_input_dim}, "
+                f"got {features.size(-1)}"
             )
         if features.size(-1) != self.pism_input_dim:
             raise ValueError(
