@@ -1203,6 +1203,27 @@ class Server:
                 f"foga_top_pism_weight_mean={pism_summary.get('uoc_foga_pism_foga_top_pism_weight_mean')}\n"
             )
             self.logger.info(
+                "[PISM-ALIGN-SUMMARY] "
+                f"logit_score_corr_mean={pism_summary.get('uoc_foga_pism_logit_score_corr_mean')} "
+                f"logit_score_corr_valid_frac={pism_summary.get('uoc_foga_pism_logit_score_corr_valid_frac')} "
+                f"logit_std_mean={pism_summary.get('uoc_foga_pism_logit_std_mean')}\n"
+            )
+            for debug_record in pism_summary.get("pism_alignment_debug_records") or []:
+                self.logger.info(
+                    "[PISM-ALIGN-DEBUG] "
+                    f"round={debug_record.get('round')} "
+                    f"layer={debug_record.get('layer_id')} "
+                    f"expert={debug_record.get('expert_id')} "
+                    f"valid_clients={debug_record.get('valid_clients')} "
+                    f"pism_top_score_rank={debug_record.get('pism_top_score_rank')} "
+                    f"weight_score_corr={debug_record.get('weight_score_corr')} "
+                    f"logit_score_corr={debug_record.get('logit_score_corr')}\n"
+                )
+                self.logger.info(
+                    "--pism_alignment_debug_record : "
+                    f"{json.dumps(debug_record, ensure_ascii=False, sort_keys=True)}\n"
+                )
+            self.logger.info(
                 "[UOC-FOGA-QUERY-REF] "
                 f"query_ref_cos_mean={pism_summary.get('uoc_foga_query_ref_cos_mean')} "
                 f"query_ref_cos_std={pism_summary.get('uoc_foga_query_ref_cos_std')} "
@@ -1230,6 +1251,9 @@ class Server:
                 "uoc_foga_pism_consensus_grad_cos_mean",
                 "uoc_foga_pism_consensus_grad_pos_frac_mean",
                 "uoc_foga_pism_expert_loss_z_std_mean",
+                "uoc_foga_pism_logit_score_corr_mean",
+                "uoc_foga_pism_logit_score_corr_valid_frac",
+                "uoc_foga_pism_logit_std_mean",
                 "uoc_foga_mixed_global_query_size_mean",
                 "uoc_foga_mixed_expert_query_size_mean",
                 "uoc_foga_mixed_global_query_num_classes_mean",

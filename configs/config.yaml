@@ -243,6 +243,10 @@ uoc_foga:
   # 小步更新学习率，只用于诊断临时更新，之后会恢复参数
   uoc_foga_ref_step_lr: 0.01
 
+  uoc_foga_pism_debug_alignment: true
+  uoc_foga_pism_debug_alignment_every: 1
+  uoc_foga_pism_debug_alignment_max_records: 2
+  uoc_foga_pism_debug_alignment_topk: 10
 
 # ============================================================
 # 数据集与数据划分配置
