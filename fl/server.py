@@ -807,7 +807,7 @@ class Server:
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
             # 控制台瘦身：默认关闭 tqdm，避免进度条刷屏。
             # 不影响日志文件，因为 tqdm 本来也不写入日志文件。
-            disable=False,
+            disable=bool(getattr(self.args, "quiet_console", True)),
         )
         try:
             # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
