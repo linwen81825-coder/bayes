@@ -2212,8 +2212,18 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         )
         features = self._select_pism_features_for_config(features)
         metric["pism_input_names"] = self._pism_input_names_for_config()
+
+        if features.size(-1) != self.pism_input_dim:
+            raise ValueError(
+                f"PISM feature dim mismatch: expected {self.pism_input_dim}, got {features.size(-1)}"
+            )
+
+        # 是否对所有 PISM 输入做 z-score，完全由 uoc_foga_pism_renorm_inputs 控制。
+        # false：保留 raw 输入，例如 [client_loss, log1p(usage), log1p(delta_norm)]。
+        # true ：按当前 expert 的有效客户端维度做 z-score。
         if self.pism_renorm_inputs:
             features = normalize_pism_inputs(features)
+
         if not torch.isfinite(features).all():
             return metric, self._fallback_expert(
                 aggregated_state,
@@ -2524,17 +2534,17 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             )
             features = self._select_pism_features_for_config(features)
             metric["pism_input_names"] = self._pism_input_names_for_config()
-        if score_metric == "grad_cosine" and features.size(-1) != self.pism_input_dim:
-            raise ValueError(
-                f"grad_cosine PISM features must have input_dim={self.pism_input_dim}, "
-                f"got {features.size(-1)}"
-            )
         if features.size(-1) != self.pism_input_dim:
             raise ValueError(
                 f"PISM feature dim mismatch: expected {self.pism_input_dim}, got {features.size(-1)}"
             )
+
+        # 是否对所有 PISM 输入做 z-score，完全由 uoc_foga_pism_renorm_inputs 控制。
+        # false：保留 raw 输入，例如 [client_loss, log1p(usage), log1p(delta_norm)]。
+        # true ：按当前 expert 的有效客户端维度做 z-score。
         if self.pism_renorm_inputs:
             features = normalize_pism_inputs(features)
+
         if not torch.isfinite(features).all():
             return metric, self._fallback_expert(
                 aggregated_state,
