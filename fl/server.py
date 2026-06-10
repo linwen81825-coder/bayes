@@ -805,9 +805,6 @@ class Server:
             ascii=False,
             mininterval=0.1,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
-            # 控制台瘦身：默认关闭 tqdm，避免进度条刷屏。
-            # 不影响日志文件，因为 tqdm 本来也不写入日志文件。
-            disable=bool(getattr(self.args, "quiet_console", True)),
         )
 
         try:
@@ -948,18 +945,6 @@ class Server:
                     round_eval_seconds = time.perf_counter() - eval_start_time
                     self.logger.info(f"--server_global_test_loss : {test_loss:.4f} --server_global_test_acc : {test_acc:.4f}\n")
                     is_best = self.update_best_model(test_acc=test_acc, test_loss=test_loss, round_id=round_completed)
-
-                    # 控制台专用精简摘要：
-                    # 只有这条日志会通过 train.py 里的 ConsoleSummaryFilter 显示到控制台。
-                    # 其他完整诊断日志仍然全部写入 logs/*.log。
-                    self.logger.info(
-                        f"round={round_completed:04d}/{self.server_epochs:04d} "
-                        f"loss={test_loss:.4f} "
-                        f"test_acc={test_acc * 100.0:.2f}% "
-                        f"best_acc={self.best_test_acc * 100.0:.2f}% "
-                        f"best_round={self.best_round}",
-                        extra={"to_console": True},
-                    )
                     record_server_result(
                         {
                             "phase": "test",
@@ -1269,6 +1254,7 @@ class Server:
             for key in (
                 "uoc_foga_score_metric",
                 "uoc_foga_pism_input_dim",
+                "uoc_foga_pism_meta_loss_reduction",
                 "uoc_foga_pism_consensus_grad_cos_mean",
                 "uoc_foga_pism_consensus_grad_pos_frac_mean",
                 "uoc_foga_pism_expert_loss_z_std_mean",

@@ -1482,6 +1482,19 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             raise ValueError("uoc_foga_pism_meta_steps must be a positive integer")
         if self.pism_meta_steps <= 0:
             raise ValueError("uoc_foga_pism_meta_steps must be a positive integer")
+
+        # PISM meta loss 在每个 expert 内如何聚合客户端项：
+        # - mean：源码风格，-(weights * scores).mean()，不同有效客户端数 K 的 loss 尺度更一致；
+        # - sum ：旧实验风格，-(weights * scores).sum()，梯度强度约为 mean 的 K 倍。
+        # 这里只控制 meta loss 公式，不改变 PISM 输入、score、softmax、后处理或专家聚合逻辑。
+        self.pism_meta_loss_reduction = str(
+            getattr(args, "uoc_foga_pism_meta_loss_reduction", "mean")
+        ).strip().lower()
+        if self.pism_meta_loss_reduction not in {"mean", "sum"}:
+            raise ValueError(
+                "uoc_foga_pism_meta_loss_reduction must be 'mean' or 'sum'"
+            )
+
         self.pism_update_steps = 0
         self.meta_net = ExpertPISM(
             input_dim=self.pism_input_dim,
@@ -1635,6 +1648,15 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "PISM meta_steps mismatch. Please set resume=false when changing uoc_foga_pism_meta_steps."
             )
 
+    def _validate_checkpoint_meta_loss_reduction(self, pism_config):
+        saved_reduction = str(
+            pism_config.get("meta_loss_reduction", "mean")
+        ).strip().lower()
+        if saved_reduction != self.pism_meta_loss_reduction:
+            raise ValueError(
+                "PISM meta_loss_reduction mismatch. Please set resume=false when changing uoc_foga_pism_meta_loss_reduction."
+            )
+
     def get_checkpoint_state(self):
         return {
             "type": "uoc_foga_pism_expert_align",
@@ -1652,6 +1674,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "tau_min": self.pism_tau_min,
                 "tau_decay": self.pism_tau_decay,
                 "meta_steps": self.pism_meta_steps,
+                "meta_loss_reduction": self.pism_meta_loss_reduction,
                 "renorm_inputs": self.pism_renorm_inputs,
                 "min_clients": self.pism_min_clients,
             },
@@ -1672,6 +1695,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         self._validate_checkpoint_input_dim(pism_config)
         self._validate_checkpoint_tau_schedule(pism_config)
         self._validate_checkpoint_meta_steps(pism_config)
+        self._validate_checkpoint_meta_loss_reduction(pism_config)
 
         if "meta_net" in state:
             self.meta_net.load_state_dict(state["meta_net"])
@@ -2974,7 +2998,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 meta_losses = []
                 for record in per_expert_records:
                     weights = self.meta_net(record["features"], tau=current_tau)
-                    meta_losses.append(-(weights * record["scores"]).mean())
+                    score_weight_terms = weights * record["scores"]
+                    if self.pism_meta_loss_reduction == "sum":
+                        meta_losses.append(-score_weight_terms.sum())
+                    else:
+                        meta_losses.append(-score_weight_terms.mean())
                 meta_loss = torch.stack(meta_losses).mean()
 
                 if not torch.isfinite(meta_loss):
@@ -3166,6 +3194,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         pism_summary = {
             "uoc_foga_score_metric": self.score_metric,
             "uoc_foga_pism_input_dim": int(self.pism_input_dim),
+            "uoc_foga_pism_meta_loss_reduction": self.pism_meta_loss_reduction,
             "uoc_foga_pism_meta_loss_mean": (
                 sum(pism_meta_losses) / len(pism_meta_losses)
                 if pism_meta_losses

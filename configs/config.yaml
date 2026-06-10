@@ -107,8 +107,10 @@ uoc_foga:
   # - delta_consensus：leave-one-out delta 共识方向
   uoc_foga_score_metric: grad_cosine
 
-  uoc_foga_pism_renorm_inputs: false
-  
+  uoc_foga_pism_renorm_inputs: true
+  #sum/mean
+  uoc_foga_pism_meta_loss_reduction: sum
+
   # 最少有效客户端数：正整数
   uoc_foga_min_valid_clients: 2
 
