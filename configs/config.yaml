@@ -6,7 +6,7 @@ federated:
   num_clients: 10
 
   # 服务端通信轮数
-  server_epochs: 50
+  server_epochs: 100
 
   # 每轮每个客户端本地训练 epoch 数
   client_epochs: 1
@@ -27,7 +27,7 @@ aggregation:
   # - uniform
   # - uoc_foga_expert_align
   # - uoc_foga_pism_expert_align
-  expert_agg_method: uoc_foga_pism_expert_align
+  expert_agg_method: sample_weighted
 
 
 # ============================================================
@@ -35,7 +35,7 @@ aggregation:
 # ============================================================
 runtime:
   # 实验总输出目录；data/result/model 三个目录会由它自动派生
-  save_root: ./save/default_exp
+  save_root: ./save/fedavg
 
   # 是否从 checkpoint 断点续训
   resume: false
@@ -160,7 +160,7 @@ data:
   data_path: ./data
 
   # DataLoader 每个 batch 的样本数
-  batch_size: 32
+  batch_size: 64
 
   # 每个客户端至少分到的样本数
   min_datasize: 32

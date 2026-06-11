@@ -817,8 +817,16 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         )
         return None
 
-    def _pism_diag_input_names(self):
-        """返回当前 PISM 实际使用的输入名。"""
+    def _pism_input_names_for_config(self):
+        """返回当前 PISM 配置实际喂入的特征名。"""
+        score_metric = str(getattr(self.args, "uoc_foga_score_metric", "cosine"))
+        if score_metric in {"cosine", "delta_consensus"} and self.pism_input_dim == 3:
+            return [
+                "client_loss",
+                "log1p_expert_usage_ratio",
+                "log1p_delta_norm",
+            ]
+
         base_names = [
             "client_loss",
             "log1p_expert_usage",
@@ -830,6 +838,24 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             f"extra_feature_{idx}"
             for idx in range(len(base_names), self.pism_input_dim)
         ]
+
+    def _pism_diag_input_names(self):
+        """返回当前 PISM 实际使用的输入名。"""
+        return self._pism_input_names_for_config()
+
+    def _select_pism_features_for_config(self, features):
+        """只在 old1 三维 PISM 输入下把 usage 替换成 usage ratio 的 log1p。"""
+        score_metric = str(getattr(self.args, "uoc_foga_score_metric", "cosine"))
+        if score_metric in {"cosine", "delta_consensus"} and self.pism_input_dim == 3:
+            client_loss = features[..., 0]
+            expert_usage_ratio = features[..., 2]
+            log1p_expert_usage_ratio = torch.log1p(expert_usage_ratio.clamp_min(0.0))
+            log1p_delta_norm = features[..., 3]
+            return torch.stack(
+                [client_loss, log1p_expert_usage_ratio, log1p_delta_norm],
+                dim=-1,
+            )
+        return features
 
     def _pism_diag_safe_float(self, value):
         """把 tensor / number 安全转成 Python float，失败时返回 None。"""
@@ -1566,6 +1592,30 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             delta_norm=delta_norms,
             device=device,
         )
+        if score_metric in {"cosine", "delta_consensus"} and self.pism_input_dim == 3:
+            expert_usage = torch.as_tensor(
+                expert_usages,
+                device=device,
+                dtype=torch.float32,
+            ).reshape(-1)
+            sample_count = torch.as_tensor(
+                client_sample_counts_for_valid,
+                device=device,
+                dtype=torch.float32,
+            ).reshape(-1)
+            if expert_usage.numel() != sample_count.numel() or features.size(0) != sample_count.numel():
+                raise ValueError("PISM usage ratio inputs must have the same length")
+            expert_usage_ratio = expert_usage / sample_count.clamp_min(1.0)
+            features = torch.stack(
+                [
+                    features[..., 0],
+                    features[..., 1],
+                    expert_usage_ratio,
+                    features[..., 2],
+                ],
+                dim=-1,
+            )
+            features = self._select_pism_features_for_config(features)
         scores_tensor = torch.tensor(scores, device=device, dtype=torch.float32).detach()
 
         # 归一化前的输入诊断：只读 features，不影响算法。
