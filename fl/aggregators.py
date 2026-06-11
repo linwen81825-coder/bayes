@@ -938,7 +938,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         return self._pism_diag_safe_float(value)
 
     def _pism_diag_score_alignment_loss(self, features, scores, tau=1.0, eps=1e-12):
-        """只用于诊断的 score 对齐损失，不参与 optimizer.step。"""
+        """只用于诊断的 score 对齐损失，不参与 optimizer.step，不改变训练随机性。"""
         if features is None or scores is None:
             return None
         if not torch.is_tensor(features) or not torch.is_tensor(scores):
@@ -946,11 +946,20 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         if features.numel() == 0 or scores.numel() == 0:
             return None
 
-        with torch.no_grad():
-            weights = self.meta_net(features, tau=tau)
-            target = torch.softmax(scores.detach().float() / max(float(tau), eps), dim=0)
-            loss = -(target * torch.log(weights.clamp_min(eps))).sum()
-        return self._pism_diag_safe_float(loss)
+        was_training = self.meta_net.training
+        try:
+            # 诊断 forward 固定用 eval，避免 dropout 消耗随机数状态，保证不影响真正训练逻辑。
+            self.meta_net.eval()
+            with torch.no_grad():
+                weights = self.meta_net(features, tau=tau)
+                target = torch.softmax(
+                    scores.detach().float() / max(float(tau), eps),
+                    dim=0,
+                )
+                loss = -(target * torch.log(weights.clamp_min(eps))).sum()
+            return self._pism_diag_safe_float(loss)
+        finally:
+            self.meta_net.train(was_training)
 
     def _pism_diag_feature_grad_abs_mean(self, features, scores, tau=1.0, eps=1e-12):
         """计算诊断损失对每个输入维度的梯度均值。"""
@@ -1242,6 +1251,15 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 prefix="pism_norm_input_score",
             )
         )
+        if not torch.isfinite(features).all():
+            return metric, self._fallback_expert(
+                aggregated_state,
+                global_state,
+                client_updates,
+                expert_keys,
+                metric,
+                "pism_features_nan",
+            )
         feature_std_for_diag = features.detach().float().std(dim=0, unbiased=False)
         metric["pism_feature_collapse_frac"] = float(
             (feature_std_for_diag <= 1e-8).float().mean().detach().cpu().item()
@@ -1261,15 +1279,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             self._pism_diag_first_layer_weight_norm_by_input()
         )
 
-        if not torch.isfinite(features).all():
-            return metric, self._fallback_expert(
-                aggregated_state,
-                global_state,
-                client_updates,
-                expert_keys,
-                metric,
-                "pism_weights_nan",
-            )
+
 
         # 兼容旧日志字段。
         metric["pism_input_mean"] = [
