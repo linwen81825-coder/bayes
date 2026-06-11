@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 
-def set_seed(seed:int):
+def set_seed(seed:int, deterministic=True, deterministic_warn_only=True):
     """Set Python, NumPy, Torch, and CUDA seeds from one project-level value."""
 
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -15,6 +15,24 @@ def set_seed(seed:int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        # 复现实验用的强确定性设置，可能降低 cuDNN/CUDA 算子速度。
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = False
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("highest")
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(
+                    True,
+                    warn_only=bool(deterministic_warn_only),
+                )
+            except TypeError:
+                torch.use_deterministic_algorithms(True)
 
 
 def resolve_device(device: str) -> str:

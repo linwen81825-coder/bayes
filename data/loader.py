@@ -1,5 +1,7 @@
 import os
+import random
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
@@ -54,12 +56,33 @@ def _use_pin_memory(args) -> bool:
     return bool(getattr(args, "pin_memory", False)) and str(args.device).startswith("cuda")
 
 
-def _build_loader_kwargs(args):
+def seed_worker(worker_id):
+    # DataLoader worker 的 seed 由 generator 派生，并同步给 numpy/random。
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def _build_loader_generator(args, seed_offset=0):
+    # 每类 loader 使用固定偏移，保证同一配置重复运行时 shuffle/增强随机源一致。
+    seed = int(getattr(args, "seed", 0)) + int(seed_offset)
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
+
+
+def _build_loader_kwargs(args, seed_offset=0):
     num_workers = int(getattr(args, "num_workers", 0))
     loader_kwargs = {
         "num_workers": num_workers,
         "pin_memory": _use_pin_memory(args),
     }
+    if bool(getattr(args, "deterministic", True)):
+        loader_kwargs["worker_init_fn"] = seed_worker
+        loader_kwargs["generator"] = _build_loader_generator(
+            args,
+            seed_offset=seed_offset,
+        )
     if num_workers > 0:
         # 仅在 worker 模式下传入这些参数，避免 num_workers=0 时触发 PyTorch 报错。
         loader_kwargs["persistent_workers"] = True
@@ -256,7 +279,7 @@ def build_client_train_loader(args, client_id, meta=None):
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        **_build_loader_kwargs(args),
+        **_build_loader_kwargs(args, seed_offset=1000 + int(client_id)),
     )
 
 
@@ -269,7 +292,7 @@ def build_global_eval_loader(args, split, meta=None):
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        **_build_loader_kwargs(args),
+        **_build_loader_kwargs(args, seed_offset=2000),
     )
 
 

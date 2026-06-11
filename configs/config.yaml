@@ -67,6 +67,15 @@ runtime:
   # 是否缓存每个 client 的 train DataLoader：true / false
   cache_client_train_loaders: false
 
+  # 复现实验用强确定性开关；开启后可能降低训练速度
+  deterministic: true
+
+  # 确定性算子遇到非确定实现时只 warning，不直接中断训练
+  deterministic_warn_only: true
+
+  # CUDA 确定性 GEMM 配置，需要在 CUDA 上下文创建前生效
+  cublas_workspace_config: ":4096:8"
+
 
 # ============================================================
 # UOC-FOGA 配置
