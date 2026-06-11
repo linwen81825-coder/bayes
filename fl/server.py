@@ -30,19 +30,21 @@ class Server:
     def __init__(self, args: SimpleNamespace, logger):
         self.args = args
         self.aggregator = build_aggregator(self.args)
+
         # 基础联邦训练配置。
         self.num_clients = self.args.num_clients
         self.server_epochs = self.args.server_epochs
+
         # 客户端编号从 1 开始，例如 num_clients=4 时为 [1, 2, 3, 4]。
         self.clientsID_list = [i + 1 for i in range(self.num_clients)]
         self.device = self.args.device
         self.logger = logger
+
         # 服务端模型保存路径，例如 ./save/model/server.pth。
         self.model_path = os.path.join(self.args.model_save_path, "server.pth")
         self.resume_enabled = bool(getattr(self.args, "resume", False))
         self.start_round = 0
         self.checkpoint_dir = os.path.join(self.args.model_save_path, "checkpoints")
-
         os.makedirs(self.args.model_save_path, exist_ok=True)
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
@@ -52,6 +54,7 @@ class Server:
             split="global_test",
             meta=self.partition_meta,
         )
+
         self.cache_client_train_loaders = bool(
             getattr(self.args, "cache_client_train_loaders", False)
         )
@@ -66,12 +69,13 @@ class Server:
                 )
                 for client_id in self.clientsID_list
             }
-        self.logger.info(
-            f"--cache_client_train_loaders : {str(self.cache_client_train_loaders).lower()}\n"
-        )
-        self.logger.info(
-            f"--num_cached_client_loaders : {len(self.client_train_loader_cache)}\n"
-        )
+            self.logger.info(
+                f"--cache_client_train_loaders : {str(self.cache_client_train_loaders).lower()}\n"
+            )
+            self.logger.info(
+                f"--num_cached_client_loaders : {len(self.client_train_loader_cache)}\n"
+            )
+
         self.num_experts = self.args.num_experts
         self.criterion = nn.CrossEntropyLoss()
 
@@ -103,14 +107,12 @@ class Server:
         checkpoint_path = self.resolve_resume_checkpoint_path()
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         self.validate_training_checkpoint(checkpoint, checkpoint_path)
-
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.best_test_acc = float(checkpoint["best_test_acc"])
         self.best_test_loss = float(checkpoint["best_test_loss"])
         self.best_round = int(checkpoint["best_round"])
         self.best_state_dict = checkpoint.get("best_state_dict")
         self.start_round = int(checkpoint["round_completed"])
-
         restore_rng_state(checkpoint.get("rng_state"))
 
         aggregator_state = checkpoint.get("aggregator_state", None)
@@ -129,7 +131,6 @@ class Server:
         self.save_server_model()
         if not bool(getattr(self.args, "in_memory_client_updates", True)):
             self.sync_clients_model()
-
         self.logger.info(f"[Resume] Loaded checkpoint from {checkpoint_path}")
         self.logger.info(
             f"[Resume] Completed rounds: {self.start_round}, next round: {self.start_round + 1}"
@@ -139,7 +140,6 @@ class Server:
         """从头训练时清理旧 checkpoint，避免 latest.pth 残留造成误用。"""
         if not os.path.isdir(self.checkpoint_dir):
             return
-
         for filename in os.listdir(self.checkpoint_dir):
             if filename == "latest.pth" or (
                 filename.startswith("round_") and filename.endswith(".pth")
@@ -153,7 +153,6 @@ class Server:
             checkpoint_path = os.path.join(self.checkpoint_dir, "latest.pth")
         else:
             checkpoint_path = resume_checkpoint
-
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(
                 f"resume=true but checkpoint not found: {checkpoint_path}. "
@@ -168,7 +167,6 @@ class Server:
                 f"Training checkpoint must be a dict: {checkpoint_path}, "
                 f"got {type(checkpoint).__name__}."
             )
-
         required_keys = {
             "round_completed",
             "model_state_dict",
@@ -182,7 +180,6 @@ class Server:
             raise ValueError(
                 f"Training checkpoint {checkpoint_path} is missing keys: {sorted(missing_keys)}"
             )
-
         round_completed = int(checkpoint["round_completed"])
         if round_completed < 0:
             raise ValueError(
@@ -222,16 +219,13 @@ class Server:
             "config": dict(vars(self.args)),
             "aggregator_state": aggregator_state,
         }
-
         round_path = os.path.join(
             self.checkpoint_dir,
             f"round_{round_completed:04d}.pth",
         )
         latest_path = os.path.join(self.checkpoint_dir, "latest.pth")
-
         torch.save(checkpoint, round_path)
         torch.save(checkpoint, latest_path)
-
         self.logger.info(f"--checkpoint_saved : {round_path}\n")
         self.logger.info(f"--aggregator_checkpoint_saved : {aggregator_state is not None}\n")
         pism_steps = getattr(self.aggregator, "pism_update_steps", None)
@@ -259,7 +253,6 @@ class Server:
     def _summarize_uoc_foga_stats(self, uoc_foga_stats):
         if not isinstance(uoc_foga_stats, dict):
             return None
-
         expert_metrics = [
             metric
             for layer_stats in uoc_foga_stats.values()
@@ -285,12 +278,15 @@ class Server:
             fallback_reason_counts[str(reason)] = fallback_reason_counts.get(str(reason), 0) + 1
             if fallback_reason is None:
                 updated_experts += 1
+
             score_mean = metric.get("score_mean")
             if score_mean is not None:
                 score_means.append(float(score_mean))
+
             score_metric = metric.get("score_metric")
             if score_metric is not None:
                 score_metrics.append(str(score_metric))
+
             weight_entropy = metric.get("weight_entropy")
             if weight_entropy is not None:
                 weight_entropies.append(float(weight_entropy))
@@ -298,14 +294,18 @@ class Server:
             query_mode = metric.get("query_select_mode")
             if query_mode is not None:
                 query_modes.append(str(query_mode))
+
             if bool(metric.get("fallback_to_random_used", False)):
                 query_fallback_to_random_count += 1
+
             token_ratio_mean = metric.get("expert_token_ratio_mean")
             if token_ratio_mean is not None:
                 query_token_ratio_means.append(float(token_ratio_mean))
+
             query_entropy_mean = metric.get("query_entropy_mean")
             if query_entropy_mean is not None:
                 query_entropy_means.append(float(query_entropy_mean))
+
             pool_after_ratio_filter_size = metric.get("pool_size_after_token_ratio_filter")
             if pool_after_ratio_filter_size is not None:
                 query_pool_after_ratio_filter_sizes.append(float(pool_after_ratio_filter_size))
@@ -326,31 +326,26 @@ class Server:
             "uoc_foga_fallback_reason_counts": fallback_reason_counts,
             "uoc_foga_weight_entropy_mean": (
                 sum(weight_entropies) / len(weight_entropies)
-                if weight_entropies
-                else None
+                if weight_entropies else None
             ),
             "uoc_foga_score_mean_mean": (
                 sum(score_means) / len(score_means)
-                if score_means
-                else None
+                if score_means else None
             ),
             "uoc_foga_score_metric": score_metric,
             "uoc_foga_query_select_mode": query_select_mode,
             "uoc_foga_query_fallback_to_random_count": query_fallback_to_random_count,
             "uoc_foga_query_token_ratio_mean_mean": (
                 sum(query_token_ratio_means) / len(query_token_ratio_means)
-                if query_token_ratio_means
-                else None
+                if query_token_ratio_means else None
             ),
             "uoc_foga_query_entropy_mean_mean": (
                 sum(query_entropy_means) / len(query_entropy_means)
-                if query_entropy_means
-                else None
+                if query_entropy_means else None
             ),
             "uoc_foga_query_pool_after_ratio_filter_mean": (
                 sum(query_pool_after_ratio_filter_sizes) / len(query_pool_after_ratio_filter_sizes)
-                if query_pool_after_ratio_filter_sizes
-                else None
+                if query_pool_after_ratio_filter_sizes else None
             ),
         }
 
@@ -363,7 +358,6 @@ class Server:
 
         total_client_steps = self.server_epochs * len(self.clientsID_list)
         initial_client_steps = self.start_round * len(self.clientsID_list)
-
         progress_bar = tqdm(
             total=total_client_steps,
             initial=initial_client_steps,
@@ -375,12 +369,12 @@ class Server:
             mininterval=0.1,
             bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]",
         )
-
         try:
             # 外层循环是一轮轮服务端通信，也就是联邦学习中的 global round。
             for c_T in range(self.start_round, self.server_epochs):
                 round_start_time = time.perf_counter()
                 self.logger.info(f"============================== T:{c_T+1} start !!! ===============================\n")
+
                 use_in_memory_updates = bool(getattr(self.args, "in_memory_client_updates", True))
                 if use_in_memory_updates:
                     server_state_dict = self.get_cpu_state_dict()
@@ -395,12 +389,12 @@ class Server:
                 round_client_uoc_evidences = []
                 round_client_stats = []
                 client_states = []
+
                 client_train_start_time = time.perf_counter()
                 for id in self.clientsID_list:
                     train_loader = (
                         self.client_train_loader_cache.get(id)
-                        if self.cache_client_train_loaders
-                        else None
+                        if self.cache_client_train_loaders else None
                     )
                     # 每个客户端执行本地训练，并返回本轮信息。
                     client_stats = Client(
@@ -413,6 +407,7 @@ class Server:
                         save_model_to_disk=not use_in_memory_updates,
                         train_loader=train_loader,
                     ).train()
+
                     progress_bar.update(1)
                     progress_bar.set_postfix_str(
                         f"round={c_T + 1}/{self.server_epochs}, client={id}"
@@ -428,6 +423,7 @@ class Server:
 
                     uoc_evidence = client_stats.get("uoc_evidence_by_layer", {})
                     round_client_uoc_evidences.append(uoc_evidence)
+
                     # 传给聚合器的 client stats 保持轻量，不重复保存 model_state_dict 或 evidence 大 tensor。
                     round_client_stats.append({
                         "client_id": id,
@@ -448,6 +444,7 @@ class Server:
                     client_expert_usage = client_stats["expert_activations"].float().cpu()
                     round_client_expert_usages.append(client_stats)
                     round_expert_usage_summary += client_expert_usage
+
                     for layer_id, stats in client_stats.get("expert_stats_by_layer", {}).items():
                         if layer_id not in round_layer_stats:
                             round_layer_stats[layer_id] = {
@@ -457,11 +454,15 @@ class Server:
                             }
                         round_layer_stats[layer_id]["expert_activations"] += stats["expert_activations"].float().cpu()
                         round_layer_stats[layer_id]["overflow_counts"] += stats["overflow_counts"].float().cpu()
-                        round_layer_stats[layer_id]["capacity"] = stats.get("capacity", round_layer_stats[layer_id]["capacity"])
+                        round_layer_stats[layer_id]["capacity"] = stats.get(
+                            "capacity",
+                            round_layer_stats[layer_id]["capacity"],
+                        )
 
                 round_client_train_seconds = time.perf_counter() - client_train_start_time
                 usage_list = [int(v) for v in round_expert_usage_summary.tolist()]
                 self.logger.info(f"--round_expert_usage_summary : {usage_list}\n")
+
                 client_usage_list = [
                     [int(v) for v in stats["expert_activations"].tolist()]
                     for stats in round_client_expert_usages
@@ -506,7 +507,11 @@ class Server:
                     test_loss, test_acc = self.evaluate_global_model(self.global_test_loader)
                     round_eval_seconds = time.perf_counter() - eval_start_time
                     self.logger.info(f"--server_global_test_loss : {test_loss:.4f} --server_global_test_acc : {test_acc:.4f}\n")
-                    is_best = self.update_best_model(test_acc=test_acc, test_loss=test_loss, round_id=round_completed)
+                    is_best = self.update_best_model(
+                        test_acc=test_acc,
+                        test_loss=test_loss,
+                        round_id=round_completed,
+                    )
                     record_server_result(
                         {
                             "phase": "test",
@@ -521,8 +526,9 @@ class Server:
                     )
                 else:
                     self.logger.info(f"--server_global_test_skipped : true --eval_every : {eval_every}\n")
-                    if self.args.expert_agg_method in {"uoc_foga_expert_align", "uoc_foga_pism_expert_align"}:
-                        self.model.to("cpu")
+
+                if self.args.expert_agg_method in {"uoc_foga_expert_align", "uoc_foga_pism_expert_align"}:
+                    self.model.to("cpu")
 
                 save_server_each_round = bool(getattr(self.args, "save_server_model_each_round", False))
                 if (not use_in_memory_updates) or save_server_each_round:
@@ -556,12 +562,11 @@ class Server:
                 self.logger.info(f"--round_total_seconds : {round_total_seconds:.4f}\n")
         finally:
             progress_bar.close()
-
-        self.logger.info(
-            f"--best_global_test_acc : {self.best_test_acc:.4f} "
-            f"--best_global_test_loss : {self.best_test_loss:.4f} "
-            f"--best_round : {self.best_round}\n"
-        )
+            self.logger.info(
+                f"--best_global_test_acc : {self.best_test_acc:.4f} "
+                f"--best_global_test_loss : {self.best_test_loss:.4f} "
+                f"--best_round : {self.best_round}\n"
+            )
 
     def evaluate_global_model(self, data_loader):
         self.model.to(self.device)
@@ -572,7 +577,6 @@ class Server:
             str(self.device).startswith("cuda")
             and bool(getattr(self.args, "pin_memory", False))
         )
-
         inference_context = getattr(torch, "inference_mode", torch.no_grad)
         with inference_context():
             for inputs, labels in data_loader:
@@ -581,11 +585,9 @@ class Server:
                 result = self.model(inputs)
                 outputs = result["logits"]
                 loss = self.criterion(outputs, labels)
-
                 running_loss += loss.item() * inputs.size(0)
                 _, preds = torch.max(outputs, 1)
                 running_corrects += torch.sum(preds == labels.data)
-
         average_loss = running_loss / len(data_loader.dataset)
         accuracy = running_corrects.double() / len(data_loader.dataset)
         self.model.to("cpu")
@@ -633,7 +635,6 @@ class Server:
         # - 非专家参数使用 non_expert_agg_method；
         # - 专家参数使用 expert_agg_method。
         client_sizes = []
-
         if client_states is None:
             loaded_client_states = []
             for id in self.clientsID_list:
@@ -668,11 +669,14 @@ class Server:
         finally:
             if use_uoc_foga and not bool(getattr(self.args, "keep_uoc_model_on_device_until_eval", True)):
                 self.model.to("cpu")
+
         aggregation_metrics = getattr(self.aggregator, "last_aggregation_metrics", {})
         uoc_foga_stats = aggregation_metrics.get("uoc_foga_stats")
         pism_summary = aggregation_metrics.get("uoc_foga_pism_summary", None)
+
         if uoc_foga_stats is not None and bool(getattr(self.args, "uoc_foga_log_detail", False)):
             self.logger.info(f"--uoc_foga_stats : {uoc_foga_stats}\n")
+
         if uoc_foga_stats is not None:
             uoc_summary = self._summarize_uoc_foga_stats(uoc_foga_stats)
             if uoc_summary is not None:
@@ -707,8 +711,36 @@ class Server:
                 "uoc_foga_pism_weight_max_mean",
                 "uoc_foga_pism_used_frac",
                 "uoc_foga_pism_update_steps",
+                # PISM 输入名字。
+                "uoc_foga_pism_input_names",
+                # 三个输入本身有没有区分度。
+                "uoc_foga_pism_raw_input_std_mean",
+                "uoc_foga_pism_norm_input_std_mean",
+                "uoc_foga_pism_feature_collapse_frac_mean",
+                # 三个输入和 FOGA score 的关系。
+                "uoc_foga_pism_raw_input_score_corr_mean",
+                "uoc_foga_pism_norm_input_score_corr_mean",
+                # PISM 输出到底跟哪个输入相关。
+                "uoc_foga_pism_weight_input_corr_mean",
+                "uoc_foga_pism_logit_input_corr_mean",
+                # 删除单个输入后，PISM 权重会不会变化。
+                "uoc_foga_pism_feature_sensitivity_l1_mean",
+                "uoc_foga_pism_feature_sensitivity_kl_mean",
+                "uoc_foga_pism_feature_sensitivity_top_change_frac",
+                # 训练信号是否真的推动了某个输入通道。
+                "uoc_foga_pism_feature_grad_abs_mean",
+                "uoc_foga_pism_first_layer_weight_norm_by_input",
+                "uoc_foga_pism_first_layer_grad_norm_by_input",
+                # PISM 权重是否真的朝 FOGA score 靠拢。
+                "uoc_foga_pism_weight_score_corr_mean",
+                "uoc_foga_pism_top_weight_match_score_frac",
+                "uoc_foga_pism_logits_std_mean",
+                "uoc_foga_pism_diag_alignment_loss_before_step_mean",
+                "uoc_foga_pism_diag_alignment_loss_after_step_mean",
+                "uoc_foga_pism_diag_alignment_loss_delta_mean",
             ):
                 self.logger.info(f"--{key} : {pism_summary.get(key)}\n")
+
         self.logger.info(
             f"--non_expert_agg_method : {self.args.non_expert_agg_method} "
             f"--expert_agg_method : {self.args.expert_agg_method}\n"

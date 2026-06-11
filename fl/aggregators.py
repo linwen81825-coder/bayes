@@ -42,7 +42,6 @@ def build_client_weights(method, client_sample_counts):
     total = sum(weights)
     if total <= 0:
         raise ValueError(f"Aggregation method {method!r} requires positive total weight")
-
     return [weight / total for weight in weights]
 
 
@@ -83,8 +82,8 @@ class SplitParameterAggregator(Aggregator):
 
         non_expert_weights = build_client_weights(self.non_expert_method, client_weights)
         expert_weights = build_client_weights(self.expert_method, client_weights)
-
         aggregated_state = collections.OrderedDict()
+
         for key in client_updates[0].keys():
             first_value = client_updates[0][key].detach().cpu()
             if not torch.is_floating_point(first_value):
@@ -120,7 +119,6 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         num_classes = getattr(self.args, "num_classes", None)
         if num_classes is not None:
             return int(num_classes)
-
         data_name = str(getattr(self.args, "data_name", "")).lower()
         if data_name == "cifar100":
             return 100
@@ -155,7 +153,6 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
                 key: value.detach().cpu().clone()
                 for key, value in client_updates[0].items()
             }
-
         return {
             key: value.detach()
             for key, value in global_model.state_dict().items()
@@ -210,7 +207,6 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             if not valid_values:
                 aggregated_state[key] = global_value.clone()
                 continue
-
             aggregated_state[key] = torch.stack(valid_values, dim=0).mean(dim=0)
 
     def _apply_weighted_delta_for_expert(
@@ -268,7 +264,6 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         client_stats = kwargs.get("client_stats")
         if client_stats is None:
             return None
-
         if isinstance(client_stats, dict):
             client_stats = list(client_stats.values())
 
@@ -351,6 +346,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
     ):
         if named_parameters is None:
             named_parameters = dict(global_model.named_parameters())
+
         param_keys = [
             key
             for key in expert_keys
@@ -564,6 +560,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         device = self._get_model_device(global_model)
         # 每轮只构造一次参数字典，避免每个 expert 重复遍历 named_parameters。
         named_parameters = dict(global_model.named_parameters()) if global_model is not None else None
+
         uoc_foga_stats = {}
         for (layer_id, expert_id), expert_keys in sorted(
             self._expert_key_cache.items(),
@@ -642,7 +639,6 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         if state.get("type") != "uoc_foga_pism_expert_align":
             print("aggregator checkpoint type mismatch")
             return
-
         if "meta_net" in state:
             self.meta_net.load_state_dict(state["meta_net"])
         if "meta_optimizer" in state:
@@ -665,6 +661,50 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "pism_input_mean": None,
             "pism_input_std": None,
             "pism_fallback_reason": None,
+            # 下面都是纯诊断字段，不参与聚合权重计算。
+            "pism_input_names": None,
+            "pism_raw_input_mean": None,
+            "pism_raw_input_std": None,
+            "pism_raw_input_min": None,
+            "pism_raw_input_max": None,
+            "pism_raw_input_p10": None,
+            "pism_raw_input_p50": None,
+            "pism_raw_input_p90": None,
+            "pism_raw_input_zero_frac": None,
+            "pism_raw_input_nonfinite_frac": None,
+            "pism_raw_input_corr_matrix": None,
+            "pism_raw_input_score_corr": None,
+            "pism_norm_input_mean": None,
+            "pism_norm_input_std": None,
+            "pism_norm_input_min": None,
+            "pism_norm_input_max": None,
+            "pism_norm_input_p10": None,
+            "pism_norm_input_p50": None,
+            "pism_norm_input_p90": None,
+            "pism_norm_input_zero_frac": None,
+            "pism_norm_input_nonfinite_frac": None,
+            "pism_norm_input_corr_matrix": None,
+            "pism_norm_input_score_corr": None,
+            "pism_feature_collapse_frac": None,
+            "pism_logits_mean": None,
+            "pism_logits_std": None,
+            "pism_logits_min": None,
+            "pism_logits_max": None,
+            "pism_weight_score_corr": None,
+            "pism_weight_input_corr": None,
+            "pism_logit_input_corr": None,
+            "pism_top_score_client_id": None,
+            "pism_top_weight_client_id": None,
+            "pism_top_weight_matches_top_score": None,
+            "pism_feature_sensitivity_l1": None,
+            "pism_feature_sensitivity_kl": None,
+            "pism_feature_sensitivity_top_change": None,
+            "pism_feature_grad_abs_mean": None,
+            "pism_first_layer_weight_norm_by_input": None,
+            "pism_first_layer_grad_norm_by_input": None,
+            "pism_diag_alignment_loss_before_step": None,
+            "pism_diag_alignment_loss_after_step": None,
+            "pism_diag_alignment_loss_delta": None,
         })
         return metric
 
@@ -690,7 +730,6 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
     def _get_expert_usage_from_stats(self, client_stat, layer_id, expert_id):
         if not isinstance(client_stat, dict):
             return 0.0
-
         expert_index = int(expert_id)
         layer_key = str(layer_id)
         activations_by_layer = client_stat.get("expert_activations_by_layer")
@@ -749,6 +788,272 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             expert_keys,
         )
         return None
+
+    def _pism_diag_input_names(self):
+        """返回当前 PISM 实际使用的输入名。"""
+        base_names = [
+            "client_loss",
+            "log1p_expert_usage",
+            "log1p_delta_norm",
+        ]
+        if self.pism_input_dim <= len(base_names):
+            return base_names[: self.pism_input_dim]
+        return base_names + [
+            f"extra_feature_{idx}"
+            for idx in range(len(base_names), self.pism_input_dim)
+        ]
+
+    def _pism_diag_safe_float(self, value):
+        """把 tensor / number 安全转成 Python float，失败时返回 None。"""
+        if value is None:
+            return None
+        try:
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    return None
+                value = value.detach().float().cpu().item()
+            value = float(value)
+        except (TypeError, ValueError, RuntimeError):
+            return None
+        if value != value:
+            return None
+        return value
+
+    def _pism_diag_safe_pearson_corr(self, x, y, eps=1e-12):
+        """安全计算 Pearson 相关系数。"""
+        if x is None or y is None:
+            return None
+
+        x = torch.as_tensor(x).detach().float().reshape(-1)
+        y = torch.as_tensor(y).detach().float().reshape(-1)
+        if x.numel() != y.numel() or x.numel() < 2:
+            return None
+
+        finite_mask = torch.isfinite(x) & torch.isfinite(y)
+        if int(finite_mask.sum().item()) < 2:
+            return None
+
+        x = x[finite_mask]
+        y = y[finite_mask]
+        x = x - x.mean()
+        y = y - y.mean()
+        denom = x.norm() * y.norm()
+        if (not torch.isfinite(denom)) or denom.item() <= eps:
+            return None
+        corr = (x * y).sum() / denom
+        corr = corr.clamp(min=-1.0, max=1.0)
+        return float(corr.detach().cpu().item())
+
+    def _pism_diag_summarize_feature_matrix(self, features, prefix):
+        """统计 PISM 输入矩阵分布。features shape: [valid_clients, input_dim]。"""
+        summary = {
+            f"{prefix}_names": self._pism_diag_input_names(),
+        }
+        if not torch.is_tensor(features) or features.dim() != 2:
+            return summary
+
+        features = features.detach().float()
+        num_features = int(features.size(1))
+        means = []
+        stds = []
+        mins = []
+        maxs = []
+        p10s = []
+        p50s = []
+        p90s = []
+        zero_fracs = []
+        nonfinite_fracs = []
+
+        for feature_idx in range(num_features):
+            value = features[:, feature_idx]
+            finite_mask = torch.isfinite(value)
+            nonfinite_frac = 1.0 - float(finite_mask.float().mean().detach().cpu().item())
+            nonfinite_fracs.append(nonfinite_frac)
+
+            if int(finite_mask.sum().item()) <= 0:
+                means.append(None)
+                stds.append(None)
+                mins.append(None)
+                maxs.append(None)
+                p10s.append(None)
+                p50s.append(None)
+                p90s.append(None)
+                zero_fracs.append(None)
+                continue
+
+            finite_value = value[finite_mask]
+            means.append(float(finite_value.mean().detach().cpu().item()))
+            stds.append(float(finite_value.std(unbiased=False).detach().cpu().item()))
+            mins.append(float(finite_value.min().detach().cpu().item()))
+            maxs.append(float(finite_value.max().detach().cpu().item()))
+            p10s.append(float(torch.quantile(finite_value, 0.10).detach().cpu().item()))
+            p50s.append(float(torch.quantile(finite_value, 0.50).detach().cpu().item()))
+            p90s.append(float(torch.quantile(finite_value, 0.90).detach().cpu().item()))
+            zero_fracs.append(float((finite_value.abs() <= 1e-12).float().mean().detach().cpu().item()))
+
+        corr_matrix = []
+        for row_idx in range(num_features):
+            row = []
+            for col_idx in range(num_features):
+                row.append(
+                    self._pism_diag_safe_pearson_corr(
+                        features[:, row_idx],
+                        features[:, col_idx],
+                    )
+                )
+            corr_matrix.append(row)
+
+        summary.update({
+            f"{prefix}_mean": means,
+            f"{prefix}_std": stds,
+            f"{prefix}_min": mins,
+            f"{prefix}_max": maxs,
+            f"{prefix}_p10": p10s,
+            f"{prefix}_p50": p50s,
+            f"{prefix}_p90": p90s,
+            f"{prefix}_zero_frac": zero_fracs,
+            f"{prefix}_nonfinite_frac": nonfinite_fracs,
+            f"{prefix}_corr_matrix": corr_matrix,
+        })
+        return summary
+
+    def _pism_diag_summarize_feature_target_corr(self, features, target, prefix):
+        """统计每个 PISM 输入和目标量之间的相关性。"""
+        if not torch.is_tensor(features) or features.dim() != 2:
+            return {f"{prefix}_corr": None}
+        corr_values = []
+        for feature_idx in range(features.size(1)):
+            corr_values.append(
+                self._pism_diag_safe_pearson_corr(features[:, feature_idx], target)
+            )
+        return {f"{prefix}_corr": corr_values}
+
+    def _pism_diag_weight_kl(self, base_weights, alt_weights, eps=1e-12):
+        """计算两个权重分布的 KL，用于输入消融敏感度诊断。"""
+        if base_weights is None or alt_weights is None:
+            return None
+        base_weights = base_weights.detach().float().clamp_min(eps)
+        alt_weights = alt_weights.detach().float().clamp_min(eps)
+        value = (base_weights * (base_weights.log() - alt_weights.log())).sum()
+        return self._pism_diag_safe_float(value)
+
+    def _pism_diag_score_alignment_loss(self, features, scores, tau=1.0, eps=1e-12):
+        """只用于诊断的 score 对齐损失，不参与 optimizer.step。"""
+        if features is None or scores is None:
+            return None
+        if not torch.is_tensor(features) or not torch.is_tensor(scores):
+            return None
+        if features.numel() == 0 or scores.numel() == 0:
+            return None
+
+        with torch.no_grad():
+            weights = self.meta_net(features, tau=tau)
+            target = torch.softmax(scores.detach().float() / max(float(tau), eps), dim=0)
+            loss = -(target * torch.log(weights.clamp_min(eps))).sum()
+        return self._pism_diag_safe_float(loss)
+
+    def _pism_diag_feature_grad_abs_mean(self, features, scores, tau=1.0, eps=1e-12):
+        """计算诊断损失对每个输入维度的梯度均值。"""
+        if features is None or scores is None:
+            return None
+        if not torch.is_tensor(features) or not torch.is_tensor(scores):
+            return None
+        if features.numel() == 0 or scores.numel() == 0:
+            return None
+
+        was_training = self.meta_net.training
+        try:
+            self.meta_net.eval()
+            diag_features = features.detach().clone().requires_grad_(True)
+            weights = self.meta_net(diag_features, tau=tau)
+            target = torch.softmax(scores.detach().float() / max(float(tau), eps), dim=0)
+            loss = -(target * torch.log(weights.clamp_min(eps))).sum()
+            grad = torch.autograd.grad(
+                loss,
+                diag_features,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )[0]
+            if grad is None:
+                return None
+            return [
+                float(value)
+                for value in grad.detach().abs().mean(dim=0).cpu().tolist()
+            ]
+        finally:
+            self.meta_net.train(was_training)
+
+    def _pism_diag_first_layer_weight_norm_by_input(self):
+        """统计 PISM encoder 第一层对每个输入维度的参数范数。"""
+        first_linear = None
+        encoder = getattr(self.meta_net, "encoder", None)
+        if encoder is not None:
+            for module in encoder.modules():
+                if isinstance(module, torch.nn.Linear):
+                    first_linear = module
+                    break
+        if first_linear is None:
+            return None
+        weight = first_linear.weight.detach().float()
+        return [
+            float(value)
+            for value in weight.norm(dim=0).cpu().tolist()
+        ]
+
+    def _pism_diag_first_layer_grad_norm_by_input(self):
+        """统计 PISM encoder 第一层当前梯度在每个输入维度上的范数。"""
+        first_linear = None
+        encoder = getattr(self.meta_net, "encoder", None)
+        if encoder is not None:
+            for module in encoder.modules():
+                if isinstance(module, torch.nn.Linear):
+                    first_linear = module
+                    break
+        if first_linear is None or first_linear.weight.grad is None:
+            return None
+        grad = first_linear.weight.grad.detach().float()
+        return [
+            float(value)
+            for value in grad.norm(dim=0).cpu().tolist()
+        ]
+
+    def _pism_diag_mean_scalar_metric(self, expert_metrics, key):
+        """对 per-expert 标量诊断取均值。"""
+        values = []
+        for metric in expert_metrics:
+            value = self._pism_diag_safe_float(metric.get(key))
+            if value is not None:
+                values.append(value)
+        if not values:
+            return None
+        return sum(values) / len(values)
+
+    def _pism_diag_mean_vector_metric(self, expert_metrics, key):
+        """对 per-expert 向量诊断逐维取均值。"""
+        sums = None
+        counts = None
+        for metric in expert_metrics:
+            value = metric.get(key)
+            if not isinstance(value, (list, tuple)):
+                continue
+            if sums is None:
+                sums = [0.0 for _ in range(len(value))]
+                counts = [0 for _ in range(len(value))]
+            for idx, item in enumerate(value):
+                if idx >= len(sums):
+                    continue
+                item = self._pism_diag_safe_float(item)
+                if item is None:
+                    continue
+                sums[idx] += item
+                counts[idx] += 1
+        if sums is None:
+            return None
+        return [
+            sums[idx] / counts[idx] if counts[idx] > 0 else None
+            for idx in range(len(sums))
+        ]
 
     def _build_pism_record_for_expert(
         self,
@@ -845,6 +1150,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         client_losses = []
         expert_usages = []
         delta_norms = []
+
         for client_idx, client_state in enumerate(client_updates):
             delta_state = extract_expert_delta_state(
                 client_state,
@@ -885,7 +1191,6 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 metric,
                 "too_few_valid_clients",
             )
-
         if valid_clients < self.pism_min_clients:
             return metric, self._fallback_expert(
                 aggregated_state,
@@ -902,8 +1207,60 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             delta_norm=delta_norms,
             device=device,
         )
+        scores_tensor = torch.tensor(scores, device=device, dtype=torch.float32).detach()
+
+        # 归一化前的输入诊断：只读 features，不影响算法。
+        metric["pism_input_names"] = self._pism_diag_input_names()
+        metric.update(
+            self._pism_diag_summarize_feature_matrix(
+                features,
+                prefix="pism_raw_input",
+            )
+        )
+        metric.update(
+            self._pism_diag_summarize_feature_target_corr(
+                features,
+                scores_tensor,
+                prefix="pism_raw_input_score",
+            )
+        )
+
         if self.pism_renorm_inputs:
             features = normalize_pism_inputs(features)
+
+        # 归一化后的输入诊断：这里的 features 才是真正喂给 PISM 的输入。
+        metric.update(
+            self._pism_diag_summarize_feature_matrix(
+                features,
+                prefix="pism_norm_input",
+            )
+        )
+        metric.update(
+            self._pism_diag_summarize_feature_target_corr(
+                features,
+                scores_tensor,
+                prefix="pism_norm_input_score",
+            )
+        )
+        feature_std_for_diag = features.detach().float().std(dim=0, unbiased=False)
+        metric["pism_feature_collapse_frac"] = float(
+            (feature_std_for_diag <= 1e-8).float().mean().detach().cpu().item()
+        )
+        tau_for_diag = max(float(self.pism_tau), 1e-12)
+        metric["pism_diag_alignment_loss_before_step"] = self._pism_diag_score_alignment_loss(
+            features,
+            scores_tensor,
+            tau=tau_for_diag,
+        )
+        metric["pism_feature_grad_abs_mean"] = self._pism_diag_feature_grad_abs_mean(
+            features,
+            scores_tensor,
+            tau=tau_for_diag,
+        )
+        metric["pism_first_layer_weight_norm_by_input"] = (
+            self._pism_diag_first_layer_weight_norm_by_input()
+        )
+
         if not torch.isfinite(features).all():
             return metric, self._fallback_expert(
                 aggregated_state,
@@ -914,13 +1271,15 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "pism_weights_nan",
             )
 
+        # 兼容旧日志字段。
         metric["pism_input_mean"] = [
             float(value) for value in features.detach().mean(dim=0).cpu().tolist()
         ]
         metric["pism_input_std"] = [
-            float(value) for value in features.detach().std(dim=0, unbiased=False).cpu().tolist()
+            float(value)
+            for value in features.detach().std(dim=0, unbiased=False).cpu().tolist()
         ]
-        scores_tensor = torch.tensor(scores, device=device, dtype=torch.float32).detach()
+
         record = {
             "layer_id": str(layer_id),
             "expert_id": str(expert_id),
@@ -943,8 +1302,85 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
     ):
         metric = record["metric"]
         tau = self.pism_tau
+
         with torch.no_grad():
-            weights_tensor = self.meta_net(record["features"], tau=tau)
+            pism_output = self.meta_net(
+                record["features"],
+                tau=tau,
+                return_logits=True,
+            )
+            weights_tensor = pism_output["weights"]
+            logits_tensor = pism_output["logits"]
+
+            metric["pism_logits_mean"] = float(logits_tensor.mean().detach().cpu().item())
+            metric["pism_logits_std"] = float(
+                logits_tensor.std(unbiased=False).detach().cpu().item()
+            )
+            metric["pism_logits_min"] = float(logits_tensor.min().detach().cpu().item())
+            metric["pism_logits_max"] = float(logits_tensor.max().detach().cpu().item())
+
+            metric["pism_weight_score_corr"] = self._pism_diag_safe_pearson_corr(
+                weights_tensor,
+                record["scores"],
+            )
+            metric.update(
+                self._pism_diag_summarize_feature_target_corr(
+                    record["features"],
+                    weights_tensor,
+                    prefix="pism_weight_input",
+                )
+            )
+            metric.update(
+                self._pism_diag_summarize_feature_target_corr(
+                    record["features"],
+                    logits_tensor,
+                    prefix="pism_logit_input",
+                )
+            )
+
+            metric["pism_diag_alignment_loss_after_step"] = self._pism_diag_score_alignment_loss(
+                record["features"],
+                record["scores"],
+                tau=tau,
+            )
+            before_loss = metric.get("pism_diag_alignment_loss_before_step")
+            after_loss = metric.get("pism_diag_alignment_loss_after_step")
+            if before_loss is None or after_loss is None:
+                metric["pism_diag_alignment_loss_delta"] = None
+            else:
+                metric["pism_diag_alignment_loss_delta"] = float(before_loss - after_loss)
+
+            score_top_pos = int(torch.argmax(record["scores"]).detach().cpu().item())
+            weight_top_pos = int(torch.argmax(weights_tensor).detach().cpu().item())
+            metric["pism_top_score_client_id"] = int(record["valid_client_ids"][score_top_pos])
+            metric["pism_top_weight_client_id"] = int(record["valid_client_ids"][weight_top_pos])
+            metric["pism_top_weight_matches_top_score"] = int(score_top_pos == weight_top_pos)
+
+            feature_sensitivity_l1 = []
+            feature_sensitivity_kl = []
+            feature_sensitivity_top_change = []
+            for feature_idx in range(record["features"].size(-1)):
+                ablated_features = record["features"].detach().clone()
+                # renorm 后 0 代表该特征处在本 expert 的均值位置。
+                ablated_features[:, feature_idx] = 0.0
+                ablated_output = self.meta_net(
+                    ablated_features,
+                    tau=tau,
+                    return_logits=True,
+                )
+                ablated_weights = ablated_output["weights"]
+                sensitivity_l1 = (ablated_weights - weights_tensor).abs().mean()
+                feature_sensitivity_l1.append(float(sensitivity_l1.detach().cpu().item()))
+                feature_sensitivity_kl.append(
+                    self._pism_diag_weight_kl(weights_tensor, ablated_weights)
+                )
+                ablated_top_pos = int(torch.argmax(ablated_weights).detach().cpu().item())
+                feature_sensitivity_top_change.append(int(ablated_top_pos != weight_top_pos))
+
+            metric["pism_feature_sensitivity_l1"] = feature_sensitivity_l1
+            metric["pism_feature_sensitivity_kl"] = feature_sensitivity_kl
+            metric["pism_feature_sensitivity_top_change"] = feature_sensitivity_top_change
+
         if not torch.isfinite(weights_tensor).all():
             self._fallback_expert(
                 aggregated_state,
@@ -973,6 +1409,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             client_idx: float(weight.item())
             for client_idx, weight in zip(record["valid_client_ids"], weights_tensor)
         }
+
         if not self._apply_weighted_delta_for_expert(
             aggregated_state,
             global_state,
@@ -1022,6 +1459,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         device = self._get_model_device(global_model)
         # 每轮只构造一次参数字典，供所有 expert 的 query 梯度复用。
         named_parameters = dict(global_model.named_parameters()) if global_model is not None else None
+
         self.meta_net.to(device)
         self._move_meta_optimizer_state_to_device(device)
 
@@ -1065,6 +1503,12 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             else:
                 self.meta_optimizer.zero_grad()
                 meta_loss.backward()
+
+                # 只读当前 backward 后的第一层梯度范数，不 step、不改训练逻辑。
+                first_layer_grad_norm = self._pism_diag_first_layer_grad_norm_by_input()
+                for record in per_expert_records:
+                    record["metric"]["pism_first_layer_grad_norm_by_input"] = first_layer_grad_norm
+
                 self.meta_optimizer.step()
                 self.pism_update_steps += 1
                 meta_loss_value = float(meta_loss.detach().cpu().item())
@@ -1120,7 +1564,6 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
 
             if not pism_used or fallback_reason is not None:
                 continue
-
             updated_experts += 1
             meta_loss_value = expert_metric.get("pism_meta_loss")
             if meta_loss_value is not None:
@@ -1136,28 +1579,101 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         pism_summary = {
             "uoc_foga_pism_meta_loss_mean": (
                 sum(pism_meta_losses) / len(pism_meta_losses)
-                if pism_meta_losses
-                else None
+                if pism_meta_losses else None
             ),
             "uoc_foga_pism_updated_experts": updated_experts,
             "uoc_foga_pism_fallback_experts": fallback_experts,
             "uoc_foga_pism_fallback_reason_counts": dict(pism_fallback_reason_counts),
             "uoc_foga_pism_weight_entropy_mean": (
                 sum(pism_weight_entropies) / len(pism_weight_entropies)
-                if pism_weight_entropies
-                else None
+                if pism_weight_entropies else None
             ),
             "uoc_foga_pism_weight_max_mean": (
                 sum(pism_weight_max_values) / len(pism_weight_max_values)
-                if pism_weight_max_values
-                else None
+                if pism_weight_max_values else None
             ),
             "uoc_foga_pism_used_frac": (
-                updated_experts / total_experts
-                if total_experts > 0
-                else 0.0
+                updated_experts / total_experts if total_experts > 0 else 0.0
             ),
             "uoc_foga_pism_update_steps": int(self.pism_update_steps),
+            # PISM 三输入诊断 summary。
+            "uoc_foga_pism_input_names": self._pism_diag_input_names(),
+            "uoc_foga_pism_raw_input_std_mean": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_raw_input_std",
+            ),
+            "uoc_foga_pism_norm_input_std_mean": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_norm_input_std",
+            ),
+            "uoc_foga_pism_raw_input_score_corr_mean": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_raw_input_score_corr",
+            ),
+            "uoc_foga_pism_norm_input_score_corr_mean": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_norm_input_score_corr",
+            ),
+            "uoc_foga_pism_weight_input_corr_mean": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_weight_input_corr",
+            ),
+            "uoc_foga_pism_logit_input_corr_mean": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_logit_input_corr",
+            ),
+            "uoc_foga_pism_feature_sensitivity_l1_mean": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_feature_sensitivity_l1",
+            ),
+            "uoc_foga_pism_feature_sensitivity_kl_mean": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_feature_sensitivity_kl",
+            ),
+            "uoc_foga_pism_feature_sensitivity_top_change_frac": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_feature_sensitivity_top_change",
+            ),
+            "uoc_foga_pism_feature_grad_abs_mean": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_feature_grad_abs_mean",
+            ),
+            "uoc_foga_pism_first_layer_weight_norm_by_input": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_first_layer_weight_norm_by_input",
+            ),
+            "uoc_foga_pism_first_layer_grad_norm_by_input": self._pism_diag_mean_vector_metric(
+                expert_metrics,
+                "pism_first_layer_grad_norm_by_input",
+            ),
+            "uoc_foga_pism_weight_score_corr_mean": self._pism_diag_mean_scalar_metric(
+                expert_metrics,
+                "pism_weight_score_corr",
+            ),
+            "uoc_foga_pism_top_weight_match_score_frac": self._pism_diag_mean_scalar_metric(
+                expert_metrics,
+                "pism_top_weight_matches_top_score",
+            ),
+            "uoc_foga_pism_feature_collapse_frac_mean": self._pism_diag_mean_scalar_metric(
+                expert_metrics,
+                "pism_feature_collapse_frac",
+            ),
+            "uoc_foga_pism_logits_std_mean": self._pism_diag_mean_scalar_metric(
+                expert_metrics,
+                "pism_logits_std",
+            ),
+            "uoc_foga_pism_diag_alignment_loss_before_step_mean": self._pism_diag_mean_scalar_metric(
+                expert_metrics,
+                "pism_diag_alignment_loss_before_step",
+            ),
+            "uoc_foga_pism_diag_alignment_loss_after_step_mean": self._pism_diag_mean_scalar_metric(
+                expert_metrics,
+                "pism_diag_alignment_loss_after_step",
+            ),
+            "uoc_foga_pism_diag_alignment_loss_delta_mean": self._pism_diag_mean_scalar_metric(
+                expert_metrics,
+                "pism_diag_alignment_loss_delta",
+            ),
         }
         self.last_aggregation_metrics = {
             "uoc_foga_stats": uoc_foga_stats,
@@ -1181,7 +1697,6 @@ def build_aggregator(args):
         )
     if expert_method == "uoc_foga_pism_expert_align":
         return UOCFOGAPISMExpertAlignAggregator(args=args)
-
     return SplitParameterAggregator(
         non_expert_method=args.non_expert_agg_method,
         expert_method=expert_method,
