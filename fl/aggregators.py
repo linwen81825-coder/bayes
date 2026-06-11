@@ -705,6 +705,34 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "pism_diag_alignment_loss_before_step": None,
             "pism_diag_alignment_loss_after_step": None,
             "pism_diag_alignment_loss_delta": None,
+            "pism_score_sample_corr": None,
+            "pism_weight_sample_corr": None,
+            "pism_logit_sample_corr": None,
+            "pism_delta_norm_sample_corr": None,
+            "pism_usage_sample_corr": None,
+            "pism_weight_usage_corr": None,
+            "pism_weight_delta_norm_corr": None,
+            "pism_weight_loss_corr": None,
+            "pism_logit_usage_corr": None,
+            "pism_logit_delta_norm_corr": None,
+            "pism_logit_loss_corr": None,
+            "pism_agg_delta_query_cos": None,
+            "foga_agg_delta_query_cos": None,
+            "uniform_agg_delta_query_cos": None,
+            "pism_vs_uniform_agg_delta_query_cos_gap": None,
+            "pism_vs_foga_agg_delta_query_cos_gap": None,
+            "pism_weight_top1": None,
+            "pism_weight_top2_sum": None,
+            "pism_weight_eff_clients": None,
+            "pism_weight_gini": None,
+            "pism_top_minus_foga_top_score": None,
+            "pism_top_minus_foga_top_usage": None,
+            "pism_top_minus_foga_top_delta_norm": None,
+            "pism_top_minus_foga_top_sample_size": None,
+            "pism_foga_weight_l1": None,
+            "pism_foga_weight_kl": None,
+            "pism_foga_top_match": None,
+            "pism_foga_rank_corr": None,
         })
         return metric
 
@@ -937,6 +965,322 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         value = (base_weights * (base_weights.log() - alt_weights.log())).sum()
         return self._pism_diag_safe_float(value)
 
+    def _pism_diag_tensor_from_values(self, values, device=None):
+        if values is None:
+            return None
+        try:
+            if torch.is_tensor(values):
+                tensor = values.detach()
+                if device is not None:
+                    tensor = tensor.to(device)
+                return tensor.float().reshape(-1)
+            return torch.tensor(values, device=device, dtype=torch.float32).reshape(-1)
+        except (TypeError, ValueError, RuntimeError):
+            return None
+
+    def _pism_diag_normalize_weight_tensor(self, weights, eps=1e-12):
+        weights = self._pism_diag_tensor_from_values(weights)
+        if weights is None or weights.numel() == 0:
+            return None
+        if not torch.isfinite(weights).all():
+            return None
+        if (weights < 0).any():
+            return None
+        total = weights.sum()
+        if (not torch.isfinite(total)) or total.item() <= eps:
+            return None
+        return weights / total
+
+    def _pism_diag_eff_clients(self, weights, eps=1e-12):
+        weights = self._pism_diag_normalize_weight_tensor(weights, eps=eps)
+        if weights is None:
+            return None
+        denom = (weights * weights).sum()
+        if (not torch.isfinite(denom)) or denom.item() <= eps:
+            return None
+        return self._pism_diag_safe_float(1.0 / denom)
+
+    def _pism_diag_weight_gini(self, weights, eps=1e-12):
+        weights = self._pism_diag_normalize_weight_tensor(weights, eps=eps)
+        if weights is None:
+            return None
+        num_weights = int(weights.numel())
+        if num_weights <= 1:
+            return 0.0
+        sorted_weights = torch.sort(weights).values
+        index = torch.arange(
+            1,
+            num_weights + 1,
+            device=sorted_weights.device,
+            dtype=sorted_weights.dtype,
+        )
+        gini = (2.0 * (index * sorted_weights).sum() / num_weights) - (
+            (num_weights + 1.0) / num_weights
+        )
+        return self._pism_diag_safe_float(gini.clamp(min=0.0, max=1.0))
+
+    def _pism_diag_l1(self, weights_a, weights_b):
+        weights_a = self._pism_diag_normalize_weight_tensor(weights_a)
+        weights_b = self._pism_diag_normalize_weight_tensor(weights_b)
+        if weights_a is None or weights_b is None or weights_a.numel() != weights_b.numel():
+            return None
+        return self._pism_diag_safe_float((weights_a - weights_b).abs().sum())
+
+    def _pism_diag_kl(self, weights_a, weights_b, eps=1e-12):
+        weights_a = self._pism_diag_normalize_weight_tensor(weights_a, eps=eps)
+        weights_b = self._pism_diag_normalize_weight_tensor(weights_b, eps=eps)
+        if weights_a is None or weights_b is None or weights_a.numel() != weights_b.numel():
+            return None
+        value = (weights_a * torch.log((weights_a + eps) / (weights_b + eps))).sum()
+        return self._pism_diag_safe_float(value)
+
+    def _pism_diag_rank_corr(self, weights_a, weights_b):
+        weights_a = self._pism_diag_normalize_weight_tensor(weights_a)
+        weights_b = self._pism_diag_normalize_weight_tensor(weights_b)
+        if weights_a is None or weights_b is None or weights_a.numel() != weights_b.numel():
+            return None
+        if weights_a.numel() < 2:
+            return None
+        rank_dtype = torch.float32
+        ranks = torch.arange(weights_a.numel(), device=weights_a.device, dtype=rank_dtype)
+        rank_a = torch.empty(weights_a.numel(), device=weights_a.device, dtype=rank_dtype)
+        rank_b = torch.empty(weights_b.numel(), device=weights_b.device, dtype=rank_dtype)
+        rank_a[torch.argsort(weights_a, descending=True)] = ranks
+        rank_b[torch.argsort(weights_b, descending=True)] = ranks.to(weights_b.device)
+        return self._pism_diag_safe_pearson_corr(rank_a, rank_b)
+
+    def _weighted_average_delta_states(self, delta_states_by_client, weights, device, eps=1e-12):
+        if not isinstance(delta_states_by_client, dict) or not isinstance(weights, dict):
+            return None
+        selected = []
+        for client_idx, weight in weights.items():
+            weight = self._pism_diag_safe_float(weight)
+            if weight is None or weight <= 0.0:
+                continue
+            delta_state = delta_states_by_client.get(client_idx)
+            if not isinstance(delta_state, dict) or not delta_state:
+                return None
+            selected.append((client_idx, weight, delta_state))
+        if not selected:
+            return None
+
+        total_weight = sum(weight for _, weight, _ in selected)
+        if total_weight <= eps:
+            return None
+        keys = sorted(selected[0][2].keys())
+        if not keys:
+            return None
+        expected_keys = set(keys)
+        averaged_state = {}
+        for _, _, delta_state in selected:
+            if set(delta_state.keys()) != expected_keys:
+                return None
+
+        for key in keys:
+            accumulator = None
+            reference_shape = None
+            for _, weight, delta_state in selected:
+                tensor = delta_state.get(key)
+                if tensor is None or not torch.is_tensor(tensor) or not torch.is_floating_point(tensor):
+                    return None
+                tensor = tensor.detach().to(device).float()
+                if reference_shape is None:
+                    reference_shape = tensor.shape
+                    accumulator = torch.zeros_like(tensor)
+                elif tensor.shape != reference_shape:
+                    return None
+                accumulator += (weight / total_weight) * tensor
+            averaged_state[key] = accumulator
+        return averaged_state
+
+    def _pism_diag_delta_query_cos(self, delta_states_by_client, weights, query_grad_state, device):
+        averaged_delta_state = self._weighted_average_delta_states(
+            delta_states_by_client,
+            weights,
+            device,
+        )
+        if averaged_delta_state is None:
+            return None
+        return delta_to_negative_grad_score(
+            averaged_delta_state,
+            query_grad_state,
+            metric="cosine",
+            device=device,
+        )
+
+    def _add_pism_extra_diagnostics(
+        self,
+        metric,
+        record,
+        weights_tensor,
+        logits_tensor,
+        client_updates,
+        global_state,
+        device,
+    ):
+        valid_client_ids = list(record.get("valid_client_ids") or [])
+        num_clients = len(valid_client_ids)
+        if num_clients <= 0:
+            return
+
+        diag_device = weights_tensor.device if torch.is_tensor(weights_tensor) else device
+        pism_weights = self._pism_diag_normalize_weight_tensor(weights_tensor)
+        scores = self._pism_diag_tensor_from_values(record.get("scores"), device=diag_device)
+        logits = self._pism_diag_tensor_from_values(logits_tensor, device=diag_device)
+        sample_counts = self._pism_diag_tensor_from_values(
+            record.get("client_sample_counts"),
+            device=diag_device,
+        )
+        raw_losses = self._pism_diag_tensor_from_values(
+            record.get("raw_client_losses"),
+            device=diag_device,
+        )
+        raw_usages = self._pism_diag_tensor_from_values(
+            record.get("raw_expert_usages"),
+            device=diag_device,
+        )
+        raw_delta_norms = self._pism_diag_tensor_from_values(
+            record.get("raw_delta_norms"),
+            device=diag_device,
+        )
+        if pism_weights is None or scores is None or logits is None:
+            return
+        if (
+            pism_weights.numel() != num_clients
+            or scores.numel() != num_clients
+            or logits.numel() != num_clients
+        ):
+            return
+
+        def same_len(values):
+            if values is None or values.numel() != num_clients:
+                return None
+            return values
+
+        sample_counts = same_len(sample_counts)
+        raw_losses = same_len(raw_losses)
+        raw_usages = same_len(raw_usages)
+        raw_delta_norms = same_len(raw_delta_norms)
+        log_sample_counts = torch.log1p(sample_counts.clamp_min(0.0)) if sample_counts is not None else None
+        log_usages = torch.log1p(raw_usages.clamp_min(0.0)) if raw_usages is not None else None
+        log_delta_norms = torch.log1p(raw_delta_norms.clamp_min(0.0)) if raw_delta_norms is not None else None
+
+        metric["pism_score_sample_corr"] = self._pism_diag_safe_pearson_corr(scores, log_sample_counts)
+        metric["pism_weight_sample_corr"] = self._pism_diag_safe_pearson_corr(pism_weights, log_sample_counts)
+        metric["pism_logit_sample_corr"] = self._pism_diag_safe_pearson_corr(logits, log_sample_counts)
+        metric["pism_delta_norm_sample_corr"] = self._pism_diag_safe_pearson_corr(log_delta_norms, log_sample_counts)
+        metric["pism_usage_sample_corr"] = self._pism_diag_safe_pearson_corr(log_usages, log_sample_counts)
+
+        metric["pism_weight_usage_corr"] = self._pism_diag_safe_pearson_corr(pism_weights, log_usages)
+        metric["pism_weight_delta_norm_corr"] = self._pism_diag_safe_pearson_corr(pism_weights, log_delta_norms)
+        metric["pism_weight_loss_corr"] = self._pism_diag_safe_pearson_corr(pism_weights, raw_losses)
+        metric["pism_logit_usage_corr"] = self._pism_diag_safe_pearson_corr(logits, log_usages)
+        metric["pism_logit_delta_norm_corr"] = self._pism_diag_safe_pearson_corr(logits, log_delta_norms)
+        metric["pism_logit_loss_corr"] = self._pism_diag_safe_pearson_corr(logits, raw_losses)
+
+        metric["pism_weight_top1"] = self._pism_diag_safe_float(pism_weights.max())
+        top2_values = torch.topk(pism_weights, k=min(2, int(pism_weights.numel()))).values
+        metric["pism_weight_top2_sum"] = self._pism_diag_safe_float(top2_values.sum())
+        metric["pism_weight_eff_clients"] = self._pism_diag_eff_clients(pism_weights)
+        metric["pism_weight_gini"] = self._pism_diag_weight_gini(pism_weights)
+
+        client_score_dict = {
+            client_idx: float(score.detach().cpu().item())
+            for client_idx, score in zip(valid_client_ids, scores)
+        }
+        foga_weight_dict, _ = positive_score_to_weights(
+            client_score_dict,
+            mode=getattr(self.args, "uoc_foga_score_mode", "relu"),
+        )
+        foga_weights = None
+        if foga_weight_dict:
+            foga_weights = self._pism_diag_tensor_from_values(
+                [foga_weight_dict.get(client_idx, 0.0) for client_idx in valid_client_ids],
+                device=diag_device,
+            )
+            foga_weights = self._pism_diag_normalize_weight_tensor(foga_weights)
+
+        if torch.isfinite(scores).all() and pism_weights.numel() > 0:
+            foga_top_pos = int(torch.argmax(scores).detach().cpu().item())
+            pism_top_pos = int(torch.argmax(pism_weights).detach().cpu().item())
+            metric["pism_top_minus_foga_top_score"] = self._pism_diag_safe_float(
+                scores[pism_top_pos] - scores[foga_top_pos]
+            )
+
+            def set_top_gap(key, values):
+                if values is None:
+                    return
+                metric[key] = self._pism_diag_safe_float(
+                    values[pism_top_pos] - values[foga_top_pos]
+                )
+
+            set_top_gap("pism_top_minus_foga_top_usage", log_usages)
+            set_top_gap("pism_top_minus_foga_top_delta_norm", log_delta_norms)
+            set_top_gap("pism_top_minus_foga_top_sample_size", log_sample_counts)
+
+        if foga_weights is not None and foga_weights.numel() == num_clients:
+            metric["pism_foga_weight_l1"] = self._pism_diag_l1(pism_weights, foga_weights)
+            metric["pism_foga_weight_kl"] = self._pism_diag_kl(pism_weights, foga_weights)
+            metric["pism_foga_top_match"] = float(
+                int(
+                    torch.argmax(pism_weights).detach().cpu().item()
+                    == torch.argmax(foga_weights).detach().cpu().item()
+                )
+            )
+            metric["pism_foga_rank_corr"] = self._pism_diag_rank_corr(pism_weights, foga_weights)
+
+        delta_states_by_client = {}
+        for client_idx in valid_client_ids:
+            if client_idx < 0 or client_idx >= len(client_updates):
+                continue
+            delta_state = extract_expert_delta_state(
+                client_updates[client_idx],
+                global_state,
+                record["expert_keys"],
+                device=device,
+            )
+            if delta_state:
+                delta_states_by_client[client_idx] = delta_state
+
+        pism_weight_dict = {
+            client_idx: float(weight.detach().cpu().item())
+            for client_idx, weight in zip(valid_client_ids, pism_weights)
+        }
+        uniform_weight_dict = {
+            client_idx: 1.0 / num_clients
+            for client_idx in valid_client_ids
+        }
+        metric["pism_agg_delta_query_cos"] = self._pism_diag_delta_query_cos(
+            delta_states_by_client,
+            pism_weight_dict,
+            record.get("query_grad_state"),
+            device,
+        )
+        if foga_weights is not None and foga_weights.numel() == num_clients:
+            foga_weight_dict_for_diag = {
+                client_idx: float(weight.detach().cpu().item())
+                for client_idx, weight in zip(valid_client_ids, foga_weights)
+            }
+            metric["foga_agg_delta_query_cos"] = self._pism_diag_delta_query_cos(
+                delta_states_by_client,
+                foga_weight_dict_for_diag,
+                record.get("query_grad_state"),
+                device,
+            )
+        metric["uniform_agg_delta_query_cos"] = self._pism_diag_delta_query_cos(
+            delta_states_by_client,
+            uniform_weight_dict,
+            record.get("query_grad_state"),
+            device,
+        )
+        pism_cos = metric.get("pism_agg_delta_query_cos")
+        foga_cos = metric.get("foga_agg_delta_query_cos")
+        uniform_cos = metric.get("uniform_agg_delta_query_cos")
+        if pism_cos is not None and uniform_cos is not None:
+            metric["pism_vs_uniform_agg_delta_query_cos_gap"] = float(pism_cos - uniform_cos)
+        if pism_cos is not None and foga_cos is not None:
+            metric["pism_vs_foga_agg_delta_query_cos_gap"] = float(pism_cos - foga_cos)
+
     def _pism_diag_score_alignment_loss(self, features, scores, tau=1.0, eps=1e-12):
         """只用于诊断的 score 对齐损失，不参与 optimizer.step，不改变训练随机性。"""
         if features is None or scores is None:
@@ -1070,6 +1414,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         global_state,
         client_updates,
         client_stats,
+        client_sample_counts,
         expert_keys,
         layer_id,
         expert_id,
@@ -1159,6 +1504,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         client_losses = []
         expert_usages = []
         delta_norms = []
+        client_sample_counts_for_valid = []
 
         for client_idx, client_state in enumerate(client_updates):
             delta_state = extract_expert_delta_state(
@@ -1185,6 +1531,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 self._get_expert_usage_from_stats(client_stat, layer_id, expert_id)
             )
             delta_norms.append(l2_norm_state(delta_state, device=device))
+            sample_count = self._get_indexed_value(client_sample_counts, client_idx)
+            client_sample_counts_for_valid.append(
+                float(sample_count) if sample_count is not None else float("nan")
+            )
 
         score_summary = summarize_scores(client_scores)
         metric.update(score_summary)
@@ -1297,6 +1647,11 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "valid_client_ids": valid_client_ids,
             "features": features,
             "scores": scores_tensor,
+            "raw_client_losses": client_losses,
+            "raw_expert_usages": expert_usages,
+            "raw_delta_norms": delta_norms,
+            "client_sample_counts": client_sample_counts_for_valid,
+            "query_grad_state": grad_state,
             "metric": metric,
         }
         return metric, record
@@ -1415,6 +1770,15 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             return
 
         weights_tensor = weights_tensor / weight_sum
+        self._add_pism_extra_diagnostics(
+            metric,
+            record,
+            weights_tensor,
+            logits_tensor,
+            client_updates,
+            global_state,
+            device,
+        )
         weights = {
             client_idx: float(weight.item())
             for client_idx, weight in zip(record["valid_client_ids"], weights_tensor)
@@ -1485,6 +1849,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 global_state=global_state,
                 client_updates=client_updates,
                 client_stats=client_stats,
+                client_sample_counts=client_weights,
                 expert_keys=expert_keys,
                 layer_id=str(layer_id),
                 expert_id=str(expert_id),
@@ -1586,6 +1951,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 pism_weight_max_values.append(float(weight_max_value))
 
         fallback_experts = total_experts - updated_experts
+        pism_success_metrics = [
+            expert_metric
+            for expert_metric in expert_metrics
+            if bool(expert_metric.get("pism_used", False))
+            and expert_metric.get("fallback_reason") is None
+            and expert_metric.get("pism_fallback_reason") is None
+        ]
         pism_summary = {
             "uoc_foga_pism_meta_loss_mean": (
                 sum(pism_meta_losses) / len(pism_meta_losses)
@@ -1683,6 +2055,118 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "uoc_foga_pism_diag_alignment_loss_delta_mean": self._pism_diag_mean_scalar_metric(
                 expert_metrics,
                 "pism_diag_alignment_loss_delta",
+            ),
+            "uoc_foga_pism_score_sample_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_score_sample_corr",
+            ),
+            "uoc_foga_pism_weight_sample_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_weight_sample_corr",
+            ),
+            "uoc_foga_pism_logit_sample_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_logit_sample_corr",
+            ),
+            "uoc_foga_pism_delta_norm_sample_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_delta_norm_sample_corr",
+            ),
+            "uoc_foga_pism_usage_sample_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_usage_sample_corr",
+            ),
+            "uoc_foga_pism_weight_usage_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_weight_usage_corr",
+            ),
+            "uoc_foga_pism_weight_delta_norm_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_weight_delta_norm_corr",
+            ),
+            "uoc_foga_pism_weight_loss_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_weight_loss_corr",
+            ),
+            "uoc_foga_pism_logit_usage_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_logit_usage_corr",
+            ),
+            "uoc_foga_pism_logit_delta_norm_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_logit_delta_norm_corr",
+            ),
+            "uoc_foga_pism_logit_loss_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_logit_loss_corr",
+            ),
+            "uoc_foga_pism_agg_delta_query_cos_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_agg_delta_query_cos",
+            ),
+            "uoc_foga_foga_agg_delta_query_cos_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "foga_agg_delta_query_cos",
+            ),
+            "uoc_foga_uniform_agg_delta_query_cos_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "uniform_agg_delta_query_cos",
+            ),
+            "uoc_foga_pism_vs_uniform_agg_delta_query_cos_gap_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_vs_uniform_agg_delta_query_cos_gap",
+            ),
+            "uoc_foga_pism_vs_foga_agg_delta_query_cos_gap_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_vs_foga_agg_delta_query_cos_gap",
+            ),
+            "uoc_foga_pism_weight_top1_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_weight_top1",
+            ),
+            "uoc_foga_pism_weight_top2_sum_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_weight_top2_sum",
+            ),
+            "uoc_foga_pism_weight_eff_clients_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_weight_eff_clients",
+            ),
+            "uoc_foga_pism_weight_gini_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_weight_gini",
+            ),
+            "uoc_foga_pism_top_minus_foga_top_score_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_top_minus_foga_top_score",
+            ),
+            "uoc_foga_pism_top_minus_foga_top_usage_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_top_minus_foga_top_usage",
+            ),
+            "uoc_foga_pism_top_minus_foga_top_delta_norm_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_top_minus_foga_top_delta_norm",
+            ),
+            "uoc_foga_pism_top_minus_foga_top_sample_size_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_top_minus_foga_top_sample_size",
+            ),
+            "uoc_foga_pism_foga_weight_l1_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_foga_weight_l1",
+            ),
+            "uoc_foga_pism_foga_weight_kl_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_foga_weight_kl",
+            ),
+            "uoc_foga_pism_foga_top_match_frac": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_foga_top_match",
+            ),
+            "uoc_foga_pism_foga_rank_corr_mean": self._pism_diag_mean_scalar_metric(
+                pism_success_metrics,
+                "pism_foga_rank_corr",
             ),
         }
         self.last_aggregation_metrics = {

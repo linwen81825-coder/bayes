@@ -738,8 +738,81 @@ class Server:
                 "uoc_foga_pism_diag_alignment_loss_before_step_mean",
                 "uoc_foga_pism_diag_alignment_loss_after_step_mean",
                 "uoc_foga_pism_diag_alignment_loss_delta_mean",
+                "uoc_foga_pism_score_sample_corr_mean",
+                "uoc_foga_pism_weight_sample_corr_mean",
+                "uoc_foga_pism_logit_sample_corr_mean",
+                "uoc_foga_pism_delta_norm_sample_corr_mean",
+                "uoc_foga_pism_usage_sample_corr_mean",
+                "uoc_foga_pism_weight_usage_corr_mean",
+                "uoc_foga_pism_weight_delta_norm_corr_mean",
+                "uoc_foga_pism_weight_loss_corr_mean",
+                "uoc_foga_pism_logit_usage_corr_mean",
+                "uoc_foga_pism_logit_delta_norm_corr_mean",
+                "uoc_foga_pism_logit_loss_corr_mean",
+                "uoc_foga_pism_agg_delta_query_cos_mean",
+                "uoc_foga_foga_agg_delta_query_cos_mean",
+                "uoc_foga_uniform_agg_delta_query_cos_mean",
+                "uoc_foga_pism_vs_uniform_agg_delta_query_cos_gap_mean",
+                "uoc_foga_pism_vs_foga_agg_delta_query_cos_gap_mean",
+                "uoc_foga_pism_weight_top1_mean",
+                "uoc_foga_pism_weight_top2_sum_mean",
+                "uoc_foga_pism_weight_eff_clients_mean",
+                "uoc_foga_pism_weight_gini_mean",
+                "uoc_foga_pism_top_minus_foga_top_score_mean",
+                "uoc_foga_pism_top_minus_foga_top_usage_mean",
+                "uoc_foga_pism_top_minus_foga_top_delta_norm_mean",
+                "uoc_foga_pism_top_minus_foga_top_sample_size_mean",
+                "uoc_foga_pism_foga_weight_l1_mean",
+                "uoc_foga_pism_foga_weight_kl_mean",
+                "uoc_foga_pism_foga_top_match_frac",
+                "uoc_foga_pism_foga_rank_corr_mean",
             ):
                 self.logger.info(f"--{key} : {pism_summary.get(key)}\n")
+
+            pism_get = pism_summary.get
+            self.logger.info(
+                "[UOC-FOGA-PISM-SAMPLE-BIAS] "
+                f"score_sample_corr={pism_get('uoc_foga_pism_score_sample_corr_mean')} "
+                f"weight_sample_corr={pism_get('uoc_foga_pism_weight_sample_corr_mean')} "
+                f"logit_sample_corr={pism_get('uoc_foga_pism_logit_sample_corr_mean')} "
+                f"delta_norm_sample_corr={pism_get('uoc_foga_pism_delta_norm_sample_corr_mean')} "
+                f"usage_sample_corr={pism_get('uoc_foga_pism_usage_sample_corr_mean')}\n"
+            )
+            self.logger.info(
+                "[UOC-FOGA-PISM-INPUT-DOMINANCE] "
+                f"weight_usage_corr={pism_get('uoc_foga_pism_weight_usage_corr_mean')} "
+                f"weight_delta_norm_corr={pism_get('uoc_foga_pism_weight_delta_norm_corr_mean')} "
+                f"weight_loss_corr={pism_get('uoc_foga_pism_weight_loss_corr_mean')} "
+                f"logit_usage_corr={pism_get('uoc_foga_pism_logit_usage_corr_mean')} "
+                f"logit_delta_norm_corr={pism_get('uoc_foga_pism_logit_delta_norm_corr_mean')} "
+                f"logit_loss_corr={pism_get('uoc_foga_pism_logit_loss_corr_mean')}\n"
+            )
+            self.logger.info(
+                "[UOC-FOGA-PISM-AGG-DELTA] "
+                f"pism_cos={pism_get('uoc_foga_pism_agg_delta_query_cos_mean')} "
+                f"foga_cos={pism_get('uoc_foga_foga_agg_delta_query_cos_mean')} "
+                f"uniform_cos={pism_get('uoc_foga_uniform_agg_delta_query_cos_mean')} "
+                f"pism_vs_uniform_gap={pism_get('uoc_foga_pism_vs_uniform_agg_delta_query_cos_gap_mean')} "
+                f"pism_vs_foga_gap={pism_get('uoc_foga_pism_vs_foga_agg_delta_query_cos_gap_mean')}\n"
+            )
+            self.logger.info(
+                "[UOC-FOGA-PISM-WEIGHT-DIST] "
+                f"top1={pism_get('uoc_foga_pism_weight_top1_mean')} "
+                f"top2_sum={pism_get('uoc_foga_pism_weight_top2_sum_mean')} "
+                f"eff_clients={pism_get('uoc_foga_pism_weight_eff_clients_mean')} "
+                f"gini={pism_get('uoc_foga_pism_weight_gini_mean')} "
+                f"foga_l1={pism_get('uoc_foga_pism_foga_weight_l1_mean')} "
+                f"foga_kl={pism_get('uoc_foga_pism_foga_weight_kl_mean')} "
+                f"top_match_frac={pism_get('uoc_foga_pism_foga_top_match_frac')} "
+                f"rank_corr={pism_get('uoc_foga_pism_foga_rank_corr_mean')}\n"
+            )
+            self.logger.info(
+                "[UOC-FOGA-PISM-TOP-GAP] "
+                f"score_gap={pism_get('uoc_foga_pism_top_minus_foga_top_score_mean')} "
+                f"usage_gap={pism_get('uoc_foga_pism_top_minus_foga_top_usage_mean')} "
+                f"delta_norm_gap={pism_get('uoc_foga_pism_top_minus_foga_top_delta_norm_mean')} "
+                f"sample_size_gap={pism_get('uoc_foga_pism_top_minus_foga_top_sample_size_mean')}\n"
+            )
 
         self.logger.info(
             f"--non_expert_agg_method : {self.args.non_expert_agg_method} "
