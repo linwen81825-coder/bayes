@@ -103,8 +103,11 @@ uoc_foga:
   # 强制 expert 的 gate 模式：one（当前仅支持 one）
   uoc_foga_gate_mode: one
 
-  # score 转权重方式：relu（当前仅支持 relu）
+  # score 转权重方式：relu / softmax
   uoc_foga_score_mode: relu
+
+  # FOGA score softmax 温度：仅 softmax 模式使用，越小权重越尖锐
+  uoc_foga_score_tau: 1.0
 
   # score 计算度量：cosine 保持旧行为，dot 使用内积
   uoc_foga_score_metric: cosine

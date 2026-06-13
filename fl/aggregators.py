@@ -508,6 +508,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
         weights, score_fallback = positive_score_to_weights(
             client_scores,
             mode=getattr(self.args, "uoc_foga_score_mode", "relu"),
+            tau=float(getattr(self.args, "uoc_foga_score_tau", 1.0)),
         )
         if score_fallback is not None:
             metric["fallback_reason"] = score_fallback
@@ -1217,6 +1218,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         foga_weight_dict, _ = positive_score_to_weights(
             client_score_dict,
             mode=getattr(self.args, "uoc_foga_score_mode", "relu"),
+            tau=float(getattr(self.args, "uoc_foga_score_tau", 1.0)),
         )
         foga_weights = None
         if foga_weight_dict:
