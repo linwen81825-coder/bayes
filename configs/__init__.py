@@ -11,6 +11,13 @@ import yaml
 _CONFIG_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _CONFIG_DIR.parent
 DEFAULT_CONFIG_PATH = "configs/config.yaml"
+_OPTIONAL_CONFIG_DEFAULTS = {
+    "use_server_meta_validation": False,
+    "server_meta_validation_size": 1000,
+    "server_meta_validation_balanced": True,
+    "server_meta_validation_seed_offset": 9100,
+}
+
 _REQUIRED_CONFIG_KEYS = (
     "data_name",
     "data_path",
@@ -175,6 +182,8 @@ def load_args(config_path: str = DEFAULT_CONFIG_PATH):
 
     raw_config = _load_yaml_mapping(config_path)
     merged_config = _flatten_grouped_config(raw_config)
+    for key, value in _OPTIONAL_CONFIG_DEFAULTS.items():
+        merged_config.setdefault(key, value)
 
     _raise_if_missing_required_keys(merged_config)
     _validate_aggregation_methods(merged_config)

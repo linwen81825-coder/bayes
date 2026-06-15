@@ -13,10 +13,11 @@ class CIFARPartitionBuilder:
     """Build index-based FL partitions for CIFAR10/CIFAR100.
 
     Protocol:
-    1. Official train set is used as the client_train_pool.
-    2. client_train_pool is split across clients with Dirichlet non-IID sampling.
-    3. Official test set is kept as global_test and is never used by clients.
-    4. Only indices and metadata are saved; transforms are applied dynamically in loader.py.
+    1. Optional server_meta_validation is split from the official train set.
+    2. Remaining official train samples become client_train_pool.
+    3. client_train_pool is split across clients with Dirichlet non-IID sampling.
+    4. Official test set is kept as global_test and is never used by clients.
+    5. Only indices and metadata are saved; transforms are applied dynamically in loader.py.
     """
 
     def __init__(self, args: SimpleNamespace):
@@ -26,11 +27,23 @@ class CIFARPartitionBuilder:
         self.data_name = self.args.data_name
         self.data_path = self.args.data_path
         self.alpha = self.args.alpha
+        self.use_server_meta_validation = bool(
+            getattr(self.args, "use_server_meta_validation", False)
+        )
+        self.server_meta_validation_size = int(
+            getattr(self.args, "server_meta_validation_size", 1000)
+        )
+        self.server_meta_validation_balanced = bool(
+            getattr(self.args, "server_meta_validation_balanced", True)
+        )
+        self.server_meta_validation_seed_offset = int(
+            getattr(self.args, "server_meta_validation_seed_offset", 9100)
+        )
 
         # 先加载 torchvision 里的原始训练集和测试集。
         self.train_dataset,self.test_dataset,self.num_classes = self.load_dataset()
 
-        # 官方 train set 全部划给客户端；官方 test set 保持统一，不参与客户端划分。
+        # 官方 train 可选划出 server meta-validation；官方 test 保持统一，不参与客户端划分。
         self.min_datasize = self.args.min_datasize
         self.seed = self.args.seed
         self.rng = np.random.default_rng(self.seed)
@@ -51,12 +64,18 @@ class CIFARPartitionBuilder:
         """Create partition_meta.pt and partition_stats.json."""
 
         self.validate_args()
-        client_train_pool_indices = list(range(len(self.train_dataset)))
+        server_meta_validation_indices = self.build_server_meta_validation_indices()
+        server_meta_validation_index_set = set(server_meta_validation_indices)
+        client_train_pool_indices = [
+            index
+            for index in range(len(self.train_dataset))
+            if index not in server_meta_validation_index_set
+        ]
         client_train_indices = self.dirichlet_client_split(client_train_pool_indices)
 
         meta = {
-            "protocol": "server_global_test_client_train_index_partition",
-            "version": 2,
+            "protocol": "server_meta_validation_client_train_global_test_partition",
+            "version": 3,
             "dataset": self.data_name,
             "data_path": self.data_path,
             "num_classes": self.num_classes,
@@ -64,12 +83,18 @@ class CIFARPartitionBuilder:
             "alpha": self.alpha,
             "seed": self.seed,
             "min_datasize": self.min_datasize,
+            "use_server_meta_validation": self.use_server_meta_validation,
+            "server_meta_validation_size": self.server_meta_validation_size,
+            "server_meta_validation_balanced": self.server_meta_validation_balanced,
+            "server_meta_validation_seed_offset": self.server_meta_validation_seed_offset,
             "index_space": {
+                "server_meta_validation": "official_train",
                 "client_train": "official_train",
                 "client_train_pool": "official_train",
                 "global_test": "official_test",
             },
             "splits": {
+                "server_meta_validation_indices": server_meta_validation_indices,
                 "client_train_pool_indices": client_train_pool_indices,
                 "client_train_indices": {
                     str(client_id): indices
@@ -79,6 +104,7 @@ class CIFARPartitionBuilder:
             },
         }
         stats = self.build_stats(meta)
+        self.log_partition_summary(meta)
         self.save(meta, stats)
         return meta, stats
 
@@ -89,6 +115,48 @@ class CIFARPartitionBuilder:
             raise ValueError("alpha must be positive")
         if self.min_datasize <= 0:
             raise ValueError("min_datasize must be positive")
+        if self.server_meta_validation_size < 0:
+            raise ValueError("server_meta_validation_size must be non-negative")
+        if self.use_server_meta_validation:
+            if self.server_meta_validation_size <= 0:
+                raise ValueError(
+                    "server_meta_validation_size must be positive when use_server_meta_validation=true"
+                )
+            if self.server_meta_validation_size >= len(self.train_dataset):
+                raise ValueError(
+                    "server_meta_validation_size must be smaller than the official train set size"
+                )
+
+    def build_server_meta_validation_indices(self):
+        if not self.use_server_meta_validation:
+            return []
+
+        meta_seed = int(self.seed) + int(self.server_meta_validation_seed_offset)
+        rng = np.random.default_rng(meta_seed)
+        total_size = int(self.server_meta_validation_size)
+
+        if not self.server_meta_validation_balanced:
+            all_indices = np.arange(len(self.train_dataset))
+            return rng.choice(all_indices, size=total_size, replace=False).astype(int).tolist()
+
+        base_per_class = total_size // self.num_classes
+        remainder = total_size % self.num_classes
+        selected_indices = []
+
+        for class_id in range(self.num_classes):
+            take_count = base_per_class + (1 if class_id < remainder else 0)
+            if take_count <= 0:
+                continue
+
+            class_indices = np.where(self.train_targets == class_id)[0]
+            if class_indices.size < take_count:
+                raise ValueError(
+                    f"Not enough samples in class {class_id} to build server_meta_validation set."
+                )
+            shuffled_class_indices = rng.permutation(class_indices)
+            selected_indices.extend(shuffled_class_indices[:take_count].astype(int).tolist())
+
+        return selected_indices
 
     def dirichlet_client_split(self, pool_indices, max_attempts=100):
         """Split client_train_pool into non-IID client train indices."""
@@ -141,8 +209,13 @@ class CIFARPartitionBuilder:
             "alpha": self.alpha,
             "seed": self.seed,
             "min_datasize": self.min_datasize,
+            "use_server_meta_validation": self.use_server_meta_validation,
+            "server_meta_validation_size": self.server_meta_validation_size,
+            "server_meta_validation_balanced": self.server_meta_validation_balanced,
+            "server_meta_validation_seed_offset": self.server_meta_validation_seed_offset,
             "sizes": {
                 "official_train": len(self.train_dataset),
+                "server_meta_validation": len(splits["server_meta_validation_indices"]),
                 "client_train_pool": len(splits["client_train_pool_indices"]),
                 "global_test": len(splits["global_test_indices"]),
                 "client_train": {
@@ -151,6 +224,10 @@ class CIFARPartitionBuilder:
                 },
             },
             "class_counts": {
+                "server_meta_validation": self.class_counts(
+                    splits["server_meta_validation_indices"],
+                    self.train_targets,
+                ),
                 "client_train_pool": self.class_counts(
                     splits["client_train_pool_indices"],
                     self.train_targets,
@@ -166,6 +243,28 @@ class CIFARPartitionBuilder:
     def class_counts(self, indices, targets):
         counts = Counter(int(targets[index]) for index in indices)
         return {str(class_id): int(counts.get(class_id, 0)) for class_id in range(self.num_classes)}
+
+    def log_partition_summary(self, meta):
+        splits = meta["splits"]
+        server_meta_counts = self.class_counts(
+            splits["server_meta_validation_indices"],
+            self.train_targets,
+        )
+        server_meta_counts_for_log = {
+            int(class_id): count
+            for class_id, count in server_meta_counts.items()
+        }
+        print(
+            f"--use_server_meta_validation : {str(self.use_server_meta_validation).lower()}"
+        )
+        print(
+            f"--server_meta_validation_size : {len(splits['server_meta_validation_indices'])}"
+        )
+        print(
+            f"--server_meta_validation_class_counts : {server_meta_counts_for_log}"
+        )
+        print(f"--client_train_pool_size : {len(splits['client_train_pool_indices'])}")
+        print(f"--global_test_size : {len(splits['global_test_indices'])}")
 
     def save(self, meta, stats):
         os.makedirs(self.data_save_path, exist_ok=True)

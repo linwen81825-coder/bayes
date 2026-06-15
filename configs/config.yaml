@@ -118,7 +118,7 @@ uoc_foga:
   # 是否打印完整 per-expert UOC 详情：true / false
   uoc_foga_log_detail: false
 
-  # query 筛选模式：class_balanced_random 保持旧行为，expert_ratio_entropy 启用增强筛选
+  # query 筛选模式：class_balanced_random / expert_ratio_entropy / server_meta_validation
   uoc_foga_query_select_mode: expert_ratio_entropy
 
   # expert token 命中比例阈值；旧模式默认不额外过滤
@@ -173,6 +173,18 @@ data:
 
   # 随机种子，控制数据划分和训练随机性
   seed: 1
+
+  # 是否从 official train 中划出服务端 meta-validation；默认关闭以保持旧实验划分
+  use_server_meta_validation: false
+
+  # 服务端 meta-validation 样本数；CIFAR-10 下默认每类 100 张
+  server_meta_validation_size: 1000
+
+  # 是否按类别均衡抽样 server meta-validation
+  server_meta_validation_balanced: true
+
+  # 服务端 meta-validation 独立随机种子偏移量
+  server_meta_validation_seed_offset: 9100
 
   # 数据划分元信息文件名
   partition_meta_name: partition_meta.pt

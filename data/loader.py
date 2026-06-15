@@ -8,8 +8,8 @@ from torchvision import transforms
 from torchvision.datasets import CIFAR10, CIFAR100
 
 
-EXPECTED_PROTOCOL = "server_global_test_client_train_index_partition"
-EXPECTED_VERSION = 2
+EXPECTED_PROTOCOL = "server_meta_validation_client_train_global_test_partition"
+EXPECTED_VERSION = 3
 
 
 def get_cifar_stats(data_name):
@@ -116,6 +116,30 @@ def validate_partition_meta(meta, args):
         ("alpha", meta.get("alpha"), args.alpha, "float"),
         ("seed", meta.get("seed"), args.seed, "int"),
         ("min_datasize", meta.get("min_datasize"), args.min_datasize, "int"),
+        (
+            "use_server_meta_validation",
+            meta.get("use_server_meta_validation"),
+            getattr(args, "use_server_meta_validation", False),
+            "bool",
+        ),
+        (
+            "server_meta_validation_size",
+            meta.get("server_meta_validation_size"),
+            getattr(args, "server_meta_validation_size", 1000),
+            "int",
+        ),
+        (
+            "server_meta_validation_balanced",
+            meta.get("server_meta_validation_balanced"),
+            getattr(args, "server_meta_validation_balanced", True),
+            "bool",
+        ),
+        (
+            "server_meta_validation_seed_offset",
+            meta.get("server_meta_validation_seed_offset"),
+            getattr(args, "server_meta_validation_seed_offset", 9100),
+            "int",
+        ),
         ("data_path", meta.get("data_path"), args.data_path, "path"),
     ]
 
@@ -135,6 +159,7 @@ def validate_partition_structure(meta, args):
         )
 
     required_split_keys = {
+        "server_meta_validation_indices",
         "client_train_pool_indices",
         "client_train_indices",
         "global_test_indices",
@@ -168,7 +193,11 @@ def validate_partition_structure(meta, args):
                 "Run `python train.py` to rebuild partition_meta.pt and partition_stats.json."
             )
 
-    for key in ["client_train_pool_indices", "global_test_indices"]:
+    for key in [
+        "server_meta_validation_indices",
+        "client_train_pool_indices",
+        "global_test_indices",
+    ]:
         if not isinstance(splits[key], (list, tuple)):
             raise ValueError(
                 f"`splits['{key}']` must be a list or tuple. "
@@ -183,6 +212,8 @@ def metadata_value_matches(actual, expected, value_type):
         return abs(float(actual) - float(expected)) <= 1e-12
     if value_type == "int":
         return int(actual) == int(expected)
+    if value_type == "bool":
+        return isinstance(actual, (bool, np.bool_)) and bool(actual) == bool(expected)
     if value_type == "path":
         return os.path.abspath(os.path.normpath(str(actual))) == os.path.abspath(os.path.normpath(str(expected)))
     return actual == expected
@@ -259,6 +290,11 @@ def build_index_dataset(args, split, client_id=None, meta=None):
             raise ValueError("client_id is required for client_train split")
         indices = splits["client_train_indices"][str(client_id)]
         dataset = build_raw_cifar_dataset(args, train=True, transform=train_transform)
+    elif split == "server_meta_validation":
+        if not bool(getattr(args, "use_server_meta_validation", False)):
+            raise ValueError("server_meta_validation split requires use_server_meta_validation=true")
+        indices = splits["server_meta_validation_indices"]
+        dataset = build_raw_cifar_dataset(args, train=True, transform=eval_transform)
     elif split == "global_test":
         indices = splits["global_test_indices"]
         dataset = build_raw_cifar_dataset(args, train=False, transform=eval_transform)
@@ -293,6 +329,23 @@ def build_global_eval_loader(args, split, meta=None):
         batch_size=args.batch_size,
         shuffle=False,
         **_build_loader_kwargs(args, seed_offset=2000),
+    )
+
+
+def build_server_meta_validation_loader(args, meta=None):
+    if not bool(getattr(args, "use_server_meta_validation", False)):
+        return None
+
+    dataset = build_index_dataset(
+        args=args,
+        split="server_meta_validation",
+        meta=meta,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        **_build_loader_kwargs(args, seed_offset=3000),
     )
 
 

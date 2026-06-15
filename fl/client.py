@@ -126,6 +126,8 @@ class Client:
         )
         if not uoc_foga_collect_before_train:
             return False
+        if getattr(self.args, "uoc_foga_query_select_mode", None) == "server_meta_validation":
+            return False
 
         # UOC evidence 由 expert_agg_method 或手动开关触发，不再依赖 agg_method。
         return (

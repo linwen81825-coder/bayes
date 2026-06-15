@@ -9,6 +9,7 @@ from tqdm import tqdm
 from data.loader import (
     build_client_train_loader,
     build_global_eval_loader,
+    build_server_meta_validation_loader,
     get_client_train_size,
     load_partition_meta,
 )
@@ -54,6 +55,34 @@ class Server:
             split="global_test",
             meta=self.partition_meta,
         )
+        self.server_meta_validation_loader = None
+        if bool(getattr(self.args, "use_server_meta_validation", False)):
+            self.server_meta_validation_loader = build_server_meta_validation_loader(
+                args=self.args,
+                meta=self.partition_meta,
+            )
+        self.args.server_meta_validation_loader_present = (
+            self.server_meta_validation_loader is not None
+        )
+        query_select_mode = getattr(
+            self.args,
+            "uoc_foga_query_select_mode",
+            "class_balanced_random",
+        )
+        if query_select_mode == "server_meta_validation":
+            if not bool(getattr(self.args, "use_server_meta_validation", False)):
+                raise ValueError(
+                    "uoc_foga_query_select_mode=server_meta_validation requires use_server_meta_validation=true"
+                )
+            if self.server_meta_validation_loader is None:
+                raise ValueError(
+                    "uoc_foga_query_select_mode=server_meta_validation requires server_meta_validation_loader is not None"
+                )
+            self.logger.info("UOC-FOGA query source: server_meta_validation\n")
+            self.logger.info(
+                "UOC-FOGA server_meta_validation query samples: "
+                f"{len(self.server_meta_validation_loader.dataset)}\n"
+            )
 
         self.cache_client_train_loaders = bool(
             getattr(self.args, "cache_client_train_loaders", False)
@@ -568,6 +597,106 @@ class Server:
                 f"--best_round : {self.best_round}\n"
             )
 
+    def _collect_server_meta_validation_uoc_evidence(self):
+        if self.server_meta_validation_loader is None:
+            raise ValueError(
+                "uoc_foga_query_select_mode=server_meta_validation requires server_meta_validation_loader is not None"
+            )
+        if not hasattr(self.model, "collect_uoc_evidence"):
+            return {}
+
+        uoc_foga_use_top1 = bool(getattr(self.args, "uoc_foga_use_top1", True))
+        was_training = self.model.training
+        self.model.eval()
+        non_blocking = (
+            str(self.device).startswith("cuda")
+            and bool(getattr(self.args, "pin_memory", False))
+        )
+        inference_context = (
+            torch.inference_mode if hasattr(torch, "inference_mode") else torch.no_grad
+        )
+
+        try:
+            evidence_chunks_by_layer = {}
+            collected_samples = 0
+
+            for images, labels in self.server_meta_validation_loader:
+                images = images.to(self.device, non_blocking=non_blocking)
+                labels = labels.to(self.device, non_blocking=non_blocking)
+                if labels.size(0) == 0:
+                    continue
+
+                with inference_context():
+                    batch_evidence = self.model.collect_uoc_evidence(
+                        images,
+                        max_samples=None,
+                        use_top1=uoc_foga_use_top1,
+                    )
+
+                batch_sample_count = labels.size(0)
+                for layer_id, layer_evidence in batch_evidence.items():
+                    layer_key = str(layer_id)
+                    hidden = layer_evidence["hidden"].detach()
+                    top1_expert_ids = layer_evidence["top1_expert_ids"].detach()
+                    top1_gates = layer_evidence["top1_gates"].detach()
+                    residual = layer_evidence.get("residual")
+                    if residual is not None:
+                        residual = residual[: hidden.size(0)].detach()
+                    entropy = layer_evidence.get("entropy")
+                    if entropy is not None:
+                        entropy = entropy[: hidden.size(0)].detach()
+                    layer_labels = labels[: hidden.size(0)].detach()
+
+                    if layer_key not in evidence_chunks_by_layer:
+                        evidence_chunks_by_layer[layer_key] = {
+                            "hidden": [],
+                            "labels": [],
+                            "top1_expert_ids": [],
+                            "top1_gates": [],
+                        }
+                    if residual is not None and "residual" not in evidence_chunks_by_layer[layer_key]:
+                        evidence_chunks_by_layer[layer_key]["residual"] = []
+                    if entropy is not None and "entropy" not in evidence_chunks_by_layer[layer_key]:
+                        evidence_chunks_by_layer[layer_key]["entropy"] = []
+
+                    evidence_chunks_by_layer[layer_key]["hidden"].append(hidden.cpu())
+                    evidence_chunks_by_layer[layer_key]["labels"].append(layer_labels.cpu())
+                    evidence_chunks_by_layer[layer_key]["top1_expert_ids"].append(
+                        top1_expert_ids.cpu()
+                    )
+                    evidence_chunks_by_layer[layer_key]["top1_gates"].append(
+                        top1_gates.cpu()
+                    )
+                    if residual is not None:
+                        evidence_chunks_by_layer[layer_key]["residual"].append(residual.cpu())
+                    if entropy is not None:
+                        evidence_chunks_by_layer[layer_key]["entropy"].append(entropy.cpu())
+
+                collected_samples += batch_sample_count
+
+            uoc_evidence_by_layer = {
+                layer_id: {
+                    stat_key: torch.cat(chunks, dim=0).detach().cpu()
+                    for stat_key, chunks in layer_chunks.items()
+                }
+                for layer_id, layer_chunks in evidence_chunks_by_layer.items()
+            }
+
+            if uoc_evidence_by_layer:
+                counts_by_layer = {
+                    layer_id: int(layer_evidence["hidden"].size(0))
+                    for layer_id, layer_evidence in uoc_evidence_by_layer.items()
+                }
+                self.logger.info(
+                    f"[UOCEvidence] server_meta_validation counts_by_layer={counts_by_layer}"
+                )
+            self.logger.info(
+                f"UOC-FOGA server_meta_validation query samples: {collected_samples}\n"
+            )
+            return uoc_evidence_by_layer
+        finally:
+            self.model.train(was_training)
+
     def evaluate_global_model(self, data_loader):
         self.model.to(self.device)
         self.model.eval()
@@ -653,16 +782,33 @@ class Server:
             "uoc_foga_expert_align",
             "uoc_foga_pism_expert_align",
         }
+        aggregation_uoc_evidence = uoc_evidence
+        query_select_mode = getattr(
+            self.args,
+            "uoc_foga_query_select_mode",
+            "class_balanced_random",
+        )
         if use_uoc_foga:
             # UOC-FOGA 需要在 global_model 上计算 g_query，让模型先到目标设备。
             self.model.to(self.device)
+            if query_select_mode == "server_meta_validation":
+                if not bool(getattr(self.args, "use_server_meta_validation", False)):
+                    raise ValueError(
+                        "uoc_foga_query_select_mode=server_meta_validation requires use_server_meta_validation=true"
+                    )
+                if self.server_meta_validation_loader is None:
+                    raise ValueError(
+                        "uoc_foga_query_select_mode=server_meta_validation requires server_meta_validation_loader is not None"
+                    )
+                self.logger.info("UOC-FOGA query source: server_meta_validation\n")
+                aggregation_uoc_evidence = self._collect_server_meta_validation_uoc_evidence()
 
         try:
             aggregated_state = self.aggregator.aggregate(
                 client_updates=client_states,
                 client_weights=client_sizes,
                 global_model=self.model,
-                uoc_evidence=uoc_evidence,
+                uoc_evidence=aggregation_uoc_evidence,
                 client_stats=client_stats,
             )
             self.model.load_state_dict(aggregated_state)

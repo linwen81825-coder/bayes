@@ -561,6 +561,8 @@ def build_stratified_query_for_expert(
     min_expert_token_ratio=0.0,
     max_samples_per_client_per_class=0,
     fallback_to_random=True,
+    use_server_meta_validation=False,
+    server_meta_validation_loader_present=False,
 ):
     if not use_top1:
         raise ValueError("build_stratified_query_for_expert currently supports use_top1=True only")
@@ -577,7 +579,18 @@ def build_stratified_query_for_expert(
         "expert_token_ratio_max": None,
         "query_entropy_mean": None,
         "max_samples_per_client_per_class": int(max_samples_per_client_per_class),
+        "query_source": None,
     }
+    if query_select_mode == "server_meta_validation":
+        if not bool(use_server_meta_validation):
+            raise ValueError(
+                "uoc_foga_query_select_mode=server_meta_validation requires use_server_meta_validation=true"
+            )
+        if not bool(server_meta_validation_loader_present):
+            raise ValueError(
+                "uoc_foga_query_select_mode=server_meta_validation requires server_meta_validation_loader is not None"
+            )
+        query_stats["query_source"] = "server_meta_validation"
     if not uoc_evidences:
         return _empty_query_result(num_classes, "no_uoc_evidence", extra_stats=query_stats)
 
@@ -668,7 +681,7 @@ def build_stratified_query_for_expert(
     query_stats["expert_token_ratio_min"] = ratio_min
     query_stats["expert_token_ratio_max"] = ratio_max
 
-    if query_select_mode == "class_balanced_random":
+    if query_select_mode in {"class_balanced_random", "server_meta_validation"}:
         query_stats["pool_size_after_token_ratio_filter"] = None
         query_stats["entropy_missing"] = pool_entropy is None
         result = _build_random_class_balanced_query_from_pool(

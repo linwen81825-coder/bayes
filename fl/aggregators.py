@@ -314,6 +314,12 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             "fallback_to_random": bool(
                 getattr(self.args, "uoc_foga_query_fallback_to_random", True)
             ),
+            "use_server_meta_validation": bool(
+                getattr(self.args, "use_server_meta_validation", False)
+            ),
+            "server_meta_validation_loader_present": bool(
+                getattr(self.args, "server_meta_validation_loader_present", False)
+            ),
         }
 
     def _copy_query_stats_to_metric(self, metric, query):
@@ -330,6 +336,7 @@ class UOCFOGAExpertAlignAggregator(Aggregator):
             "expert_token_ratio_max",
             "query_entropy_mean",
             "max_samples_per_client_per_class",
+            "query_source",
         ):
             if key in query:
                 metric[key] = query[key]
