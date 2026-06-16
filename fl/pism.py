@@ -4,7 +4,7 @@ from torch import nn
 
 class ExpertPISM(nn.Module):
     # PISM/DeepSets 元网络：根据每个 client-expert 的状态特征生成聚合权重。
-    def __init__(self, input_dim: int = 3, hidden_size: int = 64, dropout: float = 0.0, eps: float = 1e-12):
+    def __init__(self, input_dim: int = 2, hidden_size: int = 64, dropout: float = 0.0, eps: float = 1e-12):
         super(ExpertPISM, self).__init__()
         self.input_dim = input_dim
         self.hidden_size = hidden_size
@@ -93,19 +93,19 @@ def normalize_pism_inputs(x, eps=1e-6):
     return (x - mean) / (std + eps)
 
 
-def build_pism_feature_tensor(client_loss, expert_usage, delta_norm, device=None, dtype=None):
-    # s_i,l,e 是后续 meta loss 的监督信号，不是 PISM 输入特征。
+def build_pism_feature_tensor(client_loss, expert_activation_frequency, device=None, dtype=None):
+    # PISM 输入只包含 client loss 和该 layer/expert 的激活频率。
     if dtype is None:
         dtype = torch.float32
 
     client_loss = torch.as_tensor(client_loss, device=device, dtype=dtype).reshape(-1)
-    expert_usage = torch.as_tensor(expert_usage, device=device, dtype=dtype).reshape(-1)
-    delta_norm = torch.as_tensor(delta_norm, device=device, dtype=dtype).reshape(-1)
-    if not (
-        client_loss.numel() == expert_usage.numel() == delta_norm.numel()
-    ):
-        raise ValueError("client_loss, expert_usage, and delta_norm must have the same length")
+    expert_activation_frequency = torch.as_tensor(
+        expert_activation_frequency,
+        device=device,
+        dtype=dtype,
+    ).reshape(-1)
+    if client_loss.numel() != expert_activation_frequency.numel():
+        raise ValueError("client_loss and expert_activation_frequency must have the same length")
 
-    expert_usage = torch.log1p(expert_usage.clamp_min(0))
-    delta_norm = torch.log1p(delta_norm.clamp_min(0))
-    return torch.stack([client_loss, expert_usage, delta_norm], dim=-1)
+    expert_activation_frequency = expert_activation_frequency.clamp_min(0)
+    return torch.stack([client_loss, expert_activation_frequency], dim=-1)

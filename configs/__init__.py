@@ -16,6 +16,13 @@ _OPTIONAL_CONFIG_DEFAULTS = {
     "server_meta_validation_size": 1000,
     "server_meta_validation_balanced": True,
     "server_meta_validation_seed_offset": 9100,
+    "uoc_foga_pism_objective": "meta_validation_loss",
+    "uoc_foga_pism_input_features": [
+        "client_loss",
+        "expert_activation_frequency",
+    ],
+    "uoc_foga_pism_meta_loss_max_batches": 1,
+    "uoc_foga_pism_recompute_weights_after_meta_step": True,
 }
 
 _REQUIRED_CONFIG_KEYS = (

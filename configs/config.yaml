@@ -130,8 +130,22 @@ uoc_foga:
   # 增强筛选后 query 不足时是否回退到旧随机 class-balanced
   uoc_foga_query_fallback_to_random: true
 
-  # PISM 输入维度：当前固定为 3
-  uoc_foga_pism_input_dim: 3
+  # PISM 输入维度：client_loss + expert_activation_frequency
+  uoc_foga_pism_input_dim: 2
+
+  # PISM 训练目标：meta_validation_loss 使用 server meta-validation/query loss
+  uoc_foga_pism_objective: meta_validation_loss
+
+  # PISM 输入特征顺序
+  uoc_foga_pism_input_features:
+    - client_loss
+    - expert_activation_frequency
+
+  # PISM meta loss 使用的最大 batch 数；<=0 表示完整 loader
+  uoc_foga_pism_meta_loss_max_batches: 1
+
+  # meta step 后是否用更新后的 PISM 重新计算真实聚合权重
+  uoc_foga_pism_recompute_weights_after_meta_step: true
 
   # PISM 隐层宽度：正整数
   uoc_foga_pism_hidden_size: 64

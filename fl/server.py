@@ -810,6 +810,7 @@ class Server:
                 global_model=self.model,
                 uoc_evidence=aggregation_uoc_evidence,
                 client_stats=client_stats,
+                server_meta_validation_loader=self.server_meta_validation_loader,
             )
             self.model.load_state_dict(aggregated_state)
         finally:
@@ -849,6 +850,12 @@ class Server:
         if pism_summary is not None:
             # PISM summary 只打印轻量标量/字典，不输出 per-expert 大对象。
             for key in (
+                "uoc_foga_pism_objective",
+                "uoc_foga_pism_meta_validation_loss_before",
+                "uoc_foga_pism_meta_validation_loss_after",
+                "uoc_foga_pism_meta_grad_norm",
+                "uoc_foga_pism_recompute_weights_after_meta_step",
+                "uoc_foga_pism_zero_grad_expert_count",
                 "uoc_foga_pism_meta_loss_mean",
                 "uoc_foga_pism_updated_experts",
                 "uoc_foga_pism_fallback_experts",
@@ -859,11 +866,11 @@ class Server:
                 "uoc_foga_pism_update_steps",
                 # PISM 输入名字。
                 "uoc_foga_pism_input_names",
-                # 三个输入本身有没有区分度。
+                # PISM 输入本身有没有区分度。
                 "uoc_foga_pism_raw_input_std_mean",
                 "uoc_foga_pism_norm_input_std_mean",
                 "uoc_foga_pism_feature_collapse_frac_mean",
-                # 三个输入和 FOGA score 的关系。
+                # PISM 输入和 FOGA score 的关系。
                 "uoc_foga_pism_raw_input_score_corr_mean",
                 "uoc_foga_pism_norm_input_score_corr_mean",
                 # PISM 输出到底跟哪个输入相关。

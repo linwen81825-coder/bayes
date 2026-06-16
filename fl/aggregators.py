@@ -4,6 +4,11 @@ from abc import ABC, abstractmethod
 import torch
 from torch import nn
 
+try:
+    from torch.func import functional_call
+except ImportError:  # pragma: no cover - compatibility for older PyTorch.
+    from torch.nn.utils.stateless import functional_call
+
 from fl.pism import ExpertPISM, build_pism_feature_tensor, normalize_pism_inputs
 from fl.uoc_foga import (
     build_stratified_query_for_expert,
@@ -604,13 +609,37 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             args=args,
             non_expert_method=args.non_expert_agg_method,
         )
-        self.pism_input_dim = int(getattr(args, "uoc_foga_pism_input_dim", 3))
+        self.pism_objective = str(
+            getattr(args, "uoc_foga_pism_objective", "meta_validation_loss")
+        )
+        if self.pism_objective not in {"meta_validation_loss", "score_alignment"}:
+            raise ValueError(f"Unknown uoc_foga_pism_objective: {self.pism_objective!r}")
+        configured_features = getattr(
+            args,
+            "uoc_foga_pism_input_features",
+            ["client_loss", "expert_activation_frequency"],
+        )
+        self.pism_input_features = [str(value) for value in configured_features]
+        expected_features = ["client_loss", "expert_activation_frequency"]
+        if self.pism_input_features != expected_features:
+            raise ValueError(
+                "uoc_foga_pism_input_features must be "
+                f"{expected_features!r}, got {self.pism_input_features!r}"
+            )
+        self.pism_input_dim = len(self.pism_input_features)
         self.pism_hidden_size = int(getattr(args, "uoc_foga_pism_hidden_size", 64))
         self.pism_dropout = float(getattr(args, "uoc_foga_pism_dropout", 0.0))
         self.pism_lr = float(getattr(args, "uoc_foga_pism_lr", 1e-3))
         self.pism_tau = float(getattr(args, "uoc_foga_pism_tau", 1.0))
         self.pism_renorm_inputs = bool(getattr(args, "uoc_foga_pism_renorm_inputs", True))
         self.pism_min_clients = int(getattr(args, "uoc_foga_pism_min_clients", 2))
+        self.pism_meta_loss_max_batches = int(
+            getattr(args, "uoc_foga_pism_meta_loss_max_batches", 1)
+        )
+        self.pism_recompute_weights_after_meta_step = bool(
+            getattr(args, "uoc_foga_pism_recompute_weights_after_meta_step", True)
+        )
+        self.pism_meta_steps = max(1, int(getattr(args, "uoc_foga_pism_meta_steps", 1)))
         self.pism_update_steps = 0
         self.meta_net = ExpertPISM(
             input_dim=self.pism_input_dim,
@@ -636,6 +665,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "tau": self.pism_tau,
                 "renorm_inputs": self.pism_renorm_inputs,
                 "min_clients": self.pism_min_clients,
+                "objective": self.pism_objective,
+                "input_features": list(self.pism_input_features),
+                "meta_loss_max_batches": self.pism_meta_loss_max_batches,
+                "recompute_weights_after_meta_step": self.pism_recompute_weights_after_meta_step,
             },
         }
 
@@ -647,10 +680,18 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         if state.get("type") != "uoc_foga_pism_expert_align":
             print("aggregator checkpoint type mismatch")
             return
+        meta_net_loaded = False
         if "meta_net" in state:
-            self.meta_net.load_state_dict(state["meta_net"])
-        if "meta_optimizer" in state:
-            self.meta_optimizer.load_state_dict(state["meta_optimizer"])
+            try:
+                self.meta_net.load_state_dict(state["meta_net"])
+                meta_net_loaded = True
+            except RuntimeError as exc:
+                print(f"skip incompatible PISM meta_net checkpoint: {exc}")
+        if "meta_optimizer" in state and meta_net_loaded:
+            try:
+                self.meta_optimizer.load_state_dict(state["meta_optimizer"])
+            except ValueError as exc:
+                print(f"skip incompatible PISM optimizer checkpoint: {exc}")
         self.pism_update_steps = int(state.get("pism_update_steps", 0))
 
     def _move_meta_optimizer_state_to_device(self, device):
@@ -664,6 +705,12 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         metric.update({
             "pism_used": False,
             "pism_meta_loss": None,
+            "pism_objective": self.pism_objective,
+            "pism_meta_validation_loss_before": None,
+            "pism_meta_validation_loss_after": None,
+            "pism_meta_grad_norm": None,
+            "pism_meta_weight_grad_norm": None,
+            "pism_zero_usage_total_clients": 0,
             "pism_weight_max": None,
             "pism_weight_entropy": None,
             "pism_input_mean": None,
@@ -763,36 +810,54 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 return float(value[key])
         return None
 
-    def _get_expert_usage_from_stats(self, client_stat, layer_id, expert_id):
+    def _as_float_list(self, value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.dim() == 0:
+                return [float(value.detach().cpu().item())]
+            return [float(item) for item in value.detach().cpu().reshape(-1).tolist()]
+        if isinstance(value, (list, tuple)):
+            return [float(item) for item in value]
+        return None
+
+    def _get_layer_usage_values_from_stats(self, client_stat, layer_id):
         if not isinstance(client_stat, dict):
-            return 0.0
-        expert_index = int(expert_id)
+            return None
         layer_key = str(layer_id)
         activations_by_layer = client_stat.get("expert_activations_by_layer")
         if isinstance(activations_by_layer, dict):
             value = activations_by_layer.get(layer_key, activations_by_layer.get(int(layer_id), None))
-            indexed_value = self._get_indexed_value(value, expert_index)
-            if indexed_value is not None:
-                return indexed_value
+            values = self._as_float_list(value)
+            if values is not None:
+                return values
 
         stats_by_layer = client_stat.get("expert_stats_by_layer")
         if isinstance(stats_by_layer, dict):
             layer_stats = stats_by_layer.get(layer_key, stats_by_layer.get(int(layer_id), None))
             if isinstance(layer_stats, dict):
-                indexed_value = self._get_indexed_value(
-                    layer_stats.get("expert_activations"),
-                    expert_index,
-                )
-                if indexed_value is not None:
-                    return indexed_value
+                values = self._as_float_list(layer_stats.get("expert_activations"))
+                if values is not None:
+                    return values
 
-        indexed_value = self._get_indexed_value(
-            client_stat.get("expert_activations"),
-            expert_index,
-        )
-        if indexed_value is not None:
-            return indexed_value
+        return self._as_float_list(client_stat.get("expert_activations"))
+
+    def _get_expert_usage_from_stats(self, client_stat, layer_id, expert_id):
+        expert_index = int(expert_id)
+        values = self._get_layer_usage_values_from_stats(client_stat, layer_id)
+        if values is not None and expert_index < len(values):
+            return float(values[expert_index])
         return 0.0
+
+    def _get_expert_activation_frequency_from_stats(self, client_stat, layer_id, expert_id, eps=1e-12):
+        expert_index = int(expert_id)
+        values = self._get_layer_usage_values_from_stats(client_stat, layer_id)
+        if values is None or expert_index >= len(values):
+            return 0.0, True
+        total_usage = sum(max(float(value), 0.0) for value in values)
+        if total_usage <= eps:
+            return 0.0, True
+        return max(float(values[expert_index]), 0.0) / total_usage, False
 
     def _get_client_loss_from_stats(self, client_stat):
         if not isinstance(client_stat, dict):
@@ -827,42 +892,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
 
     def _pism_input_names_for_config(self):
         """返回当前 PISM 配置实际喂入的特征名。"""
-        score_metric = str(getattr(self.args, "uoc_foga_score_metric", "cosine"))
-        if score_metric in {"cosine", "delta_consensus"} and self.pism_input_dim == 3:
-            return [
-                "client_loss",
-                "log1p_expert_usage_ratio",
-                "log1p_delta_norm",
-            ]
-
-        base_names = [
-            "client_loss",
-            "log1p_expert_usage",
-            "log1p_delta_norm",
-        ]
-        if self.pism_input_dim <= len(base_names):
-            return base_names[: self.pism_input_dim]
-        return base_names + [
-            f"extra_feature_{idx}"
-            for idx in range(len(base_names), self.pism_input_dim)
-        ]
+        return list(self.pism_input_features)
 
     def _pism_diag_input_names(self):
         """返回当前 PISM 实际使用的输入名。"""
         return self._pism_input_names_for_config()
 
     def _select_pism_features_for_config(self, features):
-        """只在 old1 三维 PISM 输入下把 usage 替换成 usage ratio 的 log1p。"""
-        score_metric = str(getattr(self.args, "uoc_foga_score_metric", "cosine"))
-        if score_metric in {"cosine", "delta_consensus"} and self.pism_input_dim == 3:
-            client_loss = features[..., 0]
-            expert_usage_ratio = features[..., 2]
-            log1p_expert_usage_ratio = torch.log1p(expert_usage_ratio.clamp_min(0.0))
-            log1p_delta_norm = features[..., 3]
-            return torch.stack(
-                [client_loss, log1p_expert_usage_ratio, log1p_delta_norm],
-                dim=-1,
-            )
         return features
 
     def _pism_diag_safe_float(self, value):
@@ -1538,8 +1574,10 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         scores = []
         client_losses = []
         expert_usages = []
+        expert_activation_frequencies = []
         delta_norms = []
         client_sample_counts_for_valid = []
+        zero_usage_total_clients = 0
 
         for client_idx, client_state in enumerate(client_updates):
             delta_state = extract_expert_delta_state(
@@ -1565,6 +1603,14 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             expert_usages.append(
                 self._get_expert_usage_from_stats(client_stat, layer_id, expert_id)
             )
+            expert_frequency, zero_usage_total = self._get_expert_activation_frequency_from_stats(
+                client_stat,
+                layer_id,
+                expert_id,
+            )
+            expert_activation_frequencies.append(expert_frequency)
+            if zero_usage_total:
+                zero_usage_total_clients += 1
             delta_norms.append(l2_norm_state(delta_state, device=device))
             sample_count = self._get_indexed_value(client_sample_counts, client_idx)
             client_sample_counts_for_valid.append(
@@ -1595,36 +1641,13 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 "too_few_pism_clients",
             )
 
+        metric["pism_zero_usage_total_clients"] = int(zero_usage_total_clients)
         features = build_pism_feature_tensor(
             client_loss=client_losses,
-            expert_usage=expert_usages,
-            delta_norm=delta_norms,
+            expert_activation_frequency=expert_activation_frequencies,
             device=device,
         )
-        if score_metric in {"cosine", "delta_consensus"} and self.pism_input_dim == 3:
-            expert_usage = torch.as_tensor(
-                expert_usages,
-                device=device,
-                dtype=torch.float32,
-            ).reshape(-1)
-            sample_count = torch.as_tensor(
-                client_sample_counts_for_valid,
-                device=device,
-                dtype=torch.float32,
-            ).reshape(-1)
-            if expert_usage.numel() != sample_count.numel() or features.size(0) != sample_count.numel():
-                raise ValueError("PISM usage ratio inputs must have the same length")
-            expert_usage_ratio = expert_usage / sample_count.clamp_min(1.0)
-            features = torch.stack(
-                [
-                    features[..., 0],
-                    features[..., 1],
-                    expert_usage_ratio,
-                    features[..., 2],
-                ],
-                dim=-1,
-            )
-            features = self._select_pism_features_for_config(features)
+        features = self._select_pism_features_for_config(features)
         scores_tensor = torch.tensor(scores, device=device, dtype=torch.float32).detach()
 
         # 归一化前的输入诊断：只读 features，不影响算法。
@@ -1678,11 +1701,15 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             features,
             scores_tensor,
             tau=tau_for_diag,
-        )
-        metric["pism_feature_grad_abs_mean"] = self._pism_diag_feature_grad_abs_mean(
-            features,
-            scores_tensor,
-            tau=tau_for_diag,
+        ) if self.pism_objective == "score_alignment" else None
+        metric["pism_feature_grad_abs_mean"] = (
+            self._pism_diag_feature_grad_abs_mean(
+                features,
+                scores_tensor,
+                tau=tau_for_diag,
+            )
+            if self.pism_objective == "score_alignment"
+            else None
         )
         metric["pism_first_layer_weight_norm_by_input"] = (
             self._pism_diag_first_layer_weight_norm_by_input()
@@ -1708,12 +1735,272 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             "scores": scores_tensor,
             "raw_client_losses": client_losses,
             "raw_expert_usages": expert_usages,
+            "raw_expert_activation_frequencies": expert_activation_frequencies,
             "raw_delta_norms": delta_norms,
             "client_sample_counts": client_sample_counts_for_valid,
             "query_grad_state": grad_state,
             "metric": metric,
         }
         return metric, record
+
+    def _collect_pism_meta_batches(self, meta_loader, device):
+        if meta_loader is None:
+            raise ValueError(
+                "uoc_foga_pism_objective=meta_validation_loss requires server_meta_validation_loader or query loader."
+            )
+        max_batches = int(self.pism_meta_loss_max_batches)
+        meta_batches = []
+        non_blocking = (
+            str(device).startswith("cuda")
+            and bool(getattr(self.args, "pin_memory", False))
+        )
+        for batch_idx, (inputs, labels) in enumerate(meta_loader):
+            if max_batches > 0 and batch_idx >= max_batches:
+                break
+            meta_batches.append((
+                inputs.to(device, non_blocking=non_blocking),
+                labels.to(device, non_blocking=non_blocking).long(),
+            ))
+        if not meta_batches:
+            raise ValueError(
+                "uoc_foga_pism_objective=meta_validation_loss requires a non-empty server_meta_validation_loader."
+            )
+        return meta_batches
+
+    def _extract_logits_from_output(self, output):
+        if isinstance(output, dict):
+            if "logits" in output:
+                return output["logits"]
+            if "output" in output:
+                return output["output"]
+            raise KeyError("model output dict must contain `logits` for PISM meta loss")
+        if isinstance(output, (list, tuple)):
+            if not output:
+                raise ValueError("model output tuple/list is empty")
+            return output[0]
+        return output
+
+    def _build_pism_functional_state(
+        self,
+        global_model,
+        global_state,
+        client_updates,
+        records,
+        device,
+        retain_weight_grads=False,
+        store_pre_meta_weights=False,
+    ):
+        state = {}
+        for name, param in global_model.named_parameters():
+            state[name] = param.detach().to(device)
+        for name, buffer in global_model.named_buffers():
+            state[name] = buffer.detach().to(device)
+
+        tau = self.pism_tau
+        for record in records:
+            pism_output = self.meta_net(
+                record["features"],
+                tau=tau,
+                return_logits=True,
+            )
+            weights = pism_output["weights"]
+            logits = pism_output["logits"]
+            if retain_weight_grads and weights.requires_grad:
+                weights.retain_grad()
+                record["_meta_weights_for_grad"] = weights
+            if store_pre_meta_weights:
+                record["pre_meta_weights_tensor"] = weights.detach().cpu()
+                record["pre_meta_logits_tensor"] = logits.detach().cpu()
+
+            for key in record["expert_keys"]:
+                if key not in global_state:
+                    continue
+                global_tensor = global_state[key]
+                if not torch.is_tensor(global_tensor) or not torch.is_floating_point(global_tensor):
+                    continue
+                global_on_device = global_tensor.detach().to(device)
+                delta_sum = torch.zeros_like(global_on_device)
+                has_delta = False
+                for weight_pos, client_idx in enumerate(record["valid_client_ids"]):
+                    if key not in client_updates[client_idx]:
+                        continue
+                    client_tensor = client_updates[client_idx][key]
+                    if not torch.is_tensor(client_tensor) or not torch.is_floating_point(client_tensor):
+                        continue
+                    client_on_device = client_tensor.detach().to(device)
+                    delta_sum = delta_sum + weights[weight_pos].to(global_on_device.dtype) * (
+                        client_on_device - global_on_device
+                    )
+                    has_delta = True
+                if has_delta:
+                    state[key] = global_on_device + delta_sum
+        return state
+
+    def _functional_meta_validation_loss(self, global_model, functional_state, meta_batches):
+        total_loss = None
+        total_samples = 0
+        for inputs, labels in meta_batches:
+            output = functional_call(global_model, functional_state, (inputs,))
+            logits = self._extract_logits_from_output(output)
+            batch_loss = nn.functional.cross_entropy(logits, labels, reduction="sum")
+            total_loss = batch_loss if total_loss is None else total_loss + batch_loss
+            total_samples += int(labels.size(0))
+        if total_loss is None or total_samples <= 0:
+            raise ValueError("PISM meta-validation batches are empty")
+        return total_loss / float(total_samples)
+
+    def _pism_meta_grad_norm(self):
+        total_sq = None
+        for param in self.meta_net.parameters():
+            if param.grad is None:
+                continue
+            grad = param.grad.detach().float()
+            value = (grad * grad).sum()
+            total_sq = value if total_sq is None else total_sq + value
+        if total_sq is None:
+            return 0.0
+        return float(torch.sqrt(total_sq).detach().cpu().item())
+
+    def _mark_pism_record_weight_grad_norms(self, records, eps=1e-12):
+        zero_grad_experts = 0
+        for record in records:
+            weights = record.get("_meta_weights_for_grad")
+            grad = None if weights is None else weights.grad
+            if grad is None:
+                grad_norm = 0.0
+            else:
+                grad_norm = float(torch.linalg.vector_norm(grad.detach().float()).cpu().item())
+            record["metric"]["pism_meta_weight_grad_norm"] = grad_norm
+            if grad_norm <= eps:
+                zero_grad_experts += 1
+            record.pop("_meta_weights_for_grad", None)
+        return zero_grad_experts
+
+    def _evaluate_pism_meta_loss_no_grad(self, global_model, global_state, client_updates, records, meta_batches, device):
+        with torch.no_grad():
+            functional_state = self._build_pism_functional_state(
+                global_model=global_model,
+                global_state=global_state,
+                client_updates=client_updates,
+                records=records,
+                device=device,
+                retain_weight_grads=False,
+                store_pre_meta_weights=False,
+            )
+            loss = self._functional_meta_validation_loss(
+                global_model,
+                functional_state,
+                meta_batches,
+            )
+            return float(loss.detach().cpu().item())
+
+    def _run_pism_meta_validation_update(
+        self,
+        global_model,
+        global_state,
+        client_updates,
+        records,
+        meta_loader,
+        device,
+    ):
+        if global_model is None:
+            raise ValueError(
+                "uoc_foga_pism_objective=meta_validation_loss requires global_model"
+            )
+        meta_batches = self._collect_pism_meta_batches(meta_loader, device)
+        was_training = global_model.training
+        global_model.eval()
+        before_loss_value = None
+        after_loss_value = None
+        meta_grad_norm = 0.0
+        first_layer_grad_norm = None
+        zero_grad_experts = 0
+        try:
+            for meta_step in range(self.pism_meta_steps):
+                self.meta_optimizer.zero_grad()
+                functional_state = self._build_pism_functional_state(
+                    global_model=global_model,
+                    global_state=global_state,
+                    client_updates=client_updates,
+                    records=records,
+                    device=device,
+                    retain_weight_grads=True,
+                    store_pre_meta_weights=(meta_step == 0),
+                )
+                meta_loss = self._functional_meta_validation_loss(
+                    global_model,
+                    functional_state,
+                    meta_batches,
+                )
+                if before_loss_value is None:
+                    before_loss_value = float(meta_loss.detach().cpu().item())
+                if not torch.isfinite(meta_loss):
+                    return {
+                        "failed": True,
+                        "reason": "pism_meta_validation_loss_nan",
+                    }
+                meta_loss.backward()
+                meta_grad_norm = self._pism_meta_grad_norm()
+                first_layer_grad_norm = self._pism_diag_first_layer_grad_norm_by_input()
+                zero_grad_experts = self._mark_pism_record_weight_grad_norms(records)
+                self.meta_optimizer.step()
+                self.pism_update_steps += 1
+                del functional_state, meta_loss
+
+            after_loss_value = self._evaluate_pism_meta_loss_no_grad(
+                global_model=global_model,
+                global_state=global_state,
+                client_updates=client_updates,
+                records=records,
+                meta_batches=meta_batches,
+                device=device,
+            )
+        finally:
+            self.meta_optimizer.zero_grad(set_to_none=True)
+            global_model.train(was_training)
+
+        for record in records:
+            metric = record["metric"]
+            metric["pism_meta_loss"] = before_loss_value
+            metric["pism_meta_validation_loss_before"] = before_loss_value
+            metric["pism_meta_validation_loss_after"] = after_loss_value
+            metric["pism_meta_grad_norm"] = meta_grad_norm
+            metric["pism_first_layer_grad_norm_by_input"] = first_layer_grad_norm
+        return {
+            "failed": False,
+            "meta_loss_value": before_loss_value,
+            "meta_validation_loss_before": before_loss_value,
+            "meta_validation_loss_after": after_loss_value,
+            "meta_grad_norm": meta_grad_norm,
+            "zero_grad_expert_count": zero_grad_experts,
+        }
+
+    def _run_pism_score_alignment_update(self, records):
+        tau = self.pism_tau
+        meta_losses = []
+        for record in records:
+            weights = self.meta_net(record["features"], tau=tau)
+            meta_losses.append(-(weights * record["scores"]).sum())
+        meta_loss = torch.stack(meta_losses).mean()
+        if not torch.isfinite(meta_loss):
+            return {"failed": True, "reason": "pism_meta_loss_nan"}
+
+        self.meta_optimizer.zero_grad()
+        meta_loss.backward()
+        first_layer_grad_norm = self._pism_diag_first_layer_grad_norm_by_input()
+        for record in records:
+            record["metric"]["pism_first_layer_grad_norm_by_input"] = first_layer_grad_norm
+        self.meta_optimizer.step()
+        self.pism_update_steps += 1
+        meta_loss_value = float(meta_loss.detach().cpu().item())
+        return {
+            "failed": False,
+            "meta_loss_value": meta_loss_value,
+            "meta_validation_loss_before": None,
+            "meta_validation_loss_after": None,
+            "meta_grad_norm": self._pism_meta_grad_norm(),
+            "zero_grad_expert_count": None,
+        }
 
     def _apply_pism_weights_for_record(
         self,
@@ -1728,13 +2015,26 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         tau = self.pism_tau
 
         with torch.no_grad():
-            pism_output = self.meta_net(
-                record["features"],
-                tau=tau,
-                return_logits=True,
+            use_pre_meta_weights = (
+                self.pism_objective == "meta_validation_loss"
+                and not self.pism_recompute_weights_after_meta_step
+                and record.get("pre_meta_weights_tensor") is not None
             )
-            weights_tensor = pism_output["weights"]
-            logits_tensor = pism_output["logits"]
+            if use_pre_meta_weights:
+                weights_tensor = record["pre_meta_weights_tensor"].to(device)
+                logits_tensor = record.get("pre_meta_logits_tensor")
+                if logits_tensor is None:
+                    logits_tensor = torch.zeros_like(weights_tensor)
+                else:
+                    logits_tensor = logits_tensor.to(device)
+            else:
+                pism_output = self.meta_net(
+                    record["features"],
+                    tau=tau,
+                    return_logits=True,
+                )
+                weights_tensor = pism_output["weights"]
+                logits_tensor = pism_output["logits"]
 
             metric["pism_logits_mean"] = float(logits_tensor.mean().detach().cpu().item())
             metric["pism_logits_std"] = float(
@@ -1762,10 +2062,14 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 )
             )
 
-            metric["pism_diag_alignment_loss_after_step"] = self._pism_diag_score_alignment_loss(
-                record["features"],
-                record["scores"],
-                tau=tau,
+            metric["pism_diag_alignment_loss_after_step"] = (
+                self._pism_diag_score_alignment_loss(
+                    record["features"],
+                    record["scores"],
+                    tau=tau,
+                )
+                if self.pism_objective == "score_alignment"
+                else None
             )
             before_loss = metric.get("pism_diag_alignment_loss_before_step")
             after_loss = metric.get("pism_diag_alignment_loss_after_step")
@@ -1923,33 +2227,29 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 per_expert_records.append(record)
 
         meta_loss_value = None
-        meta_loss_failed = False
+        meta_result = {
+            "failed": True,
+            "reason": "pism_no_valid_records",
+            "zero_grad_expert_count": None,
+        }
         if per_expert_records:
-            tau = self.pism_tau
-            meta_losses = []
-            for record in per_expert_records:
-                weights = self.meta_net(record["features"], tau=tau)
-                meta_losses.append(-(weights * record["scores"]).sum())
-            meta_loss = torch.stack(meta_losses).mean()
-            if not torch.isfinite(meta_loss):
-                meta_loss_failed = True
-                meta_loss_value = None
+            if self.pism_objective == "meta_validation_loss":
+                meta_result = self._run_pism_meta_validation_update(
+                    global_model=global_model,
+                    global_state=global_state,
+                    client_updates=client_updates,
+                    records=per_expert_records,
+                    meta_loader=kwargs.get("server_meta_validation_loader"),
+                    device=device,
+                )
             else:
-                self.meta_optimizer.zero_grad()
-                meta_loss.backward()
+                meta_result = self._run_pism_score_alignment_update(per_expert_records)
+            meta_loss_value = meta_result.get("meta_loss_value")
 
-                # 只读当前 backward 后的第一层梯度范数，不 step、不改训练逻辑。
-                first_layer_grad_norm = self._pism_diag_first_layer_grad_norm_by_input()
-                for record in per_expert_records:
-                    record["metric"]["pism_first_layer_grad_norm_by_input"] = first_layer_grad_norm
-
-                self.meta_optimizer.step()
-                self.pism_update_steps += 1
-                meta_loss_value = float(meta_loss.detach().cpu().item())
-        else:
-            meta_loss_failed = True
-
-        if meta_loss_failed:
+        if meta_result.get("failed", False):
+            reason = meta_result.get("reason") or (
+                "pism_meta_loss_nan" if per_expert_records else "pism_no_valid_records"
+            )
             for record in per_expert_records:
                 self._fallback_expert(
                     aggregated_state,
@@ -1957,7 +2257,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                     client_updates,
                     record["expert_keys"],
                     record["metric"],
-                    "pism_meta_loss_nan" if per_expert_records else "pism_no_valid_records",
+                    reason,
                 )
         else:
             for record in per_expert_records:
@@ -1980,6 +2280,9 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
         pism_meta_losses = []
         pism_weight_entropies = []
         pism_weight_max_values = []
+        pism_meta_validation_loss_before_values = []
+        pism_meta_validation_loss_after_values = []
+        pism_meta_grad_norm_values = []
         pism_fallback_reason_counts = collections.defaultdict(int)
         updated_experts = 0
 
@@ -2008,6 +2311,15 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             weight_max_value = expert_metric.get("pism_weight_max")
             if weight_max_value is not None:
                 pism_weight_max_values.append(float(weight_max_value))
+            before_value = expert_metric.get("pism_meta_validation_loss_before")
+            if before_value is not None:
+                pism_meta_validation_loss_before_values.append(float(before_value))
+            after_value = expert_metric.get("pism_meta_validation_loss_after")
+            if after_value is not None:
+                pism_meta_validation_loss_after_values.append(float(after_value))
+            grad_norm_value = expert_metric.get("pism_meta_grad_norm")
+            if grad_norm_value is not None:
+                pism_meta_grad_norm_values.append(float(grad_norm_value))
 
         fallback_experts = total_experts - updated_experts
         pism_success_metrics = [
@@ -2018,6 +2330,21 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
             and expert_metric.get("pism_fallback_reason") is None
         ]
         pism_summary = {
+            "uoc_foga_pism_objective": self.pism_objective,
+            "uoc_foga_pism_recompute_weights_after_meta_step": self.pism_recompute_weights_after_meta_step,
+            "uoc_foga_pism_meta_validation_loss_before": (
+                sum(pism_meta_validation_loss_before_values) / len(pism_meta_validation_loss_before_values)
+                if pism_meta_validation_loss_before_values else None
+            ),
+            "uoc_foga_pism_meta_validation_loss_after": (
+                sum(pism_meta_validation_loss_after_values) / len(pism_meta_validation_loss_after_values)
+                if pism_meta_validation_loss_after_values else None
+            ),
+            "uoc_foga_pism_meta_grad_norm": (
+                sum(pism_meta_grad_norm_values) / len(pism_meta_grad_norm_values)
+                if pism_meta_grad_norm_values else None
+            ),
+            "uoc_foga_pism_zero_grad_expert_count": meta_result.get("zero_grad_expert_count"),
             "uoc_foga_pism_meta_loss_mean": (
                 sum(pism_meta_losses) / len(pism_meta_losses)
                 if pism_meta_losses else None
@@ -2037,7 +2364,7 @@ class UOCFOGAPISMExpertAlignAggregator(UOCFOGAExpertAlignAggregator):
                 updated_experts / total_experts if total_experts > 0 else 0.0
             ),
             "uoc_foga_pism_update_steps": int(self.pism_update_steps),
-            # PISM 三输入诊断 summary。
+            # PISM 输入诊断 summary。
             "uoc_foga_pism_input_names": self._pism_diag_input_names(),
             "uoc_foga_pism_raw_input_std_mean": self._pism_diag_mean_vector_metric(
                 expert_metrics,
