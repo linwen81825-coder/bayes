@@ -27,7 +27,7 @@ aggregation:
   # - uniform
   # - uoc_foga_expert_align
   # - uoc_foga_pism_expert_align
-  expert_agg_method: sample_weighted
+  expert_agg_method: uoc_foga_pism_expert_align
 
 
 # ============================================================
@@ -35,7 +35,7 @@ aggregation:
 # ============================================================
 runtime:
   # 实验总输出目录；data/result/model 三个目录会由它自动派生
-  save_root: ./save/fedavg
+  save_root: ./save/val2
 
   # 是否从 checkpoint 断点续训
   resume: false
@@ -82,7 +82,7 @@ runtime:
 # ============================================================
 uoc_foga:
   # 是否采集 UOC evidence：true / false
-  uoc_foga_enabled: true
+  uoc_foga_enabled: false
 
   # 每客户端采样数：正整数
   uoc_foga_samples_per_client: 64
@@ -98,7 +98,7 @@ uoc_foga:
   uoc_foga_use_top1: true
 
   # 本地训练前采集：true / false
-  uoc_foga_collect_before_train: true
+  uoc_foga_collect_before_train: flase
 
   # 强制 expert 的 gate 模式：one（当前仅支持 one）
   uoc_foga_gate_mode: one
@@ -142,7 +142,7 @@ uoc_foga:
     - expert_activation_frequency
 
   # PISM meta loss 使用的最大 batch 数；<=0 表示完整 loader
-  uoc_foga_pism_meta_loss_max_batches: 1
+  uoc_foga_pism_meta_loss_max_batches: 0
 
   # meta step 后是否用更新后的 PISM 重新计算真实聚合权重
   uoc_foga_pism_recompute_weights_after_meta_step: true
@@ -163,7 +163,7 @@ uoc_foga:
   uoc_foga_pism_renorm_inputs: true
 
   # PISM 最少有效客户端数：正整数
-  uoc_foga_pism_min_clients: 1
+  uoc_foga_pism_min_clients: 2
 
 
 # ============================================================
@@ -189,7 +189,7 @@ data:
   seed: 1
 
   # 是否从 official train 中划出服务端 meta-validation；默认关闭以保持旧实验划分
-  use_server_meta_validation: false
+  use_server_meta_validation: true
 
   # 服务端 meta-validation 样本数；CIFAR-10 下默认每类 100 张
   server_meta_validation_size: 1000
@@ -207,10 +207,10 @@ data:
   partition_stats_name: partition_stats.json
 
   # DataLoader worker 数量；GPU 训练建议大于 0
-  num_workers: 4
+  num_workers: 0
 
   # GPU 训练时建议开启 pin_memory，加快 CPU 到 GPU 的数据拷贝
-  pin_memory: true
+  pin_memory: false
 
   # 每个 worker 预取 batch 数；仅 num_workers > 0 时生效
   prefetch_factor: 2
