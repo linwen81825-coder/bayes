@@ -11,7 +11,7 @@ federated:
   # 每轮每个客户端本地训练 epoch 数
   client_epochs: 1
 
-  # 训练设备：auto / cuda / cuda:0 / cpu；auto 表示有 GPU 就用 GPU，否则用 CPU
+  # 训练设备：auto / cuda / cuda:0 / cpu
   device: auto
 
 
@@ -27,6 +27,9 @@ aggregation:
   # - uniform
   # - uoc_foga_expert_align
   # - uoc_foga_pism_expert_align
+  #
+  # 这里跑 9942508 版本的 PISM：
+  # PISM 用 UOC-FOGA score 作为监督信号更新元网络。
   expert_agg_method: sample_weighted
 
 
@@ -34,121 +37,136 @@ aggregation:
 # 输出与断点续训配置
 # ============================================================
 runtime:
-  # 实验总输出目录；data/result/model 三个目录会由它自动派生
-  save_root: ./save/fedavg
+  # 单独保存这组实验，别覆盖 fedavg
+  save_root: ./save/server_query_avg
 
-  # 是否从 checkpoint 断点续训
+  # 第一次跑建议 false
   resume: false
 
-  # 续训 checkpoint：latest 表示读取 save_root/model/checkpoints/latest.pth，也可以写具体路径
   resume_checkpoint: latest
 
-  # 是否使用内存传递客户端模型更新，避免每轮客户端模型写 pth 后再由服务端读取
+  # 使用内存传递客户端更新
   in_memory_client_updates: true
 
-  # 全局测试评估频率：1 表示每轮评估
+  # 每轮评估
   eval_every: 1
 
-  # 训练 checkpoint 保存频率：1 表示每轮保存
+  # 每轮保存 checkpoint
   checkpoint_every: 1
 
-  # 内存更新模式下是否每轮额外保存 server.pth：true / false
   save_server_model_each_round: false
 
-  # UOC 聚合后模型保留在训练设备直到评估结束：true / false
   keep_uoc_model_on_device_until_eval: true
 
-  # client 端是否打印 expert usage 和分层 stats 详情：true / false
   client_log_detail: false
 
-  # client 训练 CSV 记录频率：1 表示每轮记录，0 表示不记录
   record_client_result_every: 1
 
-  # 是否缓存每个 client 的 train DataLoader：true / false
   cache_client_train_loaders: false
 
-  # 复现实验用强确定性开关；开启后可能降低训练速度
   deterministic: true
 
-  # 确定性算子遇到非确定实现时只 warning，不直接中断训练
   deterministic_warn_only: true
 
-  # CUDA 确定性 GEMM 配置，需要在 CUDA 上下文创建前生效
   cublas_workspace_config: ":4096:8"
 
 
 # ============================================================
-# UOC-FOGA 配置
+# UOC-FOGA / PISM 配置
 # ============================================================
 uoc_foga:
-  # 是否采集 UOC evidence：true / false
+  # 仍然启用 UOC-FOGA / PISM-score 聚合逻辑
   uoc_foga_enabled: true
 
-  # 每客户端采样数：正整数
+  # 关键：
+  # 客户端不再从本地 train_loader 采集 evidence query。
+  uoc_foga_collect_before_train: false
+
+  # 关键：
+  # query 来源改成服务端 server_query。
+  # server_query 是从 official test set 中划出来的。
+  uoc_foga_query_select_mode: server_query
+
+  # 从 official test set 中划多少张作为 server query set。
+  # CIFAR10 test set 共 10000 张，这里划 1000 张 query，剩下 9000 张 global_test。
+  uoc_foga_server_query_size: 1000
+
+  # 类别均衡划分，CIFAR10 下就是每类 100 张。
+  uoc_foga_server_query_balanced: true
+
+  # server query set 的独立随机种子偏移。
+  uoc_foga_server_query_seed_offset: 9100
+
+  # ------------------------------------------------------------
+  # UOC-FOGA query / score 参数
+  # ------------------------------------------------------------
+
+  # 这个在 server_query 模式下主要保留兼容；
+  # 客户端已经不采 evidence，但部分旧代码可能还会读取这个字段。
   uoc_foga_samples_per_client: 64
 
-  # 每类 query 样本上限：正整数
-  uoc_foga_query_per_class: 4
+  # 每类 query 样本上限
+  uoc_foga_query_per_class: 10
 
-  # 每 expert 最少 query 样本/类别数：正整数
-  uoc_foga_min_query_samples_per_expert: 8
-  uoc_foga_min_classes_per_expert: 2
+  # 每 expert 最少 query 样本/类别数
+  uoc_foga_min_query_samples_per_expert: 32
+  uoc_foga_min_classes_per_expert: 4
 
-  # 用 top1 路由构造 query：true（当前仅支持 true）
+  # 用 top1 路由构造 query
   uoc_foga_use_top1: true
 
-  # 本地训练前采集：true / false
-  uoc_foga_collect_before_train: true
-
-  # 强制 expert 的 gate 模式：one（当前仅支持 one）
+  # 强制 expert 的 gate 模式
   uoc_foga_gate_mode: one
 
   # score 转权重方式：relu / softmax
   uoc_foga_score_mode: relu
 
-  # FOGA score softmax 温度：仅 softmax 模式使用，越小权重越尖锐
+  # FOGA score softmax 温度
   uoc_foga_score_tau: 1.0
 
-  # score 计算度量：cosine 保持旧行为，dot 使用内积
+  # score 计算度量：cosine / dot
   uoc_foga_score_metric: cosine
 
-  # 最少有效客户端数：正整数
+  # 最少有效客户端数
   uoc_foga_min_valid_clients: 1
 
-  # 是否打印完整 per-expert UOC 详情：true / false
+  # 是否打印完整 per-expert UOC 详情
   uoc_foga_log_detail: false
 
-  # query 筛选模式：class_balanced_random 保持旧行为，expert_ratio_entropy 启用增强筛选
-  uoc_foga_query_select_mode: expert_ratio_entropy
+  # expert token 命中比例阈值
+  uoc_foga_min_expert_token_ratio: 0.01
 
-  # expert token 命中比例阈值；旧模式默认不额外过滤
-  uoc_foga_min_expert_token_ratio: 0.05
+  # 每个 class 内每个 client 最多保留多少样本
+  uoc_foga_max_samples_per_client_per_class: 0
 
-  # 每个 class 内每个 client 最多保留多少样本；0 表示不限制
-  uoc_foga_max_samples_per_client_per_class: 2
-
-  # 增强筛选后 query 不足时是否回退到旧随机 class-balanced
+  # query 不足时是否回退
   uoc_foga_query_fallback_to_random: true
 
-  # PISM 输入维度：当前固定为 3
+  # ------------------------------------------------------------
+  # PISM 元网络配置
+  # ------------------------------------------------------------
+
+  # 9942508 这个版本的 PISM 是 3 维输入：
+  # client_loss + expert_usage + delta_norm
+  # 不要改成 2。
   uoc_foga_pism_input_dim: 3
 
-  # PISM 隐层宽度：正整数
+  # PISM 隐层宽度
   uoc_foga_pism_hidden_size: 64
 
-  # PISM dropout：0.0 - 1.0
+  # PISM dropout
   uoc_foga_pism_dropout: 0.0
 
-  # PISM 学习率：正数
+  # PISM 学习率
   uoc_foga_pism_lr: 0.003
 
-  # PISM softmax 温度：正数
+  # PISM softmax 温度
   uoc_foga_pism_tau: 1.0
 
-  # 是否标准化 PISM 输入：true / false
+  # 是否标准化 PISM 输入
   uoc_foga_pism_renorm_inputs: true
 
-  # PISM 最少有效客户端数：正整数
+  # PISM 最少有效客户端数
   uoc_foga_pism_min_clients: 1
 
 
@@ -156,22 +174,22 @@ uoc_foga:
 # 数据集与数据划分配置
 # ============================================================
 data:
-  # 数据集名称：支持 cifar10 / cifar100
+  # 数据集名称：cifar10 / cifar100
   data_name: cifar10
 
   # 原始 CIFAR 数据保存目录
   data_path: ./data
 
-  # DataLoader 每个 batch 的样本数
+  # DataLoader batch size
   batch_size: 64
 
   # 每个客户端至少分到的样本数
   min_datasize: 32
 
-  # Dirichlet non-IID 划分参数，越小表示客户端数据越偏
+  # Dirichlet non-IID 参数
   alpha: 0.1
 
-  # 随机种子，控制数据划分和训练随机性
+  # 随机种子
   seed: 1
 
   # 数据划分元信息文件名
@@ -180,22 +198,21 @@ data:
   # 数据划分类别统计文件名
   partition_stats_name: partition_stats.json
 
-  # DataLoader worker 数量；GPU 训练建议大于 0
-  num_workers: 4
+  # 先设成 0，避免之前那个 pin_memory thread 报错
+  num_workers: 0
 
-  # GPU 训练时建议开启 pin_memory，加快 CPU 到 GPU 的数据拷贝
-  pin_memory: true
+  # 先关闭 pin_memory
+  pin_memory: false
 
-  # 每个 worker 预取 batch 数；仅 num_workers > 0 时生效
+  # num_workers=0 时基本不会用到，保留即可
   prefetch_factor: 2
-
 
 
 # ============================================================
 # 模型主干配置
 # ============================================================
 model:
-  # 模型类型，目前使用 hybrid_switch_transformer
+  # 模型类型
   model_type: hybrid_switch_transformer
 
   # 图像 backbone：cnn_stem / resnet18
@@ -207,10 +224,10 @@ model:
   # 客户端本地训练学习率
   learning_rate: 0.0005
 
-  # 梯度裁剪阈值：1.0 保持旧行为，0 或负数表示跳过
+  # 梯度裁剪阈值
   grad_clip_norm: 1.0
 
-  # optimizer.zero_grad 是否使用 set_to_none=True：true / false
+  # optimizer.zero_grad 是否使用 set_to_none=True
   optimizer_zero_grad_set_to_none: true
 
   # Transformer token embedding 维度
@@ -228,7 +245,7 @@ model:
   # 兼容旧配置字段；为空时使用 depth
   num_layers: null
 
-  # CNN stem 输出通道数，仅 cnn_stem backbone 使用
+  # CNN stem 输出通道数
   stem_channels: 64
 
   # token pooling 后的空间网格大小

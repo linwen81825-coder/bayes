@@ -668,9 +668,22 @@ def build_stratified_query_for_expert(
     query_stats["expert_token_ratio_min"] = ratio_min
     query_stats["expert_token_ratio_max"] = ratio_max
 
-    if query_select_mode == "class_balanced_random":
+    # server_query 不是一种 query 筛选策略，而是 evidence 来源：
+    # 它表示 evidence 已经由服务端从 official test set 划出的 server_query_loader 采集。
+    # 真正从 evidence pool 里选 query 时，这里复用 class_balanced_random。
+    if query_select_mode in ["class_balanced_random", "server_query"]:
+        original_query_select_mode = query_select_mode
+
+        query_stats["query_select_mode"] = original_query_select_mode
+        query_stats["query_source"] = (
+            "server_query"
+            if original_query_select_mode == "server_query"
+            else "client_evidence"
+        )
+        query_stats["actual_query_select_mode"] = "class_balanced_random"
         query_stats["pool_size_after_token_ratio_filter"] = None
         query_stats["entropy_missing"] = pool_entropy is None
+
         result = _build_random_class_balanced_query_from_pool(
             pool_hidden=pool_hidden,
             pool_labels=pool_labels,
